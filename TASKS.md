@@ -82,11 +82,13 @@ kqueue on macOS is unreliable in practice (user's operational
 experience). It is the native, maintained thing on the real BSDs and
 nowhere else.
 
-### There is no `run` loop, only a tick
+### No loop, no thread, no lifetime
 
 Whatever drives an implementation belongs to the embedder. This project
-provides operations and completions; it does not own a thread, a loop,
-or a lifetime.
+provides operations and completions and nothing else. That is not the
+same as providing only a bare `submit` — see task 2: waiting with a
+deadline, and walking a batch of completions, are part of the API a
+driver needs, not part of the driver.
 
 ## Open, in the order they are worth doing
 
@@ -103,7 +105,27 @@ consumer can read, or the absence of one. Do this BEFORE the second
 implementation exists, or the second implementation inherits a wrong
 answer that already has users.
 
-### 2. Windows: IOCP
+### 2. The waiting half of the API
+
+What exists is `io_uring_submit_and_wait` plus a `peek_cqe`/`cqe_seen`
+loop, which is exactly what src/ring.hpp uses today. A driver that
+wants a BOUNDED tick needs two more, and they are the API's job, not
+the driver's:
+
+- `io_uring_submit_and_wait_timeout` — wait with a deadline
+  (`struct __kernel_timespec`), so the caller can cap how long a tick
+  may block. Under select this is the timeout argument select already
+  takes, so it is nearly free here; the value is that the caller can
+  stop asking for it in its own way.
+- `io_uring_for_each_cqe` + `io_uring_cq_advance` — walk a batch and
+  advance by however much was actually processed, so a tick interrupted
+  mid-batch leaves the rest in the queue for the next one.
+
+Needed by webmachine-mruby's `Webmachine.tick(max_work)` (#116): a
+budget on the WORK, not on the wait, which means the batch walk has to
+be interruptible and the advance has to be partial.
+
+### 3. Windows: IOCP
 
 The only foreign API that is completion-based, so it is the only one
 that maps onto this model rather than being interpreted on top of it.
@@ -113,14 +135,14 @@ select needs disappears, because the OS holds the operations.
 The largest single piece of work here, and the one with the most to
 gain.
 
-### 3. macOS: select, past FD_SETSIZE
+### 4. macOS: select, past FD_SETSIZE
 
 `FD_SETSIZE` is 1024 there, and a server that stops at 1024 connections
 is not one. Define `_DARWIN_UNLIMITED_SELECT` before the includes and
 allocate `fd_set`s on the heap. Wire it to task 1's property so the
 consumer learns the real ceiling.
 
-### 4. BSDs: kqueue
+### 5. BSDs: kqueue
 
 Lowest priority: select already serves them correctly, so this is a
 performance step, not an enablement one. Readiness-based like select,
@@ -129,11 +151,11 @@ are ready" changes — not a new implementation. Worth factoring the
 interpreter once before writing it, so the third readiness backend does
 not copy the first two.
 
-### 5. The operations are still Linux syscalls
+### 6. The operations are still Linux syscalls
 
 `accept4`, `SOCK_CLOEXEC`, `unlinkat`, `MSG_NOSIGNAL`,
 `SOCKET_URING_OP_SETSOCKOPT`. The *shape* is portable; the calls are
 not. Each one needs its per-platform spelling before any non-Linux
-implementation can actually build. Do this as part of task 2 rather
+implementation can actually build. Do this as part of task 3 rather
 than speculatively — the second platform is what reveals which of these
 are genuinely divergent and which just looked that way.
