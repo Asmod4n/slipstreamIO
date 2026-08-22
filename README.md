@@ -4,12 +4,16 @@ One API, every major OS. Async socket API for mruby.
 
 ## What is here today
 
-`include/slipstreamio.h` — the io_uring submission/completion API,
-implemented over `select(2)`. Submission queue entries in, completion
-queue entries out, for machines where the real thing is not available.
+`src/liburing.h` — the io_uring submission/completion API, implemented
+over `select(2)`. Submission queue entries in, completion queue entries
+out, for machines where the real thing is not available.
 
 It is a header, and nothing else: no library to link, no build step, no
-configuration.
+configuration. It is named for the API it implements, because that is
+the only name anyone ever writes — and it deliberately does not sit on
+an include path by itself. `mrbgem.rake` copies it into `include/`
+exactly when the host has no other `liburing.h`, and leaves it alone
+otherwise.
 
 ## What it does not do
 
@@ -30,8 +34,8 @@ built against it also stays statically linkable — there is nothing to
 `dlopen`, which matters because a static `dlopen` fails on glibc and
 musl alike.
 
-`SLIPSTREAM_IO` is defined, for the one thing a caller may legitimately
-branch on: a few limits differ in kind here. A connection is a process
+`SLIPSTREAM_IO` is defined by the header, for the one thing a caller
+may legitimately branch on: a few limits differ in kind here. A connection is a process
 fd, so the number of them lives under `FD_SETSIZE`.
 
 ## Correct, not fast

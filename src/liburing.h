@@ -1,6 +1,11 @@
 // slipstreamIO: the io_uring submission/completion API, run on
 // select(2).
 //
+// This file is named for the API it implements, because that is the
+// only name anyone ever writes. It does NOT sit on an include path by
+// itself - mrbgem.rake copies it into include/ exactly when this host
+// has no other liburing.h, and leaves it here otherwise.
+//
 // WHAT THIS IS: an implementation of that API's shape - submission
 // queue entries in, completion queue entries out - for machines where
 // the real thing is not available. It knows NOTHING about the library
