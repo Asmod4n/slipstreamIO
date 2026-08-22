@@ -1,3 +1,6 @@
+// <poll.h> explicitly: against real liburing nothing pulls it in;
+// our own liburing.h only happens to. The test compiles against both.
+#include <poll.h>
 #include <liburing.h>
 #include <sys/wait.h>
 #include <unistd.h>
