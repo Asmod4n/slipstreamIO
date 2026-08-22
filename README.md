@@ -34,9 +34,20 @@ built against it also stays statically linkable — there is nothing to
 `dlopen`, which matters because a static `dlopen` fails on glibc and
 musl alike.
 
-`SLIPSTREAM_IO` is defined by the header, for the one thing a caller
-may legitimately branch on: a few limits differ in kind here. A connection is a process
-fd, so the number of them lives under `FD_SETSIZE`.
+The header states a PROPERTY for callers to branch on, never its own
+name: `IO_URING_FD_CEILING` — every descriptor handed to these
+functions must stay strictly below it, which here is `FD_SETSIZE`,
+because a connection is a process fd and `select` addresses nothing
+higher. Absence is the other half of the contract: an implementation
+without a ceiling of its own — real liburing, for one — defines
+nothing, and a caller that finds nothing has been told its rlimits are
+the only bound. So the question to ask is `#ifdef IO_URING_FD_CEILING`.
+
+`SLIPSTREAM_IO` is also defined, for saying *which* implementation
+answered — a startup banner that reports "correct, not fast" is the
+whole use case. Nothing may be derived from it: a name is not a
+property, and any limit hung on this one's name would be inherited by
+every implementation that comes later.
 
 ## Correct, not fast
 

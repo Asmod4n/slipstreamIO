@@ -39,6 +39,28 @@ was written for.
   that gains liburing stops being served this one.
 - `test/queue.cpp`, `test/wire.cpp` — a submission with its completion,
   and a real connection driven only through this header.
+- `IO_URING_FD_CEILING` — the marker states a PROPERTY, not an
+  identity. The header publishes the descriptor ceiling it actually
+  has (`FD_SETSIZE`: every fd handed to these functions must stay
+  strictly below it, because a connection is a process fd and `select`
+  addresses nothing higher), and enforces it against that same name, so
+  one number cannot be published and another enforced. ABSENCE is the
+  other half: an implementation with no ceiling of its own defines
+  nothing, real liburing never will, and a consumer that finds nothing
+  has been told its rlimits are the only bound.
+
+  WHY, and why now: `SLIPSTREAM_IO` used to mean "you got slipstreamIO",
+  and webmachine-mruby's `raise_nofile` read that name to cap itself at
+  `FD_SETSIZE - 1`. True for select, invented for IOCP (no `fd_set` at
+  all) and for a macOS build with `_DARWIN_UNLIMITED_SELECT` (heap
+  `fd_set`s, a different number) — a second implementation would have
+  inherited a wrong answer that already had users. There was exactly
+  one consumer, so it cost one `#ifdef` to fix; that is over the moment
+  task 2 (Windows: IOCP) lands. `SLIPSTREAM_IO` survives for saying
+  WHICH implementation answered — the startup banner that reports
+  "correct, not fast" is honest reporting, not a derived limit — and
+  nothing else may be hung on it. The consumer side moved with it
+  (webmachine-mruby `src/ring.hpp`, `tools/webmachine-server/main.cpp`).
 
 ## Decided, with the reason
 
@@ -86,26 +108,13 @@ nowhere else.
 
 Whatever drives an implementation belongs to the embedder. This project
 provides operations and completions and nothing else. That is not the
-same as providing only a bare `submit` — see task 2: waiting with a
+same as providing only a bare `submit` — see task 1: waiting with a
 deadline, and walking a batch of completions, are part of the API a
 driver needs, not part of the driver.
 
 ## Open, in the order they are worth doing
 
-### 1. The marker states a PROPERTY, not an identity
-
-`SLIPSTREAM_IO` currently means "you got slipstreamIO", and consumers
-derive limits from it — webmachine-mruby caps its connection count at
-`FD_SETSIZE` on the strength of that name. That is true for select and
-false for everything else. On an IOCP build, or a macOS build with
-`_DARWIN_UNLIMITED_SELECT`, the cap would be invented.
-
-The header should say what is true instead: a descriptor ceiling the
-consumer can read, or the absence of one. Do this BEFORE the second
-implementation exists, or the second implementation inherits a wrong
-answer that already has users.
-
-### 2. The waiting half of the API
+### 1. The waiting half of the API
 
 What exists is `io_uring_submit_and_wait` plus a `peek_cqe`/`cqe_seen`
 loop, which is exactly what src/ring.hpp uses today. A driver that
@@ -125,7 +134,7 @@ Needed by webmachine-mruby's `Webmachine.tick(max_work)` (#116): a
 budget on the WORK, not on the wait, which means the batch walk has to
 be interruptible and the advance has to be partial.
 
-### 3. Windows: IOCP
+### 2. Windows: IOCP
 
 The only foreign API that is completion-based, so it is the only one
 that maps onto this model rather than being interpreted on top of it.
@@ -135,14 +144,16 @@ select needs disappears, because the OS holds the operations.
 The largest single piece of work here, and the one with the most to
 gain.
 
-### 4. macOS: select, past FD_SETSIZE
+### 3. macOS: select, past FD_SETSIZE
 
 `FD_SETSIZE` is 1024 there, and a server that stops at 1024 connections
 is not one. Define `_DARWIN_UNLIMITED_SELECT` before the includes and
-allocate `fd_set`s on the heap. Wire it to task 1's property so the
-consumer learns the real ceiling.
+allocate `fd_set`s on the heap. Then `IO_URING_FD_CEILING` (Done) stops
+being `FD_SETSIZE` and reports the real ceiling — the consumer reads
+the property and needs no change, which is the whole point of stating
+one.
 
-### 5. BSDs: kqueue
+### 4. BSDs: kqueue
 
 Lowest priority: select already serves them correctly, so this is a
 performance step, not an enablement one. Readiness-based like select,
@@ -151,11 +162,12 @@ are ready" changes — not a new implementation. Worth factoring the
 interpreter once before writing it, so the third readiness backend does
 not copy the first two.
 
-### 6. The operations are still Linux syscalls
+### 5. The operations are still Linux syscalls
 
 `accept4`, `SOCK_CLOEXEC`, `unlinkat`, `MSG_NOSIGNAL`,
 `SOCKET_URING_OP_SETSOCKOPT`. The *shape* is portable; the calls are
 not. Each one needs its per-platform spelling before any non-Linux
-implementation can actually build. Do this as part of task 3 rather
-than speculatively — the second platform is what reveals which of these
-are genuinely divergent and which just looked that way.
+implementation can actually build. Do this as part of task 2 (Windows:
+IOCP) rather than speculatively — the second platform is what reveals
+which of these are genuinely divergent and which just looked that
+way.

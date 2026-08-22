@@ -35,7 +35,9 @@
 //     says ready, so a file read would run synchronously and block the
 //     caller's loop. Nothing here opens one.
 //   - capacity is capped below FD_SETSIZE by whoever sets the limit:
-//     here a connection IS a process fd
+//     here a connection IS a process fd. That ceiling is PUBLISHED, as
+//     IO_URING_FD_CEILING below, so a consumer reads the property
+//     instead of guessing it from this implementation's name
 //
 // WHY select AND NOT poll/kqueue/epoll: it is the one readiness
 // primitive that exists everywhere AND has been debugged everywhere -
@@ -48,11 +50,12 @@
 #ifndef SLIPSTREAM_IO_H
 #define SLIPSTREAM_IO_H
 
-// The one thing a consumer may branch on: whether it got this
-// implementation. Not to pick it - that is already decided by the time
-// this file is included - but because a few limits differ in kind
-// here, and a caller sizing itself has to know (a connection is a
-// process fd, so its count lives under FD_SETSIZE).
+// The name of this implementation, and NOTHING that follows from it.
+// It exists so a build can SAY which implementation answered - the
+// startup banner that reports "correct, not fast" is the whole use
+// case. No limit and no behaviour may be derived from it: a name is
+// not a property, and every implementation of this API that comes
+// later would inherit whatever was hung on this one's name.
 #define SLIPSTREAM_IO 1
 
 #include <fcntl.h>
@@ -69,6 +72,30 @@
 #include <cstring>
 #include <deque>
 #include <vector>
+
+// ---- the property a consumer may branch on --------------------------
+//
+// IO_URING_FD_CEILING: every descriptor handed to these functions must
+// be strictly below this number. It is stated because it is TRUE here
+// and for no other reason - select(2) addresses FD_SETSIZE descriptors
+// and nothing above, and a consumer whose connections are process fds
+// has to keep its own rlimit under the same roof or hand this API an
+// fd it cannot put in an fd_set.
+//
+// ABSENCE is the other half of the contract, and the important half:
+// an implementation with no ceiling of its own defines nothing, and
+// real liburing never will. A consumer that finds no ceiling has been
+// told there is none - its rlimits are the only bound. So the question
+// to ask is `#ifdef IO_URING_FD_CEILING`, never `#ifdef SLIPSTREAM_IO`:
+// the second asks WHO answered and gets select's ceiling handed to
+// every future answer, including IOCP (no fd_set at all) and a macOS
+// build with _DARWIN_UNLIMITED_SELECT (heap fd_sets, a different
+// number). Written down while there is exactly one consumer, because
+// that is when it is cheap.
+//
+// It sits below the includes because FD_SETSIZE is <sys/select.h>'s to
+// define, and this file only reports it.
+#define IO_URING_FD_CEILING FD_SETSIZE
 
 // ---- the ABI names, as far as this tree uses them -------------------
 //
@@ -425,7 +452,7 @@ inline int execute(struct io_uring* st, struct io_uring_sqe& s) {
       const int fd = ::socket(s.fd, static_cast<int>(s.off) | SOCK_NONBLOCK | SOCK_CLOEXEC,
                               static_cast<int>(s.len));
       if (fd < 0) return -errno;
-      if (fd >= FD_SETSIZE) {  // the assertion that can structurally never fire
+      if (fd >= IO_URING_FD_CEILING) {  // the assertion that can structurally never fire
         ::close(fd);
         return -EMFILE;
       }
@@ -500,7 +527,7 @@ inline bool wait_ready(struct io_uring* st) {
   int nfds = 0;
   for (const struct io_uring_sqe& w : st->waiting) {
     const int fd = resolve_fd(st, w);
-    if (fd < 0 || fd >= FD_SETSIZE) continue;
+    if (fd < 0 || fd >= IO_URING_FD_CEILING) continue;
     if (w.opcode == IORING_OP_SEND || w.opcode == IORING_OP_SENDMSG) FD_SET(fd, &wset);
     else FD_SET(fd, &rset);
     if (fd + 1 > nfds) nfds = fd + 1;
@@ -513,7 +540,7 @@ inline bool wait_ready(struct io_uring* st) {
     struct io_uring_sqe& w = st->waiting[i];
     const int fd = resolve_fd(st, w);
     bool remove = false;
-    if (fd >= 0 && fd < FD_SETSIZE) {
+    if (fd >= 0 && fd < IO_URING_FD_CEILING) {
       if (w.opcode == IORING_OP_SEND && FD_ISSET(fd, &wset)) {
         const void* buf = reinterpret_cast<const void*>(static_cast<uintptr_t>(w.addr));
         const ssize_t r = ::send(fd, buf, w.len, static_cast<int>(w.msg_flags) | MSG_NOSIGNAL);
@@ -531,7 +558,7 @@ inline bool wait_ready(struct io_uring* st) {
       } else if (w.opcode == IORING_OP_ACCEPT && FD_ISSET(fd, &rset)) {
         const int nf = ::accept4(fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (nf >= 0) {
-          if (nf >= FD_SETSIZE || st->free_slots.empty()) {
+          if (nf >= IO_URING_FD_CEILING || st->free_slots.empty()) {
             ::close(nf);
             push_cqe(st, w.user_data, -ENFILE, 0);  // no MORE: the Ring re-arms
             remove = true;
