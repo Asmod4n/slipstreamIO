@@ -60,6 +60,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -70,8 +71,29 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <vector>
+
+// __kernel_timespec: liburing gets this from <linux/time_types.h>
+// (through its own compat.h), so use the real thing wherever it is
+// available - not just on Linux, in case some other host ships it too.
+// Guarded with the kernel header's own include guard, so this fallback
+// steps aside the moment the real header is reachable, and a later
+// include of it (directly, or pulled in by something else) never
+// collides with a struct already defined here. Where neither happens -
+// the case this exists for - the shape is the kernel's own: two 64-bit
+// fields, nothing else, so a consumer that reads tv_sec/tv_nsec sees the
+// same layout it would from the real header.
+#if __has_include(<linux/time_types.h>)
+#include <linux/time_types.h>
+#elif !defined(_LINUX_TIME_TYPES_H)
+#define _LINUX_TIME_TYPES_H
+struct __kernel_timespec {
+  int64_t tv_sec;
+  int64_t tv_nsec;
+};
+#endif
 
 // ---- the property a consumer may branch on --------------------------
 //
@@ -412,7 +434,34 @@ inline int io_uring_peek_cqe(struct io_uring* st, struct io_uring_cqe** cqe) {
   *cqe = &st->cq.front();
   return 0;
 }
-inline void io_uring_cqe_seen(struct io_uring* st, struct io_uring_cqe*) { st->cq.pop_front(); }
+
+// The batch walk, in liburing's own macro form so caller code compiles
+// unchanged against either implementation. `head` is the caller's loop
+// variable, not this struct's state - it walks cq without consuming any
+// of it, exactly like liburing's khead/ktail walk leaves the kernel-side
+// head alone until cq_advance moves it. `ring` is a pointer, as it is
+// everywhere else in this header.
+#define io_uring_for_each_cqe(ring, head, cqe)                                        \
+  for ((head) = 0; ((cqe) = ((head) < (ring)->cq.size() ? &(ring)->cq[head] : nullptr)) != \
+                    nullptr;                                                          \
+       (head)++)
+
+// Must be called after io_uring_for_each_cqe(), exactly liburing's
+// contract - and PARTIAL by construction: nr may be less than what the
+// walk just saw, and whatever is left simply stays at the front of cq
+// for the next tick. That is the reason task 1 exists: a tick cut off
+// mid-batch (webmachine's budgeted Webmachine.tick, #116) must not drop
+// the remainder. nr beyond what for_each_cqe exposed is caller error the
+// same as it would be against liburing (there head/tail would desync);
+// clamped here only so it cannot walk this deque past empty.
+inline void io_uring_cq_advance(struct io_uring* st, unsigned nr) {
+  const unsigned n = nr < st->cq.size() ? nr : static_cast<unsigned>(st->cq.size());
+  for (unsigned i = 0; i < n; i++) st->cq.pop_front();
+}
+
+inline void io_uring_cqe_seen(struct io_uring* st, struct io_uring_cqe* cqe) {
+  if (cqe) io_uring_cq_advance(st, 1);
+}
 
 namespace slipstream::detail {
 
@@ -517,25 +566,29 @@ inline int execute(struct io_uring* st, struct io_uring_sqe& s) {
   }
 }
 
-// One select(2) pass over everything armed. Returns false when there is
-// nothing armed at all - the caller must not spin on that.
-inline bool wait_ready(struct io_uring* st) {
-  if (st->waiting.empty()) return false;
-  fd_set rset, wset;
-  FD_ZERO(&rset);
-  FD_ZERO(&wset);
+// Builds the fd_sets for everything armed. Returns the nfds argument
+// select(2) wants, or 0 when nothing armed resolves to a live fd - the
+// timed and untimed waits below share this, since both hand its result
+// to select the same way and only differ in the timeout they pass.
+inline int build_waitsets(struct io_uring* st, fd_set* rset, fd_set* wset) {
+  FD_ZERO(rset);
+  FD_ZERO(wset);
   int nfds = 0;
   for (const struct io_uring_sqe& w : st->waiting) {
     const int fd = resolve_fd(st, w);
     if (fd < 0 || fd >= IO_URING_FD_CEILING) continue;
-    if (w.opcode == IORING_OP_SEND || w.opcode == IORING_OP_SENDMSG) FD_SET(fd, &wset);
-    else FD_SET(fd, &rset);
+    if (w.opcode == IORING_OP_SEND || w.opcode == IORING_OP_SENDMSG) FD_SET(fd, wset);
+    else FD_SET(fd, rset);
     if (fd + 1 > nfds) nfds = fd + 1;
   }
-  if (nfds == 0) return false;
-  const int rc = ::select(nfds, &rset, &wset, nullptr, nullptr);
-  if (rc <= 0) return true;  // EINTR and friends: try again from the top
+  return nfds;
+}
 
+// Dispatches whatever select(2) found ready into completions - the
+// per-opcode handling wait_ready always did, factored out so
+// io_uring_submit_and_wait_timeout can run the identical dispatch after
+// its own, deadline-bounded select call.
+inline void drain_ready(struct io_uring* st, const fd_set& rset, const fd_set& wset) {
   for (size_t i = 0; i < st->waiting.size();) {
     struct io_uring_sqe& w = st->waiting[i];
     const int fd = resolve_fd(st, w);
@@ -607,7 +660,59 @@ inline bool wait_ready(struct io_uring* st) {
       i++;
     }
   }
+}
+
+// One select(2) pass over everything armed, no deadline. Returns false
+// when there is nothing armed at all - the caller must not spin on that.
+inline bool wait_ready(struct io_uring* st) {
+  if (st->waiting.empty()) return false;
+  fd_set rset, wset;
+  const int nfds = build_waitsets(st, &rset, &wset);
+  if (nfds == 0) return false;
+  const int rc = ::select(nfds, &rset, &wset, nullptr, nullptr);
+  if (rc <= 0) return true;  // EINTR and friends: try again from the top
+  drain_ready(st, rset, wset);
   return true;
+}
+
+// The absolute deadline for a __kernel_timespec relative wait, on
+// CLOCK_MONOTONIC so a wall-clock step never shortens or lengthens it.
+inline struct timespec deadline_from(const struct __kernel_timespec* ts) {
+  struct timespec d;
+  ::clock_gettime(CLOCK_MONOTONIC, &d);
+  d.tv_sec += static_cast<time_t>(ts->tv_sec);
+  d.tv_nsec += static_cast<long>(ts->tv_nsec);
+  if (d.tv_nsec >= 1000000000L) {
+    d.tv_nsec -= 1000000000L;
+    d.tv_sec += 1;
+  }
+  return d;
+}
+
+// One select(2) pass bounded by an absolute deadline. Returns false once
+// the deadline has passed - the caller (submit_and_wait_timeout) is the
+// one that turns that into -ETIME, since only it knows whether wait_nr
+// was actually reached. select(0, ...) with nothing armed is a legal,
+// portable sleep for the remainder, which is what makes an empty queue
+// with a short timeout still block for roughly that long instead of
+// returning -ETIME immediately.
+inline bool wait_ready_until(struct io_uring* st, const struct timespec& deadline) {
+  struct timespec now;
+  ::clock_gettime(CLOCK_MONOTONIC, &now);
+  int64_t remain_ns = (static_cast<int64_t>(deadline.tv_sec - now.tv_sec) * 1000000000LL) +
+                      (deadline.tv_nsec - now.tv_nsec);
+  if (remain_ns <= 0) return false;
+
+  fd_set rset, wset;
+  const int nfds = build_waitsets(st, &rset, &wset);
+  struct timeval tv;
+  tv.tv_sec = static_cast<time_t>(remain_ns / 1000000000LL);
+  tv.tv_usec = static_cast<suseconds_t>((remain_ns % 1000000000LL) / 1000);
+  const int rc = ::select(nfds, &rset, &wset, nullptr, &tv);
+  if (rc > 0) drain_ready(st, rset, wset);
+  return true;  // rc == 0 (this pass's time ran out) or rc < 0 (EINTR
+                // and friends) both just loop back to the deadline
+                // check above.
 }
 
 }  // namespace slipstream::detail
@@ -644,6 +749,44 @@ inline int io_uring_submit_and_wait(struct io_uring* st, unsigned wait_nr) {
   while (st->cq.size() < wait_nr) {
     if (!slipstream::detail::wait_ready(st)) break;  // nothing armed: do not spin
   }
+  return n;
+}
+
+// Wait with a deadline: the point of this one over submit_and_wait is
+// that the caller can cap how long a tick may block instead of asking
+// select for that in its own way - under select, ts IS the timeout
+// argument select already takes, so this costs nearly nothing here.
+//
+// ts == NULL means what it means in liburing: no deadline at all, so
+// this degrades to exactly submit_and_wait (only wait_nr governs, and
+// -ETIME can never happen - there is no timeout to run out).
+//
+// With a real ts, running out before wait_nr completions have arrived
+// returns -ETIME, liburing's own documented behaviour for this function.
+// sigmask is accepted for signature parity; nothing here can be
+// interrupted by a blocked signal the way a real io_uring_enter can, so
+// it does nothing.
+inline int io_uring_submit_and_wait_timeout(struct io_uring* st, struct io_uring_cqe** cqe_ptr,
+                                            unsigned wait_nr, struct __kernel_timespec* ts,
+                                            sigset_t*) {
+  namespace d = slipstream::detail;
+  const int n = io_uring_submit(st);
+
+  if (ts == nullptr) {
+    while (st->cq.size() < wait_nr) {
+      if (!d::wait_ready(st)) break;  // nothing armed: do not spin
+    }
+  } else {
+    const struct timespec deadline = d::deadline_from(ts);
+    while (st->cq.size() < wait_nr) {
+      if (!d::wait_ready_until(st, deadline)) {
+        if (cqe_ptr) *cqe_ptr = nullptr;
+        return -ETIME;
+      }
+    }
+  }
+
+  if (cqe_ptr) *cqe_ptr = st->cq.empty() ? nullptr : &st->cq.front();
   return n;
 }
 
