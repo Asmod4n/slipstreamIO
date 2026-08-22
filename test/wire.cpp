@@ -14,6 +14,7 @@
 static const int kPort = 28731;
 
 int main() {
+  alarm(60);  // a wait that never returns is a FAILURE, not a hung test run
   struct io_uring r;
   if (io_uring_queue_init(64, &r, 0) != 0) return 1;
   io_uring_register_files_sparse(&r, 64);
@@ -44,7 +45,10 @@ int main() {
   s = io_uring_get_sqe(&r);
   io_uring_prep_listen(s, 40, 16);
   s->flags |= IOSQE_FIXED_FILE;
-  io_uring_submit(&r);
+  // The chain runs on the engine, so its completions are WAITED for -
+  // peeking straight after submit was only ever safe because submission
+  // used to do the work inline.
+  io_uring_submit_and_wait(&r, 4);
   for (int i = 0; i < 4; i++) {
     struct io_uring_cqe* c;
     if (io_uring_peek_cqe(&r, &c) != 0) { std::printf("setup: missing cqe %d\n", i); return 2; }

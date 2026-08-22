@@ -28,17 +28,64 @@ was written for.
 
 ## Done
 
-- `src/liburing.h` — the API over `select(2)`. Submission does the work
-  inline for anything that can answer immediately; the rest parks until
-  select says ready. Provided-buffer rings, direct descriptors, linked
-  chains, multishot accept and receive.
+- `src/liburing.h` — the API over `select(2)`, **in C11**, with both
+  halves of the model implemented (see the doctrine below). Provided-
+  buffer rings, direct descriptors, linked chains, multishot accept and
+  receive, and file IO: `openat`, `read`, `statx`, `close`.
+
+  It is C because real `liburing.h` is C, and a stand-in for a name has
+  to be consumable everywhere that name is: `<threads.h>` for the
+  threads, `<stdatomic.h>` for the ring cursors (with a `<atomic>` arm
+  for C++), plain structs, `static inline` throughout, no destructor —
+  `io_uring_queue_exit` owns every teardown step, which is where C put
+  it anyway. `test/cconsume.c` is the proof: a `-std=c11` translation
+  unit, no feature macros on the command line.
+
+  WHAT THE C SWITCH MADE VISIBLE, and what it cost: `g++` defines
+  `_GNU_SOURCE` for you and `gcc -std=c11` does not, so the Linux
+  syscalls this file CALLS (`accept4`, `SOCK_CLOEXEC`, `MSG_NOSIGNAL`,
+  `statx`) were only ever declared by accident. Real liburing.h never
+  notices, because it calls nothing — it fills SQEs and the kernel runs
+  them. Ours defines `_GNU_SOURCE` before its first include and says so
+  in one `#error` if a libc header got there first. The other find was
+  a latent one: `get_sqe` handed out pointers into a `std::vector` that
+  could reallocate under the caller. The C version is a fixed array
+  allocated once, which is what the kernel's SQ is.
+
+- The ENGINE THREAD and the WORK THREADS — the kernel half of the
+  model, and the reason `ring_fd` is a real descriptor. Documented as
+  doctrine below; built as: one engine thread per ring owning the
+  `select` loop and all readiness ops, a lazily-spawned pool of at most
+  four workers for blocking ops, and a completion ring that stays
+  strictly single-producer (workers hand results BACK to the engine;
+  only the engine writes a CQE and only the engine arms `ring_fd`).
+
+  `IORING_REGISTER_IOWQ_MAX_WORKERS` is deliberately not implemented.
+  Nothing has asked for it, and the number it would tune is four.
 - `mrbgem.rake` — the layer-3 decision. Takes `mruby-io-uring` as a
   dependency because that gem is the one that knows whether liburing
   built; copies `src/liburing.h` into `include/` only when nothing else
   provides that name. The copy is removed before every check, so a host
   that gains liburing stops being served this one.
-- `test/queue.cpp`, `test/wire.cpp` — a submission with its completion,
-  and a real connection driven only through this header.
+- `test/queue.cpp`, `test/wire.cpp`, `test/file.cpp`, `test/cconsume.c`
+  — a submission with its completion, a real connection driven only
+  through this header, file IO through the pool, and the C consumer.
+  The engine-specific proofs live in the first three: `ring_fd` wakes a
+  bare `poll()` while the caller is inside no API call at all; the pipe
+  is empty again once the ring is; teardown with ops still parked does
+  not hang; 5000 completions cross a 4096-entry ring in order (the
+  overflow backlog); a socket completion overtakes a blocked file read;
+  and a linked chain whose first member is blocking still cancels what
+  follows it.
+
+  `make tsan` and `make asan` run all of it under the sanitizers. TSan
+  is the verdict that matters and it needed one harness file, NOT a
+  change to `src/`: glibc's C11 thread functions do not go through the
+  pthread symbols TSan intercepts, so a `thrd_create`d thread crashes
+  the runtime — a four-line program proves it, under gcc and clang
+  alike. `test/thrd_tsan_shim.c` re-spells the C11 calls as their
+  pthread equivalents for the sanitizer build only. It is also the
+  shape of the shim macOS will need for real (see task 3).
 - `IO_URING_FD_CEILING` — the marker states a PROPERTY, not an
   identity. The header publishes the descriptor ceiling it actually
   has (`FD_SETSIZE`: every fd handed to these functions must stay
@@ -146,17 +193,94 @@ kqueue on macOS is unreliable in practice (user's operational
 experience). It is the native, maintained thing on the real BSDs and
 nowhere else.
 
-### No loop, no thread, no lifetime
+### The DRIVER loop is the embedder's. The ENGINE is ours.
 
-Whatever drives an implementation belongs to the embedder. This project
-provides operations and completions and nothing else. That is not the
-same as providing only a bare `submit` — waiting with a deadline, and
-walking a batch of completions, are part of the API a driver needs, not
-part of the driver (done below).
+This replaces "no loop, no thread, no lifetime", and it is worth saying
+why, because the old rule was right about the thing it was protecting
+and wrong about its own scope.
+
+What it was protecting: the embedder's freedom. No `run` method, no
+API-visible thread, no callbacks, nothing that owns the caller's flow of
+control. That is untouched and not negotiable — this file never calls
+user code.
+
+What it could not have meant: the KERNEL HALF of the API it implements.
+io_uring is two halves. One is userspace — submit, walk completions —
+and that half was here from the start. The other half runs the
+operations, posts the completions, and makes one descriptor readable
+when there are any; in real io_uring that half is the kernel, and it is
+not optional decoration. It is where `ring_fd` comes from, it is why a
+completion can arrive while the caller is computing, and it is what
+makes file IO expressible at all. Without a thread of our own, none of
+the three is implementable on `select(2)`. That was a structural gap,
+not a missing feature, and it was written into the code as
+`ring_fd = -1` with a comment explaining that the ring could never be
+pollable here. That comment is now gone, because the reason is.
+
+So: **the engine is the implementation's, the driver loop is the
+embedder's.** The engine is born in `io_uring_queue_init*`, joined in
+`io_uring_queue_exit`, and has no API surface whatsoever — no handle, no
+callback, no configuration. A consumer cannot tell it apart from a
+kernel except by reading this file.
+
+And it is TWO kinds of thread, because io_uring is two kinds of thread:
+
+- the ENGINE owns the `select` loop and every READINESS operation
+  (sockets). It never blocks on work.
+- the WORK THREADS are the io-wq analogue: everything BLOCKING —
+  `openat`, `read`, `statx`, closing a file descriptor — runs in a
+  small, lazily-spawned pool. A file has no readiness for `select` to
+  report (it calls every regular file ready, always), so the only
+  honest way to offer file IO is to have somebody block on it, and the
+  one thread that must never be that somebody is the caller's.
+
+The completion ring stays strictly single-producer across both: workers
+never post a CQE. They hand results back to the engine, and the engine
+alone writes completions and arms `ring_fd`. That keeps the ring's
+memory model exactly the kernel's — one producer, one consumer, no lock
+on the completion path — and leaves the `ring_fd` invariant with exactly
+one writer.
 
 ## Open, in the order they are worth doing
 
-### 1. Windows: IOCP
+### 1. Pass liburing's own test suite, for the ops we implement
+
+FIRST, before any second implementation, and this is the reason: a
+passing suite is what makes a second implementation SAFE. It proves the
+API's semantics hold independently of the engine underneath, so kqueue
+and IOCP get a fixed target to hit instead of "behaves like the select
+one seemed to". It also replaces our own guesses about liburing's
+semantics with liburing's own statements — every question this tree has
+had to answer by reading documentation (what `-ETIME` means, when a
+multishot ends, what `IOSQE_CQE_SKIP_SUCCESS` does) is answered there in
+executable form.
+
+Mechanics, as far as they are decided:
+
+- TEST SOURCE, PINNED: the same liburing revision `mruby-io_uring`
+  carries as its submodule — `deps/liburing`, today liburing-2.13
+  (`e07a859d4b39583c0fe0290730a9d75bccc24b5e`), 242 files under
+  `test/`. One revision for the symbols and for the suite, or the two
+  drift and the failures stop meaning anything.
+- ALLOWLIST, not a full run. Only the test files for operations this
+  header implements: nop, accept (and the multishot/direct variants),
+  send/recv, poll, link, timeout, buf-ring, openat/read/statx/close,
+  fixed files. Every file NOT on the list goes on an exclusion list with
+  a NAMED reason — "tests a kernel feature we do not implement", or
+  "reaches into liburing's internals / raw `io_uring_enter`". A test we
+  cannot pass is either a bug or a documented non-goal; there is no
+  third category and no silent skipping.
+- liburing's own skip discipline is honoured: `T_EXIT_SKIP` and the
+  probe checks mean SKIPPED, and skipped never counts as passed.
+- Runs as part of `make test`.
+
+Expect it to push back on the probe surface: several tests ask
+`io_uring_get_probe` / the feature flags in order to skip themselves,
+and ours answers "yes, everything" to every opcode. That is exactly the
+conformance pressure worth having — the probe should start telling the
+truth, and the suite is what will say which truth it has to tell.
+
+### 2. Windows: IOCP
 
 The only foreign API that is completion-based, so it is the only one
 that maps onto this model rather than being interpreted on top of it.
@@ -166,7 +290,7 @@ select needs disappears, because the OS holds the operations.
 The largest single piece of work here, and the one with the most to
 gain.
 
-### 2. macOS: select, past FD_SETSIZE
+### 3. macOS: select, past FD_SETSIZE, and a `<threads.h>` of its own
 
 `FD_SETSIZE` is 1024 there, and a server that stops at 1024 connections
 is not one. Define `_DARWIN_UNLIMITED_SELECT` before the includes and
@@ -175,7 +299,19 @@ being `FD_SETSIZE` and reports the real ceiling — the consumer reads
 the property and needs no change, which is the whole point of stating
 one.
 
-### 3. BSDs: kqueue
+AND THE FACT THAT COMES WITH IT, stated plainly rather than allowed to
+turn into a quiet reversal: **macOS has never shipped `<threads.h>`.**
+Apple has not delivered C11 threads to this day; MSVC has had them
+since VS 2022 17.8, and glibc has carried `thrd_*` in libc itself since
+2.34. So on macOS this header needs a small `thrd_`/`mtx_`/`cnd_` shim
+over pthreads — perhaps twenty lines, and `test/thrd_tsan_shim.c`
+already shows what it looks like — or Apple ships one. That is a named
+part of THIS task. It is not a reason to fall back to pthreads
+everywhere: the engine is written against the standard's threads, and
+one platform missing a standard header is that platform's gap to fill,
+in the same file where its other gaps are filled.
+
+### 4. BSDs: kqueue
 
 Lowest priority: select already serves them correctly, so this is a
 performance step, not an enablement one. Readiness-based like select,
@@ -184,7 +320,7 @@ are ready" changes — not a new implementation. Worth factoring the
 interpreter once before writing it, so the third readiness backend does
 not copy the first two.
 
-### 4. The operations are still Linux syscalls
+### 5. The operations are still Linux syscalls
 
 `accept4`, `SOCK_CLOEXEC`, `unlinkat`, `MSG_NOSIGNAL`,
 `SOCKET_URING_OP_SETSOCKOPT`. The *shape* is portable; the calls are
