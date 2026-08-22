@@ -63,6 +63,14 @@ matrix instead of three.
 The operations themselves are still Linux syscalls today. The *shape*
 is what is portable, and nothing here pretends the port has been done.
 
+## What is planned
+
+`TASKS.md` holds the roadmap and, more usefully, the reasons: which
+platforms get which implementation, and which alternatives were tried
+and eliminated. Linux is deliberately not a target — where liburing
+builds, its symbols are already in the process, so nothing else can
+claim those names.
+
 ## Tests
 
 ```
