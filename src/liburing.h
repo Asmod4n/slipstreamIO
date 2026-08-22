@@ -220,6 +220,20 @@ struct io_uring_buf_ring {
 struct io_uring {
   static constexpr unsigned kSqDepth = 1024;
   unsigned features = 0;  // no IORING_FEAT_* - bundles must read false
+  // Real liburing's struct carries the ring's own pollable fd here;
+  // POLLIN on it means "completions are waiting" and is the canonical
+  // way to hang a ring into a foreign event loop. This implementation
+  // CANNOT offer that, structurally: completions materialize only
+  // inside API calls (submit walks the parked set), so no kernel-side
+  // object ever aggregates readiness into one fd - and signalling one
+  // ourselves (io_uring_register_eventfd's job) would take a thread,
+  // which "no loop, no thread, no lifetime" rules out. -1 is the
+  // in-band property: a consumer that wants to export a pollable fd
+  // checks ring_fd >= 0 and refuses by name otherwise, pointing at
+  // the bounded wait (io_uring_submit_and_wait_timeout) instead -
+  // which select serves natively. Same answer IOCP will give: a
+  // completion port is waitable, not pollable.
+  int ring_fd = -1;
   std::vector<struct io_uring_sqe> sq;  // written by the prep_* below
   std::deque<struct io_uring_cqe> cq;
   std::vector<int> files;            // slot -> fd; the direct table, spelled out
