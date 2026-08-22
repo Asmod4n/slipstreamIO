@@ -28,9 +28,10 @@ MRuby::Gem::Specification.new('mruby-slipstreamio') do |spec|
 
   if spec.cc.search_header 'liburing.h'
     # A real liburing is on the path (mruby-io-uring built it). Nothing
-    # to install: this gem contributes its implementation under its own
-    # name only, and no consumer will reach it.
-    spec.build.logfile.puts "mruby-slipstreamio: liburing found, standing aside" if spec.build.logfile
+    # to install and nothing to say: this gem contributes its
+    # implementation under its own name only, and no consumer reaches
+    # it. Silence is the correct output of a decision that changed
+    # nothing.
   else
     # No liburing anywhere. Take over the name, so that source written
     # against that API compiles and runs here unchanged. A forwarding
