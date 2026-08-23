@@ -15,7 +15,19 @@ MRuby::Gem::Specification.new('mruby-slipstreamio') do |spec|
   # degrades (URING_AVAILABLE = false) when it does not. Every mrbgem's
   # include/ is on every other mrbgem's search path, so "did it work"
   # is answerable by looking.
-  spec.add_dependency 'mruby-io-uring'
+  #
+  # ONE knob, and it belongs to the BUILD TARGET, not to the host: a
+  # target that defines SLIPSTREAM_IO_ONLY has decided it wants this
+  # implementation whatever the host happens to have. mruby resolves
+  # the gem list per target, so this is also the only way to build a
+  # binary WITHOUT liburing on a machine that has one - which is the
+  # whole point for a caller shipping one binary to hosts where
+  # io_uring may be switched off (kernel.io_uring_disabled, a seccomp
+  # profile, an LSM). Without the knob nothing changes: the host is
+  # asked, and it answers.
+  only = build.cc.defines.include?('SLIPSTREAM_IO_ONLY')
+
+  spec.add_dependency 'mruby-io-uring' unless only
 
   own = "#{spec.dir}/src/liburing.h"        # the implementation, always here
   installed = "#{spec.dir}/include/liburing.h"  # the copy, only when needed
@@ -27,7 +39,7 @@ MRuby::Gem::Specification.new('mruby-slipstreamio') do |spec|
   # asked against everyone else's include/, not ours.
   FileUtils.rm_f installed
 
-  if spec.cc.search_header 'liburing.h'
+  if !only && spec.cc.search_header('liburing.h')
     # A real liburing is on the path (mruby-io-uring built it). Nothing
     # to install and nothing to say: src/liburing.h stays where it is,
     # off every include path, and no consumer reaches it. Silence is
@@ -64,7 +76,12 @@ MRuby::Gem::Specification.new('mruby-slipstreamio') do |spec|
            'see TASKS.md (macOS ships none to this day and needs a thrd_ shim).'
     end
 
-    warn 'mruby-slipstreamio: no liburing on this host -- <liburing.h> now resolves to ' \
-         'slipstreamIO (the select(2) baseline: correct, NOT fast).'
+    if only
+      warn "mruby-slipstreamio: #{build.name} asked for slipstreamIO -- <liburing.h> resolves " \
+           'to it here, liburing or no liburing (the select(2) baseline: correct, NOT fast).'
+    else
+      warn 'mruby-slipstreamio: no liburing on this host -- <liburing.h> now resolves to ' \
+           'slipstreamIO (the select(2) baseline: correct, NOT fast).'
+    end
   end
 end
