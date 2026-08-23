@@ -1551,8 +1551,17 @@ static inline void slipstream_wait_pipe(struct io_uring *st, int timeout_ms) {
 
 /* ---- setup, registration, buffer ring ------------------------------- */
 
+/* The fields a caller READS back are here too, and they are read back
+ * for a reason: the kernel is free to give a different ring than the
+ * one asked for, so code that sizes anything by its ring asks the ring
+ * afterwards. This implementation is free to answer as well - its
+ * depths are fixed, so what it gives is what it always gives, and the
+ * caller learns that instead of believing it got what it requested. */
 struct io_uring_params {
+  unsigned sq_entries;
+  unsigned cq_entries;
   unsigned flags;
+  unsigned features;
 };
 
 /* The engine is born here and joined in io_uring_queue_exit. This is C:
@@ -1565,7 +1574,6 @@ static inline int io_uring_queue_init_params(unsigned entries, struct io_uring *
                                              struct io_uring_params *p) {
   int cq[2], ctl[2], i;
   (void)entries;
-  (void)p;
 
   st->features = 0;
   st->sq = NULL;
@@ -1706,6 +1714,14 @@ static inline int io_uring_queue_init_params(unsigned entries, struct io_uring *
     return -EAGAIN;
   }
   st->engine_live = 1;
+  /* Answered LAST, and only on the path that succeeded: a failed init
+   * leaves the caller's params untouched, exactly as a failed
+   * io_uring_setup does. */
+  if (p != NULL) {
+    p->sq_entries = SLIPSTREAM_SQ_DEPTH;
+    p->cq_entries = SLIPSTREAM_CQ_DEPTH;
+    p->features = st->features;
+  }
   return 0;
 }
 static inline int io_uring_queue_init(unsigned entries, struct io_uring *st, unsigned flags) {
