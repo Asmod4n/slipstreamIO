@@ -58,6 +58,7 @@ build-iPhoneSimulator/
 # built by the Makefile, not tracked
 /test/queue
 /test/wire
+/test/sockname
 /test/file
 /test/cconsume
 /test/*-tsan

@@ -11,15 +11,18 @@ CXXFLAGS ?= -std=c++20 -Wall -Wextra -O2 -Isrc
 # for a C consumer on its own terms.
 CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
 
-BINS = test/queue test/wire test/file test/cconsume
+BINS = test/queue test/wire test/sockname test/file test/cconsume
 
 test: $(BINS)
-	./test/queue && ./test/wire && ./test/file && ./test/cconsume
+	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume
 
 test/queue: test/queue.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 test/wire: test/wire.cpp src/liburing.h
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+test/sockname: test/sockname.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 test/file: test/file.cpp src/liburing.h
@@ -39,20 +42,20 @@ test/cconsume: test/cconsume.c src/liburing.h
 SAN_TSAN = -O1 -g -fsanitize=thread
 SAN_ASAN = -O1 -g -fsanitize=address,undefined
 
-tsan: test/thrd_tsan_shim.c src/liburing.h test/queue.cpp test/wire.cpp test/file.cpp test/cconsume.c
+tsan: test/thrd_tsan_shim.c src/liburing.h test/queue.cpp test/wire.cpp test/sockname.cpp test/file.cpp test/cconsume.c
 	$(CC) $(CFLAGS) $(SAN_TSAN) -c -o test/thrd_tsan_shim.o test/thrd_tsan_shim.c
-	for t in queue wire file; do \
+	for t in queue wire sockname file; do \
 	  $(CXX) $(CXXFLAGS) $(SAN_TSAN) -o test/$$t-tsan test/$$t.cpp test/thrd_tsan_shim.o || exit 1; \
 	done
 	$(CC) $(CFLAGS) $(SAN_TSAN) -o test/cconsume-tsan test/cconsume.c test/thrd_tsan_shim.o
-	./test/queue-tsan && ./test/wire-tsan && ./test/file-tsan && ./test/cconsume-tsan
+	./test/queue-tsan && ./test/wire-tsan && ./test/sockname-tsan && ./test/file-tsan && ./test/cconsume-tsan
 
-asan: src/liburing.h test/queue.cpp test/wire.cpp test/file.cpp test/cconsume.c
-	for t in queue wire file; do \
+asan: src/liburing.h test/queue.cpp test/wire.cpp test/sockname.cpp test/file.cpp test/cconsume.c
+	for t in queue wire sockname file; do \
 	  $(CXX) $(CXXFLAGS) $(SAN_ASAN) -o test/$$t-asan test/$$t.cpp || exit 1; \
 	done
 	$(CC) $(CFLAGS) $(SAN_ASAN) -o test/cconsume-asan test/cconsume.c
-	./test/queue-asan && ./test/wire-asan && ./test/file-asan && ./test/cconsume-asan
+	./test/queue-asan && ./test/wire-asan && ./test/sockname-asan && ./test/file-asan && ./test/cconsume-asan
 
 clean:
 	rm -f $(BINS) test/*-tsan test/*-asan test/thrd_tsan_shim.o

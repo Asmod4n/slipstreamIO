@@ -131,6 +131,9 @@ make asan        # ... and under AddressSanitizer + UBSan
 - `test/wire.cpp` — a real connection: socket/bind/listen as one linked
   chain, multishot accept onto a direct descriptor, multishot receive
   off a provided-buffer ring, and a send the peer reads back
+- `test/sockname.cpp` — the three socket commands: the bound name of a
+  port-0 listener, the peer's name at accept, and `SO_MEMINFO` — all
+  three through `IORING_OP_URING_CMD`
 - `test/file.cpp` — `openat`/`statx`/`read` through the ring, a socket
   completion overtaking a blocked file read, and a linked chain whose
   first member is blocking

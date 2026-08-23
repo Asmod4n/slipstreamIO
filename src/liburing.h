@@ -276,8 +276,25 @@ enum {
  * completion. */
 #define IORING_FEAT_RECVSEND_BUNDLE (1u << 14)
 
+/* The socket commands, with the KERNEL's own numbers (linux/io_uring.h)
+ * so a reader recognises them - and each guarded, so a real liburing
+ * always wins. SETSOCKOPT used to be spelled 1 here, which was fine
+ * while it was alone and wrong the moment a second value exists: 1 is
+ * SIOCOUTQ. */
+#ifndef SOCKET_URING_OP_SIOCINQ
+#define SOCKET_URING_OP_SIOCINQ 0
+#endif
+#ifndef SOCKET_URING_OP_SIOCOUTQ
+#define SOCKET_URING_OP_SIOCOUTQ 1
+#endif
+#ifndef SOCKET_URING_OP_GETSOCKOPT
+#define SOCKET_URING_OP_GETSOCKOPT 2
+#endif
 #ifndef SOCKET_URING_OP_SETSOCKOPT
-#define SOCKET_URING_OP_SETSOCKOPT 1
+#define SOCKET_URING_OP_SETSOCKOPT 3
+#endif
+#ifndef SOCKET_URING_OP_GETSOCKNAME
+#define SOCKET_URING_OP_GETSOCKNAME 4
 #endif
 
 struct io_uring_sqe {
@@ -530,6 +547,18 @@ struct io_uring_probe {
 static inline void io_uring_prep_nop(struct io_uring_sqe *s) {
   memset(s, 0, sizeof(*s));
   s->opcode = IORING_OP_NOP;
+}
+/* liburing's generic writer. A caller reaches for it where liburing
+ * has no named helper yet - a URING_CMD spelled by hand, for instance -
+ * and then sets the command's own fields itself. */
+static inline void io_uring_prep_rw(int op, struct io_uring_sqe *s, int fd, const void *addr,
+                                    unsigned len, uint64_t offset) {
+  io_uring_prep_nop(s);
+  s->opcode = (uint8_t)op;
+  s->fd = fd;
+  s->addr = (uint64_t)(uintptr_t)addr;
+  s->len = len;
+  s->off = offset;
 }
 static inline void io_uring_sqe_set_data64(struct io_uring_sqe *s, uint64_t d) { s->user_data = d; }
 static inline uint64_t io_uring_cqe_get_data64(const struct io_uring_cqe *c) { return c->user_data; }
@@ -950,13 +979,39 @@ static inline int slipstream_execute(struct io_uring *st, struct io_uring_sqe *s
       return 0;
     }
     case IORING_OP_URING_CMD: {
-      int fd;
-      const void *val;
-      if (s->cmd_op != SOCKET_URING_OP_SETSOCKOPT) return -EOPNOTSUPP;
-      fd = slipstream_resolve_fd(st, s);
+      const int fd = slipstream_resolve_fd(st, s);
       if (fd < 0) return -EBADF;
-      val = (const void *)(uintptr_t)s->optval;
-      return setsockopt(fd, (int)s->level, (int)s->optname, val, s->optlen) == 0 ? 0 : -errno;
+      switch (s->cmd_op) {
+        case SOCKET_URING_OP_SETSOCKOPT: {
+          const void *val = (const void *)(uintptr_t)s->optval;
+          return setsockopt(fd, (int)s->level, (int)s->optname, val, s->optlen) == 0 ? 0 : -errno;
+        }
+        case SOCKET_URING_OP_GETSOCKOPT: {
+          /* The kernel answers the LENGTH in the cqe's res and writes
+           * the value into optval; optlen is what the caller offered. */
+          socklen_t len = (socklen_t)s->optlen;
+          void *val = (void *)(uintptr_t)s->optval;
+          if (getsockopt(fd, (int)s->level, (int)s->optname, val, &len) != 0) return -errno;
+          return (int)len;
+        }
+        case SOCKET_URING_OP_GETSOCKNAME: {
+          /* io_uring's own shape for this one (io_uring/cmd_net.c):
+           * addr is the sockaddr buffer, optval points at the length
+           * (in AND out), and optlen picks the side - 0 is this
+           * socket's own name, 1 is the peer's. */
+          struct sockaddr *sa = (struct sockaddr *)(uintptr_t)s->addr;
+          int *slen = (int *)(uintptr_t)s->optval;
+          socklen_t len;
+          int rc;
+          if (sa == NULL || slen == NULL) return -EFAULT;
+          len = (socklen_t)*slen;
+          rc = s->optlen ? getpeername(fd, sa, &len) : getsockname(fd, sa, &len);
+          if (rc != 0) return -errno;
+          *slen = (int)len;
+          return 0;
+        }
+        default: return -EOPNOTSUPP;
+      }
     }
     case IORING_OP_BIND: {
       const int fd = slipstream_resolve_fd(st, s);
