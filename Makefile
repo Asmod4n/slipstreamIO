@@ -11,10 +11,10 @@ CXXFLAGS ?= -std=c++20 -Wall -Wextra -O2 -Isrc
 # for a C consumer on its own terms.
 CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
 
-BINS = test/queue test/wire test/sockname test/file test/cconsume
+BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch
 
 test: $(BINS)
-	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume
+	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch
 
 test/queue: test/queue.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
@@ -61,3 +61,6 @@ clean:
 	rm -f $(BINS) test/*-tsan test/*-asan test/thrd_tsan_shim.o
 
 .PHONY: test tsan asan clean
+
+test/watch: test/watch.cpp src/liburing.h
+	$(CXX) $(CXXFLAGS) -o $@ $<

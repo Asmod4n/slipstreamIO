@@ -232,6 +232,7 @@ enum {
   IORING_OP_LISTEN,
   IORING_OP_OPENAT,
   IORING_OP_POLL_ADD,
+  IORING_OP_POLL_REMOVE,
   IORING_OP_READ,
   IORING_OP_RECV,
   IORING_OP_SEND,
@@ -253,6 +254,21 @@ enum {
 enum {
   IORING_CQE_F_BUFFER = 1u << 0,
   IORING_CQE_F_MORE = 1u << 1
+};
+
+/* RFC-free, this is liburing's own: a poll that STAYS armed until it is
+ * removed, reporting every readiness with IORING_CQE_F_MORE set. It is
+ * what a Watcher is - built once, running until told to stop - so it is
+ * the one poll form this file cares about most. */
+enum {
+  IORING_POLL_ADD_MULTI = 1u << 0
+};
+
+/* An update names the poll to change by its OLD user_data, and says
+ * which of the two things it is changing. Both may be set at once. */
+enum {
+  IORING_POLL_UPDATE_EVENTS = 1u << 1,
+  IORING_POLL_UPDATE_USER_DATA = 1u << 2
 };
 #define IORING_CQE_BUFFER_SHIFT 16
 #define IORING_MAX_FIXED_FILES (1u << 20)
@@ -316,6 +332,10 @@ struct io_uring_sqe {
   uint32_t optname;
   uint64_t optval;
   uint32_t optlen;
+  /* The poll mask lives here and NOT in len, because len carries the
+   * poll flags - that is how liburing spells it, and a header that
+   * claims its API has to spell it the same way. */
+  uint32_t poll32_events;
   uint64_t user_data;
 };
 
@@ -445,6 +465,13 @@ struct io_uring {
   struct io_uring_cqe *cqes;
   SLIPSTREAM_ATOMIC(unsigned) cq_head;
   SLIPSTREAM_ATOMIC(unsigned) cq_tail;
+
+  /* How many armed multishot polls are QUIET - each holding a completion
+   * the caller has not taken yet. Nonzero is the only reason a caller's
+   * advance has to wake the engine, so it is read on that path and
+   * nowhere else. See slipstream_poll_voice below for why they go quiet
+   * at all. */
+  SLIPSTREAM_ATOMIC(unsigned) poll_quiet;
 
   /* ring_fd: the read end of the COMPLETION pipe, and a real pollable
    * descriptor - the property real liburing's ring_fd has, and the whole
@@ -671,7 +698,41 @@ static inline void io_uring_prep_poll_add(struct io_uring_sqe *s, int fd, unsign
   io_uring_prep_nop(s);
   s->opcode = IORING_OP_POLL_ADD;
   s->fd = fd;
-  s->len = poll_mask;
+  s->poll32_events = poll_mask;
+}
+
+/* One poll, armed once, reporting readiness for as long as it is left
+ * alone. Every completion but the last carries IORING_CQE_F_MORE. */
+static inline void io_uring_prep_multishot_poll_add(struct io_uring_sqe *s, int fd,
+                                                    unsigned poll_mask) {
+  io_uring_prep_poll_add(s, fd, poll_mask);
+  s->len = IORING_POLL_ADD_MULTI;
+}
+
+/* Take an armed poll off the ring, named by the user_data it was armed
+ * with. The removal itself completes, so a caller always learns whether
+ * there was anything there to remove (-ENOENT if not). */
+static inline void io_uring_prep_poll_remove(struct io_uring_sqe *s, uint64_t user_data) {
+  io_uring_prep_nop(s);
+  s->opcode = IORING_OP_POLL_REMOVE;
+  s->fd = -1;
+  s->addr = user_data;
+}
+
+/* Change an armed poll in place: what it waits for, what it answers
+ * under, or both - and NOTHING is re-registered, which is the whole
+ * point. Removing and adding would drop readiness that arrived in
+ * between; this cannot. */
+static inline void io_uring_prep_poll_update(struct io_uring_sqe *s, uint64_t old_user_data,
+                                             uint64_t new_user_data, unsigned poll_mask,
+                                             unsigned flags) {
+  io_uring_prep_nop(s);
+  s->opcode = IORING_OP_POLL_REMOVE;
+  s->fd = -1;
+  s->addr = old_user_data;
+  s->off = new_user_data;
+  s->len = flags;
+  s->poll32_events = poll_mask;
 }
 
 /* ---- file IO: the ops the engine thread made possible ---------------
@@ -958,6 +1019,33 @@ static inline int slipstream_execute(struct io_uring *st, struct io_uring_sqe *s
   switch (s->opcode) {
     case IORING_OP_NOP:
       return 0;
+    case IORING_OP_POLL_REMOVE: {
+      /* Removal and update are ONE opcode, the way liburing spells them:
+       * an update is a removal that puts something back in the same
+       * place. It runs here, on the engine, because the armed queue is
+       * the engine's and nobody else may touch it.
+       *
+       * In place matters. Remove-then-add would drop any readiness that
+       * arrived between the two, and would hand the caller a new
+       * registration where it asked for a changed one. */
+      unsigned i;
+      for (i = 0; i < st->waiting.n; i++) {
+        struct io_uring_sqe *w = &st->waiting.v[i];
+        if (w->opcode != IORING_OP_POLL_ADD || w->user_data != s->addr) continue;
+        if (s->len & (IORING_POLL_UPDATE_EVENTS | IORING_POLL_UPDATE_USER_DATA)) {
+          if (s->len & IORING_POLL_UPDATE_EVENTS) w->poll32_events = s->poll32_events;
+          if (s->len & IORING_POLL_UPDATE_USER_DATA) w->user_data = s->off;
+          return 0;
+        }
+        /* A cancelled poll completes, the same as it does on a real
+         * ring - so whoever armed it hears that it is over instead of
+         * waiting for a completion that is never coming. */
+        slipstream_post(st, w->user_data, -ECANCELED, 0);
+        slipstream_sqeq_remove(&st->waiting, i);
+        return 0;
+      }
+      return -ENOENT;
+    }
     case IORING_OP_UNLINKAT: {
       const char *path = (const char *)(uintptr_t)s->addr;
       return unlinkat(s->fd, path, (int)s->unlink_flags) == 0 ? 0 : -errno;
@@ -1056,6 +1144,31 @@ static inline int slipstream_execute(struct io_uring *st, struct io_uring_sqe *s
   }
 }
 
+/* ENGINE. Give voice back to every quiet poll whose completion the
+ * caller has now taken. Called once per turn, before the sets are built,
+ * so a poll that has been caught up with is armed again in the very same
+ * turn rather than a turn late. */
+static inline void slipstream_poll_voice(struct io_uring *st) {
+  const unsigned head = slipstream_load(&st->cq_head, slipstream_mo_acquire);
+  unsigned freed = 0;
+  unsigned i;
+  if (slipstream_load(&st->poll_quiet, slipstream_mo_relaxed) == 0) return;
+  for (i = 0; i < st->waiting.n; i++) {
+    struct io_uring_sqe *w = &st->waiting.v[i];
+    if (w->opcode != IORING_OP_POLL_ADD || w->off == 0) continue;
+    /* Unsigned difference, so the comparison survives the counters
+     * wrapping - the same way every other head/tail test here does. */
+    if ((unsigned)(head - (unsigned)w->off) > 0x80000000u) continue;
+    w->off = 0;
+    freed++;
+  }
+  if (freed != 0) {
+    slipstream_store(&st->poll_quiet,
+                     slipstream_load(&st->poll_quiet, slipstream_mo_relaxed) - freed,
+                     slipstream_mo_release);
+  }
+}
+
 /* ENGINE. Builds the fd_sets for everything armed, PLUS the control
  * pipe - that last one is what lets a submission, an errand or a
  * shutdown interrupt a select that would otherwise wait on the network.
@@ -1070,7 +1183,22 @@ static inline int slipstream_build_waitsets(struct io_uring *st, fd_set *rset, f
     const int fd = slipstream_resolve_fd(st, w);
     if (fd < 0 || fd >= IO_URING_FD_CEILING) continue;
     if (w->opcode == IORING_OP_SEND || w->opcode == IORING_OP_SENDMSG) FD_SET(fd, wset);
-    else FD_SET(fd, rset);
+    else if (w->opcode == IORING_OP_POLL_ADD) {
+      /* A poll goes where its MASK says, which is the whole difference
+       * between this and every other op here: those know their own
+       * direction, a poll is told. Both sets when it wants both.
+       *
+       * POLLIN and POLLOUT are the whole vocabulary, because they are
+       * the whole of what select(2) has to say. A mask asking for
+       * anything else gets the readable set - the closest honest
+       * answer, and better than arming nothing at all. */
+      /* A quiet poll is in NEITHER set. Leaving it in would put a ready
+       * descriptor in front of select, which would return at once, over
+       * and over - the spin this whole mechanism exists to prevent. */
+      if (w->off != 0) continue;
+      if (w->poll32_events & POLLOUT) FD_SET(fd, wset);
+      if (!(w->poll32_events & POLLOUT) || (w->poll32_events & POLLIN)) FD_SET(fd, rset);
+    } else FD_SET(fd, rset);
     if (fd + 1 > nfds) nfds = fd + 1;
   }
   FD_SET(st->ctl_r, rset);
@@ -1138,9 +1266,50 @@ static inline void slipstream_drain_ready(struct io_uring *st, const fd_set *rse
             remove = 1;
           }
         }
-      } else if (w->opcode == IORING_OP_POLL_ADD && FD_ISSET(fd, rset)) {
-        slipstream_post(st, w->user_data, POLLIN, 0);
-        remove = 1;
+      } else if (w->opcode == IORING_OP_POLL_ADD &&
+                 (FD_ISSET(fd, rset) || FD_ISSET(fd, wset))) {
+        /* What select knows, and NOTHING beyond it. This engine is
+         * select(2) - asking poll(2) here for a nicer answer would
+         * quietly make it a poll engine, which is the one thing this
+         * file is not.
+         *
+         * So there is no POLLHUP and no POLLERR in these revents, and
+         * there cannot be: select reports a dead peer as readable and
+         * says no more than that. A reader learns the difference the
+         * way anyone using select learns it - recv answers 0 for a
+         * closed peer and -1 for a broken one. That is a real
+         * difference from a kernel ring, and it belongs in the docs
+         * rather than in a syscall smuggled in here. */
+        unsigned got = 0;
+        if (FD_ISSET(fd, rset)) got |= POLLIN;
+        if (FD_ISSET(fd, wset)) got |= POLLOUT;
+        got &= w->poll32_events ? w->poll32_events : (unsigned)POLLIN;
+        if (got == 0) {
+          /* Ready for a direction this poll never asked about. Not this
+           * one's completion, and no reason for it to end. */
+        } else if (w->len & IORING_POLL_ADD_MULTI) {
+          /* Armed once, still armed: MORE says so, and the entry stays
+           * in the queue. Only POLL_REMOVE takes it out.
+           *
+           * And then it goes QUIET until the caller takes that
+           * completion. select is level-triggered: an fd nobody has read
+           * yet stays ready, so without this the engine would post for
+           * every turn of the loop - measured at 1.6M completions and a
+           * whole core in two seconds, for ONE unread byte. A kernel
+           * ring does not do that, because its multishot poll hangs off
+           * a waitqueue and only fires on a wakeup. One outstanding
+           * completion per poll is how that is honoured here, and it
+           * loses nothing: the fd is still ready, so the next turn after
+           * the caller catches up reports it again. */
+          slipstream_post(st, w->user_data, (int)got, IORING_CQE_F_MORE);
+          w->off = (uint64_t)slipstream_load(&st->cq_tail, slipstream_mo_relaxed);
+          slipstream_store(&st->poll_quiet,
+                           slipstream_load(&st->poll_quiet, slipstream_mo_relaxed) + 1u,
+                           slipstream_mo_release);
+        } else {
+          slipstream_post(st, w->user_data, (int)got, 0);
+          remove = 1;
+        }
       }
     } else {
       slipstream_post(st, w->user_data, -EBADF, 0);
@@ -1443,6 +1612,7 @@ static inline int slipstream_engine_run(void *arg) {
     slipstream_process(st);
     slipstream_arm_cq_pipe(st);
 
+    slipstream_poll_voice(st);
     nfds = slipstream_build_waitsets(st, &rset, &wset);
     mtx_lock(&st->mtx);
     if (st->pending.n != 0 || st->errand != NULL || st->stopping) {
@@ -1606,6 +1776,7 @@ static inline int io_uring_queue_init_params(unsigned entries, struct io_uring *
   slipstream_store(&st->bufring.tail, 0u, slipstream_mo_relaxed);
   slipstream_store(&st->cq_head, 0u, slipstream_mo_relaxed);
   slipstream_store(&st->cq_tail, 0u, slipstream_mo_relaxed);
+  slipstream_store(&st->poll_quiet, 0u, slipstream_mo_relaxed);
   slipstream_store(&st->cq_armed, 0, slipstream_mo_relaxed);
   slipstream_store(&st->cq_overflow, 0, slipstream_mo_relaxed);
   slipstream_store(&st->engine_idle, 0, slipstream_mo_relaxed);
@@ -1943,6 +2114,13 @@ static inline void io_uring_cq_advance(struct io_uring *st, unsigned nr) {
   slipstream_store(&st->cq_head, head + n, slipstream_mo_release);
   slipstream_drain_cq_pipe(st);
   if (slipstream_load(&st->cq_overflow, slipstream_mo_relaxed)) slipstream_poke(st);
+  /* A quiet multishot poll is waiting for exactly this: its completion
+   * has now been taken, so it may speak again. The store above is a
+   * release and this load an acquire, so the engine cannot see the poke
+   * without also seeing the new head - which is what makes a lost
+   * wakeup impossible. Costs a write on the control pipe only while a
+   * poll is actually quiet, which is only while a caller is behind. */
+  if (slipstream_load(&st->poll_quiet, slipstream_mo_acquire)) slipstream_poke(st);
 }
 
 static inline void io_uring_cqe_seen(struct io_uring *st, struct io_uring_cqe *cqe) {
