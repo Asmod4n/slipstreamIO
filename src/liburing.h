@@ -231,6 +231,7 @@ enum {
   IORING_OP_CLOSE,
   IORING_OP_LISTEN,
   IORING_OP_OPENAT,
+  IORING_OP_ASYNC_CANCEL,
   IORING_OP_POLL_ADD,
   IORING_OP_POLL_REMOVE,
   IORING_OP_READ,
@@ -262,6 +263,15 @@ enum {
  * the one poll form this file cares about most. */
 enum {
   IORING_POLL_ADD_MULTI = 1u << 0
+};
+
+/* Cancel by DESCRIPTOR, and take everything armed on it. One way to
+ * cancel is the whole point: an op family that needs its own remove is
+ * a family that has to be remembered separately, and a caller holding a
+ * descriptor already knows the only thing it needs to know. */
+enum {
+  IORING_ASYNC_CANCEL_ALL = 1u << 0,
+  IORING_ASYNC_CANCEL_FD = 1u << 1
 };
 
 /* An update names the poll to change by its OLD user_data, and says
@@ -709,6 +719,22 @@ static inline void io_uring_prep_multishot_poll_add(struct io_uring_sqe *s, int 
   s->len = IORING_POLL_ADD_MULTI;
 }
 
+/* Everything armed on this descriptor comes off, each armed op
+ * completing with -ECANCELED so nobody waits for a completion that is
+ * never coming. The cancel itself answers how many it took, or -ENOENT
+ * when there was nothing.
+ *
+ * This is the one cancel this header needs. A poll remove, a timeout
+ * remove and a cancel-by-user_data would be three ways to say the same
+ * sentence, and each would oblige a caller to remember which kind of op
+ * it armed. A descriptor is a thing the caller has in hand already. */
+static inline void io_uring_prep_cancel_fd(struct io_uring_sqe *s, int fd, unsigned flags) {
+  io_uring_prep_nop(s);
+  s->opcode = IORING_OP_ASYNC_CANCEL;
+  s->fd = fd;
+  s->len = flags | IORING_ASYNC_CANCEL_FD;
+}
+
 /* Take an armed poll off the ring, named by the user_data it was armed
  * with. The removal itself completes, so a caller always learns whether
  * there was anything there to remove (-ENOENT if not). */
@@ -1019,6 +1045,29 @@ static inline int slipstream_execute(struct io_uring *st, struct io_uring_sqe *s
   switch (s->opcode) {
     case IORING_OP_NOP:
       return 0;
+    case IORING_OP_ASYNC_CANCEL: {
+      /* Runs on the engine, because the armed queue is the engine's.
+       * Walks backwards so removing an entry cannot skip the next one. */
+      unsigned i = st->waiting.n;
+      int taken = 0;
+      while (i-- > 0) {
+        struct io_uring_sqe *w = &st->waiting.v[i];
+        if (slipstream_resolve_fd(st, w) != s->fd) continue;
+        slipstream_post(st, w->user_data, -ECANCELED, 0);
+        /* A quiet multishot poll still counts against poll_quiet, and
+         * taking it away without saying so would leave the engine
+         * waking itself forever. */
+        if (w->opcode == IORING_OP_POLL_ADD && w->off != 0) {
+          slipstream_store(&st->poll_quiet,
+                           slipstream_load(&st->poll_quiet, slipstream_mo_relaxed) - 1u,
+                           slipstream_mo_release);
+        }
+        slipstream_sqeq_remove(&st->waiting, i);
+        taken++;
+        if (!(s->len & IORING_ASYNC_CANCEL_ALL)) break;
+      }
+      return taken != 0 ? taken : -ENOENT;
+    }
     case IORING_OP_POLL_REMOVE: {
       /* Removal and update are ONE opcode, the way liburing spells them:
        * an update is a removal that puts something back in the same
