@@ -135,6 +135,38 @@ int main() {
     std::printf("no spin: 2s over an unread byte cost %ld us and %u completions\n", us, extra);
   }
 
+  // cancel_fd is the ONE cancel: it takes everything armed on a
+  // descriptor, which is all a CDATA destructor knows and all it needs.
+  // Two polls on one fd, one sentence, both gone.
+  {
+    for (int i = 0; i < 2; i++) {
+      struct io_uring_sqe* q = io_uring_get_sqe(&r);
+      io_uring_prep_multishot_poll_add(q, sv[1], POLLOUT);
+      io_uring_sqe_set_data64(q, 0xc001 + (unsigned)i);
+      if (io_uring_submit(&r) < 1) return fail("submit poll for cancel");
+      if (take(&r, &c) != 0) return fail("wait writable before cancel");
+      io_uring_cqe_seen(&r, c);  // taken, so the poll goes quiet
+    }
+    struct io_uring_sqe* q = io_uring_get_sqe(&r);
+    io_uring_prep_cancel_fd(q, sv[1], IORING_ASYNC_CANCEL_ALL);
+    io_uring_sqe_set_data64(q, 0xca11);
+    if (io_uring_submit(&r) < 1) return fail("submit cancel_fd");
+
+    int cancelled = 0, answered = 0;
+    for (int i = 0; i < 3; i++) {
+      if (take(&r, &c) != 0) return fail("wait cancel_fd");
+      if (c->res == -ECANCELED && (c->user_data == 0xc001 || c->user_data == 0xc002)) cancelled++;
+      if (c->user_data == 0xca11) {
+        if (c->res != 2) return fail("cancel_fd did not report two");
+        answered = 1;
+      }
+      io_uring_cqe_seen(&r, c);
+    }
+    if (cancelled != 2) return fail("cancel_fd left a poll armed");
+    if (!answered) return fail("cancel_fd never completed");
+    std::printf("cancel_fd: both polls on one descriptor, one sentence\n");
+  }
+
   close(sv[0]);
   close(sv[1]);
   io_uring_queue_exit(&r);
