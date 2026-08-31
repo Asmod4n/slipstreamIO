@@ -16,21 +16,61 @@
  */
 #include <liburing.h>
 
+#include <stdint.h>
+
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 /* Everything the caller's inlines index through, in one allocation.
  * liburing keeps the mmap base in sq.ring_ptr and frees it in
  * queue_exit; this uses the same slot for the same purpose. */
+/* OUR half of an SQE, one per slot of the submission ring and reached by
+ * the same index the caller's inline already computed - sqe_tail &
+ * ring_mask. Beside the SQE and never inside it: the kernel's reserved
+ * and padding fields are the kernel's, and a future one that starts
+ * using them would take our bookkeeping with it.
+ *
+ * It is also where the decode lands. The kernel SQE overlays its
+ * meanings in unions (linux/io_uring.h), so the same bytes are off or
+ * addr2 or cmd_op depending on the opcode; the engine wants named
+ * fields, and this is where they get their names. */
+struct slip_op {
+  uint8_t opcode;
+  uint8_t sqe_flags; /* IOSQE_* as the caller set them */
+  int32_t fd;
+  uint64_t off;
+  uint64_t addr;
+  uint32_t len;
+  uint32_t op_flags; /* the one union: rw_flags, msg_flags, poll32_events, ... */
+  uint64_t user_data;
+};
+
 struct slip_ring {
   unsigned sq_head, sq_tail, sq_flags, sq_dropped;
   unsigned cq_head, cq_tail, cq_flags, cq_overflow;
   unsigned *array;
   struct io_uring_sqe *sqes;
+  struct slip_op *ops; /* sq_entries of them, same index as sqes */
   struct io_uring_cqe *cqes;
   unsigned sq_entries, cq_entries;
 };
+
+/* Only fields linux/io_uring.h names, and only the arm of each union
+ * that this opcode is documented to use. */
+static void decode(const struct io_uring_sqe *sqe, struct slip_op *op) {
+  op->opcode = sqe->opcode;
+  op->sqe_flags = sqe->flags;
+  op->fd = sqe->fd;
+  op->off = sqe->off;
+  op->addr = sqe->addr;
+  op->len = sqe->len;
+  op->op_flags = sqe->rw_flags;
+  op->user_data = sqe->user_data;
+}
 
 static unsigned round_up_pow2(unsigned v) {
   unsigned n = 1;
@@ -52,10 +92,11 @@ int io_uring_queue_init_params(unsigned entries, struct io_uring *ring,
   struct slip_ring *s = calloc(1, sizeof(*s));
   if (s == NULL) return -ENOMEM;
   s->sqes = calloc(sq_entries, sizeof(*s->sqes));
+  s->ops = calloc(sq_entries, sizeof(*s->ops));
   s->cqes = calloc(cq_entries, sizeof(*s->cqes));
   s->array = calloc(sq_entries, sizeof(*s->array));
-  if (s->sqes == NULL || s->cqes == NULL || s->array == NULL) {
-    free(s->sqes); free(s->cqes); free(s->array); free(s);
+  if (s->sqes == NULL || s->ops == NULL || s->cqes == NULL || s->array == NULL) {
+    free(s->sqes); free(s->ops); free(s->cqes); free(s->array); free(s);
     return -ENOMEM;
   }
   s->sq_entries = sq_entries;
@@ -100,6 +141,7 @@ void io_uring_queue_exit(struct io_uring *ring) {
   if (s == NULL) return;
   free(s->array);
   free(s->cqes);
+  free(s->ops);
   free(s->sqes);
   free(s);
   memset(ring, 0, sizeof(*ring));
@@ -128,13 +170,35 @@ static int publish(struct slip_ring *s, __u64 user_data, int res, unsigned flags
  * is what a caller needs in order to take another route; the second says
  * "you passed nonsense", which would be a lie about a well-formed SQE.
  */
-static int run_one(struct slip_ring *s, const struct io_uring_sqe *sqe) {
-  switch (sqe->opcode) {
+/* A pipe has no offset. liburing spells "wherever the descriptor
+ * stands" as an offset of -1, and that is the only spelling this
+ * answers with read/write instead of pread/pwrite. */
+static int off_is_current(uint64_t off) { return off == (uint64_t) -1; }
+
+static int run_one(struct slip_ring *s, const struct slip_op *op) {
+  void *buf = (void *) (uintptr_t) op->addr;
+  ssize_t n;
+  switch (op->opcode) {
     case IORING_OP_NOP:
-      return publish(s, sqe->user_data, 0, 0);
+      return publish(s, op->user_data, 0, 0);
+    case IORING_OP_READ:
+      n = off_is_current(op->off) ? read(op->fd, buf, op->len)
+                                  : pread(op->fd, buf, op->len, (off_t) op->off);
+      break;
+    case IORING_OP_WRITE:
+      n = off_is_current(op->off) ? write(op->fd, buf, op->len)
+                                  : pwrite(op->fd, buf, op->len, (off_t) op->off);
+      break;
+    case IORING_OP_RECV:
+      n = recv(op->fd, buf, op->len, (int) op->op_flags);
+      break;
+    case IORING_OP_SEND:
+      n = send(op->fd, buf, op->len, (int) op->op_flags);
+      break;
     default:
-      return publish(s, sqe->user_data, -EOPNOTSUPP, 0);
+      return publish(s, op->user_data, -EOPNOTSUPP, 0);
   }
+  return publish(s, op->user_data, n < 0 ? -errno : (int) n, 0);
 }
 
 int io_uring_submit(struct io_uring *ring) {
@@ -142,7 +206,9 @@ int io_uring_submit(struct io_uring *ring) {
   const unsigned mask = s->sq_entries - 1;
   int submitted = 0;
   while (s->sq_head != ring->sq.sqe_tail) {
-    run_one(s, &s->sqes[s->sq_head & mask]);
+    const unsigned i = s->sq_head & mask;
+    decode(&s->sqes[i], &s->ops[i]);
+    run_one(s, &s->ops[i]);
     s->sq_head++;
     submitted++;
   }

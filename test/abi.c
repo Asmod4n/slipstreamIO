@@ -5,6 +5,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
 
 static int fails = 0;
 
@@ -74,6 +76,44 @@ int main(void) {
   ok(rc == 0 && cqe->user_data == 0xbeef && cqe->res == 0,
      "and the op behind it in the same batch is unharmed");
   io_uring_cq_advance(&ring, 1);
+
+  /* Real bytes, through liburing's own prep_write/prep_read. An offset
+   * of -1 is how liburing spells "wherever the descriptor stands", which
+   * is the only thing a pipe has. */
+  int fds[2];
+  ok(pipe(fds) == 0, "a pipe to move bytes through");
+  static const char msg[] = "slipstream";
+  char got[sizeof(msg)];
+  memset(got, 0, sizeof(got));
+
+  sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_write(sqe, fds[1], msg, (unsigned) strlen(msg), (__u64) -1);
+  io_uring_sqe_set_data64(sqe, 1);
+  sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_read(sqe, fds[0], got, (unsigned) strlen(msg), (__u64) -1);
+  io_uring_sqe_set_data64(sqe, 2);
+  ok(io_uring_submit(&ring) == 2, "a write and a read submitted together");
+
+  rc = io_uring_wait_cqe(&ring, &cqe);
+  ok(rc == 0 && cqe->user_data == 1 && cqe->res == (int) strlen(msg),
+     "IORING_OP_WRITE reports the bytes it wrote");
+  io_uring_cq_advance(&ring, 1);
+  rc = io_uring_wait_cqe(&ring, &cqe);
+  ok(rc == 0 && cqe->user_data == 2 && cqe->res == (int) strlen(msg),
+     "IORING_OP_READ reports the bytes it read");
+  io_uring_cq_advance(&ring, 1);
+  ok(memcmp(got, msg, strlen(msg)) == 0, "and the bytes are the ones that were sent");
+
+  /* An error arrives the way the kernel sends one: negative errno in res. */
+  sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_read(sqe, -1, got, 1, (__u64) -1);
+  io_uring_sqe_set_data64(sqe, 3);
+  io_uring_submit(&ring);
+  rc = io_uring_wait_cqe(&ring, &cqe);
+  ok(rc == 0 && cqe->res == -EBADF, "a bad descriptor completes with -EBADF");
+  io_uring_cq_advance(&ring, 1);
+  close(fds[0]);
+  close(fds[1]);
 
   io_uring_queue_exit(&ring);                            /* ours */
   printf("%s\n", fails ? "FAILURES" : "all ok");
