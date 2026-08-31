@@ -60,4 +60,6 @@ build-iPhoneSimulator/
 /test/syscall
 /test/shim
 /test/blocked
+/test/backends
+/test/backends-*
 /test/*.o

@@ -11,41 +11,89 @@
  * completes plenty of work inline during io_uring_enter - a read out of
  * the page cache, a send with room in the buffer - and so does this
  * engine. What the kernel never does is stall the whole ring behind one
- * recv on an empty socket, and neither does this: an op that would block
- * is parked with the events it waits for, the engine thread polls the
- * parked set, and the completion is posted when the descriptor is ready.
- * The multiplexer SlipstreamIO has always been - engine thread, control
- * pipe, poll over the waiting set, a worker only for regular files,
- * which have no readiness to poll for - reading kernel-format SQEs
- * behind liburing instead of its own.
+ * recv on an empty socket, and neither does this: an op that cannot
+ * finish now goes to the backend - parked for readiness, issued as an
+ * overlapped, handed to the worker - and its completion is posted when
+ * it comes back. HOW is the whole difference between platforms, and it
+ * is all a backend is - see engine_internal.h. This file is everything
+ * else: order, chains, the CQ, enter. It compiles on every platform the
+ * engine serves, Windows included, and holds not one OS call.
  *
  * What the engine reads is one shape, not fifty: io_uring_prep_rw fills
  * opcode, fd, off, addr and len, and 56 of liburing's prep functions go
  * through it. Each op adds at most one field of its own afterwards.
  */
-
-/* pread/pwrite are POSIX names a bare -std=c11 hides. This is a .c of
- * our own, not a header a consumer includes, so it may say what it needs
- * on its own first line. */
-#define _DEFAULT_SOURCE 1
-
 #include "slipstream_engine.h"
+#include "engine_internal.h"
 
-#include <errno.h>
-#include <linux/io_uring.h>
-#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <threads.h>
 #include <time.h>
-#include <unistd.h>
 
-#define SLIP_RINGS_MAX 64
-#define SLIP_WAITING_MAX 1024
+static struct slip_ring g_rings[SLIP_RINGS_MAX];
+
+/* The backend is a per-process choice, made by the platform and
+ * overridable by name until the first ring exists - a switch under
+ * running rings would strand their pending ops. */
+static const struct eng_backend *g_backend;
+
+static const struct eng_backend *backend_default(void) {
+#if defined(_WIN32)
+  return &slip_backend_iocp;
+#elif defined(__APPLE__)
+  return &slip_backend_dispatch; /* kqueue is ruled out there - TASKS.md */
+#elif defined(__linux__)
+  return &slip_backend_epoll;
+#elif defined(__FreeBSD__) || defined(__DragonFly__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__)
+  return &slip_backend_kqueue;
+#else
+  return &slip_backend_poll;
+#endif
+}
+
+static const struct eng_backend *backend_by_name(const char *name) {
+#ifndef _WIN32
+  if (strcmp(name, slip_backend_poll.name) == 0) return &slip_backend_poll;
+#endif
+#ifdef __linux__
+  if (strcmp(name, slip_backend_epoll.name) == 0) return &slip_backend_epoll;
+#endif
+#if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__) || defined(__APPLE__) || defined(SLIPSTREAM_HAVE_LIBKQUEUE)
+  if (strcmp(name, slip_backend_kqueue.name) == 0) return &slip_backend_kqueue;
+#endif
+#if defined(__APPLE__) || defined(SLIPSTREAM_HAVE_LIBDISPATCH)
+  if (strcmp(name, slip_backend_dispatch.name) == 0) return &slip_backend_dispatch;
+#endif
+#ifdef _WIN32
+  if (strcmp(name, slip_backend_iocp.name) == 0) return &slip_backend_iocp;
+#endif
+  return NULL;
+}
+
+int slipstream_engine_backend_set(const char *name) {
+  const struct eng_backend *be = backend_by_name(name);
+  if (be == NULL) return -EINVAL; /* not carried on this platform: said, not ignored */
+  for (int i = 0; i < SLIP_RINGS_MAX; i++) {
+    if (g_rings[i].in_use) return -EBUSY; /* rings already run on the current one */
+  }
+  g_backend = be;
+  return 0;
+}
+
+const char *slipstream_engine_backend_name(void) {
+  return (g_backend ? g_backend : backend_default())->name;
+}
+
+static struct slip_ring *ring_of(int fd) {
+  if ((fd & SLIP_RING_TOKEN) == 0) return NULL;
+  const int i = fd & ~SLIP_RING_TOKEN;
+  if (i < 0 || i >= SLIP_RINGS_MAX || !g_rings[i].in_use) return NULL;
+  return &g_rings[i];
+}
 
 /* The layout we report, and therefore the one liburing reads through. */
 struct sq_ring {
@@ -56,57 +104,6 @@ struct cq_ring {
   unsigned head, tail, ring_mask, ring_entries, overflow, flags;
   /* cqes[] follow */
 };
-
-/* One submitted op, copied out of the caller's SQE slot so the slot is
- * reusable the moment enter returns - the same promise the kernel makes. */
-struct eng_op {
-  struct io_uring_sqe sqe;
-  struct eng_op *next;
-  short wait_events; /* POLLIN/POLLOUT while parked */
-  int stalls_queue;  /* a linked file op: the queue waits for the worker */
-};
-
-struct slip_ring {
-  int in_use;
-  unsigned sq_entries, cq_entries;
-  void *sq_block;
-  void *cq_block;
-  struct io_uring_sqe *sqes;
-  size_t sq_size, cq_size, sqes_size;
-
-  /* ---- the handoff, and the completions ---------------------------- */
-  mtx_t mtx;  /* inbox, worker queue, CQ posting, backlog, blocked_done */
-  cnd_t cv;   /* a completion was posted - enter's wait side */
-  cnd_t wq_cv;
-  struct eng_op *inbox_head, *inbox_tail; /* enter -> engine */
-  struct eng_op *backlog_head, *backlog_tail; /* completions the CQ had no room for */
-  struct eng_op *wq_head, *wq_tail; /* engine -> worker (regular files) */
-  struct eng_op *blocked_done; /* the op the queue stalled on, finished off-thread */
-  int blocked_failed; /* that op's result was negative - the chain must know */
-
-  /* ---- what the ENGINE THREAD owns --------------------------------- */
-  struct eng_op *queue_head, *queue_tail; /* submitted, in order */
-  struct eng_op *waiting[SLIP_WAITING_MAX];
-  unsigned waiting_n;
-  int chain_failed; /* a linked op failed: cancel the rest of its chain */
-  struct eng_op *blocking; /* a linked op is parked or at the worker; the queue waits */
-
-  int ctl_r, ctl_w; /* the poke: "look again" - submissions, shutdown, worker done */
-  thrd_t engine;
-  int engine_live;
-  thrd_t worker;
-  int worker_live;
-  int stopping;
-};
-
-static struct slip_ring g_rings[SLIP_RINGS_MAX];
-
-static struct slip_ring *ring_of(int fd) {
-  if ((fd & SLIP_RING_TOKEN) == 0) return NULL;
-  const int i = fd & ~SLIP_RING_TOKEN;
-  if (i < 0 || i >= SLIP_RINGS_MAX || !g_rings[i].in_use) return NULL;
-  return &g_rings[i];
-}
 
 static struct sq_ring *sq_of(struct slip_ring *r) { return (struct sq_ring *) r->sq_block; }
 static struct cq_ring *cq_of(struct slip_ring *r) { return (struct cq_ring *) r->cq_block; }
@@ -123,17 +120,12 @@ static unsigned round_up_pow2(unsigned v) {
   return n;
 }
 
-static void poke(struct slip_ring *r) {
-  const char b = 1;
-  /* A full pipe already holds a wakeup; a failed write is not an error. */
-  (void) !write(r->ctl_w, &b, 1);
-}
-
 /* ---- completions ------------------------------------------------------
- * Only two threads post - the engine and the worker - both under mtx.
- * The caller's side is liburing's inlines: they read ktail with acquire
- * and move khead on their own, which is why the tail store is release
- * and why free CQ space is recomputed instead of tracked. */
+ * Whoever finishes an op posts - the engine thread, the worker, iocp's
+ * drain - all under mtx. The caller's side is liburing's inlines: they
+ * read ktail with acquire and move khead on their own, which is why the
+ * tail store is release and why free CQ space is recomputed instead of
+ * tracked. */
 
 static unsigned cq_avail(struct slip_ring *r) {
   struct cq_ring *cq = cq_of(r);
@@ -165,7 +157,7 @@ static void drain_backlog_locked(struct slip_ring *r) {
   }
 }
 
-static void post(struct slip_ring *r, struct eng_op *op, int res) {
+void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res) {
   mtx_lock(&r->mtx);
   drain_backlog_locked(r);
   if (cq_room(r)) {
@@ -184,154 +176,18 @@ static void post(struct slip_ring *r, struct eng_op *op, int res) {
   mtx_unlock(&r->mtx);
 }
 
-/* ---- running one op ---------------------------------------------------
- * Three answers: done (post it), would-block (park it with these
- * events), or file (a regular file has no readiness to poll for - the
- * worker runs it). */
-
-enum verdict { RAN, PARK, FILE_OP };
-
-/* liburing spells "wherever the descriptor stands" as an offset of -1,
- * and that is the only spelling answered with read/write rather than
- * pread/pwrite - a socket or a pipe has no offset. */
-static int off_is_current(__u64 off) { return off == (__u64) -1; }
-
-static int fd_is_pollable(int fd) {
-  struct stat st;
-  if (fstat(fd, &st) != 0) return 1; /* let the real call report the error */
-  return !(S_ISREG(st.st_mode) || S_ISBLK(st.st_mode) || S_ISDIR(st.st_mode));
-}
-
-static int ready_now(int fd, short events) {
-  struct pollfd p = { .fd = fd, .events = events };
-  return poll(&p, 1, 0) > 0;
-}
-
-static enum verdict run_one(struct eng_op *op, int *res_out) {
-  const struct io_uring_sqe *s = &op->sqe;
-  void *buf = (void *) (uintptr_t) s->addr;
-  ssize_t n;
-  switch (s->opcode) {
-    case IORING_OP_NOP:
-      *res_out = 0;
-      return RAN;
-    case IORING_OP_CLOSE:
-      n = close(s->fd);
-      *res_out = n < 0 ? -errno : 0;
-      return RAN;
-    case IORING_OP_RECV:
-      n = recv(s->fd, buf, s->len, (int) s->msg_flags | MSG_DONTWAIT);
-      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
-          !(s->msg_flags & MSG_DONTWAIT)) {
-        op->wait_events = POLLIN;
-        return PARK;
-      }
-      *res_out = n < 0 ? -errno : (int) n;
-      return RAN;
-    case IORING_OP_SEND:
-      n = send(s->fd, buf, s->len, (int) s->msg_flags | MSG_DONTWAIT);
-      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
-          !(s->msg_flags & MSG_DONTWAIT)) {
-        op->wait_events = POLLOUT;
-        return PARK;
-      }
-      *res_out = n < 0 ? -errno : (int) n;
-      return RAN;
-    case IORING_OP_READ:
-      if (!fd_is_pollable(s->fd)) return FILE_OP;
-      if (!ready_now(s->fd, POLLIN)) {
-        op->wait_events = POLLIN;
-        return PARK;
-      }
-      n = off_is_current(s->off) ? read(s->fd, buf, s->len)
-                                 : pread(s->fd, buf, s->len, (off_t) s->off);
-      *res_out = n < 0 ? -errno : (int) n;
-      return RAN;
-    case IORING_OP_WRITE:
-      if (!fd_is_pollable(s->fd)) return FILE_OP;
-      if (!ready_now(s->fd, POLLOUT)) {
-        op->wait_events = POLLOUT;
-        return PARK;
-      }
-      n = off_is_current(s->off) ? write(s->fd, buf, s->len)
-                                 : pwrite(s->fd, buf, s->len, (off_t) s->off);
-      *res_out = n < 0 ? -errno : (int) n;
-      return RAN;
-    default:
-      /* Known op, not carried here. -EOPNOTSUPP and not -EINVAL: the
-       * first says "that op, not here", which is what a caller needs in
-       * order to take another route. */
-      *res_out = -EOPNOTSUPP;
-      return RAN;
-  }
-}
-
-/* A regular file read or write, run to the end. Blocking is the point:
- * this thread exists so that the engine's poll loop never does. */
-static int run_file_op(const struct io_uring_sqe *s) {
-  void *buf = (void *) (uintptr_t) s->addr;
-  ssize_t n;
-  switch (s->opcode) {
-    case IORING_OP_READ:
-      n = off_is_current(s->off) ? read(s->fd, buf, s->len)
-                                 : pread(s->fd, buf, s->len, (off_t) s->off);
-      break;
-    case IORING_OP_WRITE:
-      n = off_is_current(s->off) ? write(s->fd, buf, s->len)
-                                 : pwrite(s->fd, buf, s->len, (off_t) s->off);
-      break;
-    default:
-      return -EOPNOTSUPP;
-  }
-  return n < 0 ? -errno : (int) n;
-}
-
-static int worker_main(void *arg) {
-  struct slip_ring *r = arg;
-  mtx_lock(&r->mtx);
-  for (;;) {
-    while (r->wq_head == NULL && !r->stopping) cnd_wait(&r->wq_cv, &r->mtx);
-    if (r->stopping) break;
-    struct eng_op *op = r->wq_head;
-    r->wq_head = op->next;
-    if (r->wq_head == NULL) r->wq_tail = NULL;
-    mtx_unlock(&r->mtx);
-
-    const int res = run_file_op(&op->sqe);
-    const int stalls = op->stalls_queue;
-    if (stalls) {
-      /* The ticket goes up before post frees the op. The engine only
-       * compares the pointer against r->blocking, never reads through
-       * it. */
-      mtx_lock(&r->mtx);
-      r->blocked_done = op;
-      r->blocked_failed = res < 0;
-      mtx_unlock(&r->mtx);
-    }
-    post(r, op, res); /* frees op */
-    if (stalls) poke(r); /* the queue is waiting on this */
-
-    mtx_lock(&r->mtx);
-  }
-  mtx_unlock(&r->mtx);
-  return 0;
-}
-
-static void worker_start_once(struct slip_ring *r) {
-  if (r->worker_live) return;
-  if (thrd_create(&r->worker, worker_main, r) == thrd_success) r->worker_live = 1;
-}
-
 /* ---- the engine thread ------------------------------------------------ */
 
-/* 1 if the op now waits; 0 if the set is full - the caller then answers
- * -EBUSY itself, because only the caller knows the op's chain. */
-static int park(struct slip_ring *r, struct eng_op *op) {
-  if (r->waiting_n < SLIP_WAITING_MAX) {
-    r->waiting[r->waiting_n++] = op;
-    return 1;
+/* An op is done: settle its chain standing, then post. Engine thread
+ * only - the worker's path settles through the ticket instead. */
+static void complete(struct slip_ring *r, struct eng_op *op, int res) {
+  if (op == r->blocking) {
+    r->blocking = NULL;
+    if (res < 0) r->chain_failed = 1;
+  } else if (res < 0 && (op->sqe.flags & IOSQE_IO_LINK)) {
+    r->chain_failed = 1;
   }
-  return 0;
+  slip_engine_post(r, op, res);
 }
 
 static void process_queue(struct slip_ring *r) {
@@ -346,124 +202,64 @@ static void process_queue(struct slip_ring *r) {
     if (r->chain_failed) {
       /* A failing IOSQE_IO_LINK member cancels the rest of its chain -
        * io_uring_enter(2), IOSQE_IO_LINK. */
-      post(r, op, -ECANCELED);
+      slip_engine_post(r, op, -ECANCELED);
       if (!linked) r->chain_failed = 0;
       continue;
     }
 
     int res = 0;
-    switch (run_one(op, &res)) {
-      case RAN:
-        if (res < 0 && linked) r->chain_failed = 1;
-        post(r, op, res);
-        break;
-      case PARK:
-        if (park(r, op)) {
-          if (linked) r->blocking = op; /* the chain waits where it is */
-        } else {
-          if (linked) r->chain_failed = 1;
-          post(r, op, -EBUSY); /* a full waiting set is refused, not dropped */
-        }
-        break;
-      case FILE_OP:
-        if (linked) {
-          op->stalls_queue = 1;
-          r->blocking = op;
-        }
-        mtx_lock(&r->mtx);
-        if (r->wq_tail) r->wq_tail->next = op;
-        else r->wq_head = op;
-        r->wq_tail = op;
-        worker_start_once(r);
-        cnd_signal(&r->wq_cv);
-        mtx_unlock(&r->mtx);
-        break;
+    if (r->be->execute(r, op, &res) == EXEC_DONE) {
+      if (res < 0 && linked) r->chain_failed = 1;
+      slip_engine_post(r, op, res);
+    } else if (linked) {
+      r->blocking = op; /* the chain waits wherever the op is */
     }
   }
 }
 
 static int engine_main(void *arg) {
   struct slip_ring *r = arg;
-  struct pollfd pfds[SLIP_WAITING_MAX + 1];
+  struct eng_done done[SLIP_WAITING_MAX];
 
   for (;;) {
-    pfds[0].fd = r->ctl_r;
-    pfds[0].events = POLLIN;
-    for (unsigned i = 0; i < r->waiting_n; i++) {
-      pfds[i + 1].fd = r->waiting[i]->sqe.fd;
-      pfds[i + 1].events = r->waiting[i]->wait_events;
-    }
-    if (poll(pfds, r->waiting_n + 1, -1) < 0) {
-      if (errno == EINTR) continue;
+    const int n = r->be->wait(r, done, SLIP_WAITING_MAX);
+    if (n < 0) break;
+
+    /* Wakeups are level-noisy and pokes coalesce, so every wakeup does
+     * the whole drain: shutdown, new submissions, the worker's ticket,
+     * backlog room. */
+    mtx_lock(&r->mtx);
+    if (r->stopping) {
+      mtx_unlock(&r->mtx);
       break;
     }
-
-    if (pfds[0].revents & POLLIN) {
-      char sink[64];
-      (void) !read(r->ctl_r, sink, sizeof(sink));
-      mtx_lock(&r->mtx);
-      if (r->stopping) {
-        mtx_unlock(&r->mtx);
-        break;
-      }
-      /* New submissions in, and the ticket for a chain the worker
-       * finished off-thread. */
-      if (r->inbox_head != NULL) {
-        if (r->queue_tail) r->queue_tail->next = r->inbox_head;
-        else r->queue_head = r->inbox_head;
-        r->queue_tail = r->inbox_tail;
-        r->inbox_head = r->inbox_tail = NULL;
-      }
-      if (r->blocked_done != NULL && r->blocked_done == r->blocking) {
-        /* The pointer is a ticket - the op behind it is already posted
-         * and freed, so it is compared, never read. */
-        r->blocking = NULL;
-        r->blocked_done = NULL;
-        if (r->blocked_failed) {
-          r->chain_failed = 1;
-          r->blocked_failed = 0;
-        }
-      }
-      drain_backlog_locked(r);
-      mtx_unlock(&r->mtx);
+    if (r->inbox_head != NULL) {
+      if (r->queue_tail) r->queue_tail->next = r->inbox_head;
+      else r->queue_head = r->inbox_head;
+      r->queue_tail = r->inbox_tail;
+      r->inbox_head = r->inbox_tail = NULL;
     }
-
-    /* Parked descriptors that came ready: run them where they stand -
-     * the try is DONTWAIT/poll-guarded, so a spurious wakeup re-parks. */
-    unsigned kept = 0;
-    for (unsigned i = 0; i < r->waiting_n; i++) {
-      struct eng_op *op = r->waiting[i];
-      if (!(pfds[i + 1].revents & (op->wait_events | POLLERR | POLLHUP))) {
-        r->waiting[kept++] = op;
-        continue;
-      }
-      int res = 0;
-      enum verdict v = run_one(op, &res);
-      if (v == FILE_OP) { /* a parked op never becomes a file op */
-        v = RAN;
-        res = -EOPNOTSUPP;
-      }
-      switch (v) {
-        case RAN:
-          if (op == r->blocking) {
-            r->blocking = NULL;
-            if (res < 0) r->chain_failed = 1;
-          }
-          post(r, op, res);
-          break;
-        default:
-          r->waiting[kept++] = op;
-          break;
+    if (r->blocked_done != NULL && r->blocked_done == r->blocking) {
+      /* The pointer is a ticket - the op behind it is already posted
+       * and freed, so it is compared, never read. */
+      r->blocking = NULL;
+      r->blocked_done = NULL;
+      if (r->blocked_failed) {
+        r->chain_failed = 1;
+        r->blocked_failed = 0;
       }
     }
-    r->waiting_n = kept;
+    drain_backlog_locked(r);
+    mtx_unlock(&r->mtx);
+
+    for (int i = 0; i < n; i++) complete(r, done[i].op, done[i].res);
 
     process_queue(r);
   }
   return 0;
 }
 
-/* ---- the exported five ------------------------------------------------ */
+/* ---- the exported five, and the backend switch ------------------------ */
 
 int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   if (entries == 0 || p == NULL) return -EINVAL;
@@ -487,6 +283,10 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
 
   struct slip_ring *r = &g_rings[idx];
   memset(r, 0, sizeof(*r));
+  if (g_backend == NULL) g_backend = backend_default();
+  r->be = g_backend;
+  r->be_fd = -1;
+  r->ctl_r = r->ctl_w = -1;
   r->sq_entries = round_up_pow2(entries);
   r->cq_entries = p->cq_entries ? round_up_pow2(p->cq_entries) : r->sq_entries * 2;
 
@@ -497,17 +297,22 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   r->sq_block = calloc(1, r->sq_size);
   r->cq_block = calloc(1, r->cq_size);
   r->sqes = calloc(r->sq_entries, sizeof(struct io_uring_sqe));
-  int fds[2] = { -1, -1 };
-  if (!r->sq_block || !r->cq_block || !r->sqes || pipe(fds) != 0 ||
+  if (!r->sq_block || !r->cq_block || !r->sqes ||
       mtx_init(&r->mtx, mtx_plain) != thrd_success ||
       cnd_init(&r->cv) != thrd_success || cnd_init(&r->wq_cv) != thrd_success) {
     free(r->sq_block); free(r->cq_block); free(r->sqes);
-    if (fds[0] >= 0) { close(fds[0]); close(fds[1]); }
     memset(r, 0, sizeof(*r));
     return -ENOMEM;
   }
-  r->ctl_r = fds[0];
-  r->ctl_w = fds[1];
+
+  if (r->be->open_ring(r) != 0) {
+    mtx_destroy(&r->mtx);
+    cnd_destroy(&r->cv);
+    cnd_destroy(&r->wq_cv);
+    free(r->sq_block); free(r->cq_block); free(r->sqes);
+    memset(r, 0, sizeof(*r));
+    return -ENOMEM;
+  }
 
   sq_of(r)->ring_mask = r->sq_entries - 1;
   sq_of(r)->ring_entries = r->sq_entries;
@@ -515,7 +320,10 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   cq_of(r)->ring_entries = r->cq_entries;
 
   if (thrd_create(&r->engine, engine_main, r) != thrd_success) {
-    close(r->ctl_r); close(r->ctl_w);
+    r->be->close_ring(r);
+    mtx_destroy(&r->mtx);
+    cnd_destroy(&r->cv);
+    cnd_destroy(&r->wq_cv);
     free(r->sq_block); free(r->cq_block); free(r->sqes);
     memset(r, 0, sizeof(*r));
     return -ENOMEM;
@@ -588,17 +396,16 @@ int slipstream_engine_close(int fd) {
   cnd_broadcast(&r->wq_cv);
   cnd_broadcast(&r->cv);
   mtx_unlock(&r->mtx);
-  poke(r);
+  r->be->poke(r);
   if (r->engine_live) thrd_join(r->engine, NULL);
   if (r->worker_live) thrd_join(r->worker, NULL);
+  r->be->close_ring(r);
 
   free_op_list(r->inbox_head);
   free_op_list(r->backlog_head);
   free_op_list(r->wq_head);
   free_op_list(r->queue_head);
   for (unsigned i = 0; i < r->waiting_n; i++) free(r->waiting[i]);
-  close(r->ctl_r);
-  close(r->ctl_w);
   mtx_destroy(&r->mtx);
   cnd_destroy(&r->cv);
   cnd_destroy(&r->wq_cv);
@@ -668,7 +475,7 @@ int slipstream_engine_enter(int fd, unsigned int to_submit, unsigned int min_com
     else r->inbox_head = batch_head;
     r->inbox_tail = batch_tail;
     mtx_unlock(&r->mtx);
-    poke(r);
+    r->be->poke(r);
   }
 
   if ((flags & IORING_ENTER_GETEVENTS) && min_complete > 0) {

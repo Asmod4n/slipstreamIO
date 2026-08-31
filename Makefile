@@ -12,10 +12,14 @@
 # stand up for a C consumer on their own terms.
 CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
 
-BINS = test/available test/syscall test/shim test/blocked
+# The engine core and every backend the platform guards let through -
+# absent ones compile to empty translation units.
+ENGINE = src/slipstream_engine.c src/engine_posix.c src/engine_poll.c src/engine_epoll.c src/engine_kqueue.c src/engine_dispatch.c src/engine_iocp.c
+
+BINS = test/available test/syscall test/shim test/blocked test/backends
 
 test: $(BINS)
-	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
+	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/backends && ./test/backends_adapters.sh && ./test/backends_wine.sh && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
 
 # The question that runs before liburing exists, so it is built like any
 # other C consumer of a header here - and deliberately does not link or
@@ -24,20 +28,25 @@ test/available: test/available.c src/uring_available.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 # The three calls liburing makes, and the switch behind them.
-test/syscall: test/syscall.c src/slipstream_syscall.c src/slipstream_engine.c src/slipstream_syscall.h src/uring_available.h
-	$(CC) $(CFLAGS) -o $@ test/syscall.c src/slipstream_syscall.c src/slipstream_engine.c
+test/syscall: test/syscall.c src/slipstream_syscall.c $(ENGINE) src/engine_internal.h src/slipstream_syscall.h src/uring_available.h
+	$(CC) $(CFLAGS) -o $@ test/syscall.c src/slipstream_syscall.c $(ENGINE)
 
 # The blocked half, reached the way the wild reaches it: a seccomp
 # filter refuses the io_uring syscalls and the decision falls on its own.
-test/blocked: test/blocked.c test/seccomp_block.h src/slipstream_syscall.c src/slipstream_engine.c
-	$(CC) $(CFLAGS) -o $@ test/blocked.c src/slipstream_syscall.c src/slipstream_engine.c
+test/blocked: test/blocked.c test/seccomp_block.h src/slipstream_syscall.c $(ENGINE)
+	$(CC) $(CFLAGS) -o $@ test/blocked.c src/slipstream_syscall.c $(ENGINE)
+
+# Every backend the platform carries, three scenes each: inline NOP,
+# a parked recv a later write completes, -ETIME after a real deadline.
+test/backends: test/backends.c $(ENGINE) src/engine_internal.h src/slipstream_engine.h
+	$(CC) $(CFLAGS) -o $@ test/backends.c $(ENGINE)
 
 # The shim, compiled where liburing puts it. -iquote and NOT -Isrc: this
 # one has to see the REAL <liburing.h>, and -Isrc would hand it ours.
 # -std=gnu11 for the same reason liburing builds that way - its own
 # sources need the POSIX names.
-test/shim: test/shim.c src/liburing_arch_syscall.h src/slipstream_syscall.c src/slipstream_engine.c
-	$(CC) -std=gnu11 -Wall -Wextra -O2 -iquote src -o $@ test/shim.c src/slipstream_syscall.c src/slipstream_engine.c
+test/shim: test/shim.c src/liburing_arch_syscall.h src/slipstream_syscall.c $(ENGINE)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -iquote src -o $@ test/shim.c src/slipstream_syscall.c $(ENGINE)
 
 # The whole thing, end to end: a real liburing built WITH the shim, its
 # headers installed where we say, and an ordinary liburing program run

@@ -78,7 +78,7 @@ rc=1
 # the script the guest runs.
 stage="$run/stage"
 mkdir -p "$stage/slipstreamio" "$stage/liburing/src"
-cp -R "$here/shim" "$here/test" "$stage/slipstreamio/"
+cp -R "$here/shim" "$here/test" "$here/src" "$stage/slipstreamio/"
 cp -R "$src/src/include" "$stage/liburing/src/include"
 
 cat > "$stage/guest.sh" <<'GUEST'
@@ -90,7 +90,17 @@ exec > /dev/console 2>&1
 echo "SLIPSTREAM-FREEBSD: begin on $(uname -sr)"
 cp -R /media/slip /tmp/slip
 cd /tmp/slip/slipstreamio
-if LIBURING_SRC=/tmp/slip/liburing sh test/liburing_h_shims.sh; then
+# Two proofs: liburing.h through the shims, and the ENGINE itself -
+# compiled by the base system's cc against the carried liburing's
+# io_uring.h, its kqueue backend driven through the backend scenes.
+# threads.h lives in libstdthreads on FreeBSD, hence the -l.
+ok=yes
+LIBURING_SRC=/tmp/slip/liburing sh test/liburing_h_shims.sh || ok=no
+cc -std=c11 -Wall -Wextra -O2 -Isrc -Ishim/common -I/tmp/slip/liburing/src/include \
+   -o /tmp/backends test/backends.c src/slipstream_engine.c src/engine_posix.c src/engine_poll.c \
+   src/engine_epoll.c src/engine_kqueue.c -lstdthreads || ok=no
+[ "$ok" = yes ] && /tmp/backends || ok=no
+if [ "$ok" = yes ]; then
   echo "SLIPSTREAM-FREEBSD: ok"
 else
   echo "SLIPSTREAM-FREEBSD: FAILED"
