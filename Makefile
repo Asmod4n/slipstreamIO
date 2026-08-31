@@ -14,7 +14,7 @@ CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
 BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch test/available test/syscall test/shim
 
 test: $(BINS)
-	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch && ./test/available && ./test/syscall && ./test/shim
+	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch && ./test/available && ./test/syscall && ./test/shim && ./test/with_liburing.sh
 
 test/queue: test/queue.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
@@ -33,6 +33,14 @@ test/file: test/file.cpp src/liburing.h
 # include liburing, because it is what decides whether liburing is loaded.
 test/available: test/available.c src/uring_available.h
 	$(CC) $(CFLAGS) -o $@ $<
+
+# The whole thing, end to end: a real liburing built WITH the shim, its
+# headers installed where we say, and an ordinary liburing program run
+# against exactly those. Needs a liburing source tree - LIBURING_SRC, or
+# deps/liburing - and says so and skips when there is none.
+.PHONY: with_liburing
+with_liburing:
+	./test/with_liburing.sh
 
 # The three calls liburing makes, and the switch behind them.
 test/syscall: test/syscall.c src/slipstream_syscall.c src/slipstream_syscall.h src/uring_available.h
