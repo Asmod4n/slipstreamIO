@@ -11,10 +11,10 @@ CXXFLAGS ?= -std=c++20 -Wall -Wextra -O2 -Isrc
 # for a C consumer on its own terms.
 CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
 
-BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch
+BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch test/available
 
 test: $(BINS)
-	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch
+	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch && ./test/available
 
 test/queue: test/queue.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
@@ -27,6 +27,12 @@ test/sockname: test/sockname.cpp src/liburing.h
 
 test/file: test/file.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
+
+# The question that runs before liburing exists, so it is built like any
+# other C consumer of a header here - and deliberately does not link or
+# include liburing, because it is what decides whether liburing is loaded.
+test/available: test/available.c src/uring_available.h
+	$(CC) $(CFLAGS) -o $@ $<
 
 # The C half of "one header, both languages". Built with $(CC), not
 # $(CXX), and that is the entire point of it.
