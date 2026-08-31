@@ -13,6 +13,11 @@
  * liburing's prep functions go through it. Each op adds at most one
  * field of its own from the union afterwards.
  */
+/* pread/pwrite are POSIX names a bare -std=c11 hides. This is a .c of
+ * our own, not a header a consumer includes, so it may say what it needs
+ * on its own first line. */
+#define _DEFAULT_SOURCE 1
+
 #include "slipstream_engine.h"
 
 #include <errno.h>

@@ -90,3 +90,42 @@ cc -I"$work/out/include" -I"$here/src" -H -E "$work/consumer.c" 2>&1 >/dev/null 
 cc -O2 -I"$work/out/include" -I"$here/src" -o "$work/consumer" \
    "$work/consumer.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here/src/slipstream_engine.c"
 "$work/consumer"
+
+# And the case all of this exists for: the syscalls seccomp'd away, the
+# way a container runtime does it, and NOBODY calling set_engine. The
+# same ordinary liburing program must complete the same NOP - the
+# decision falls on its own.
+cat > "$work/blocked.c" <<'C'
+#include <liburing.h>
+#include <stdio.h>
+#include "slipstream_syscall.h"
+#include "seccomp_block.h"
+
+int main(void) {
+  if (block_io_uring_syscalls() != 0) {
+    printf("  seccomp:         this host refuses the filter itself - skipped\n");
+    return 0;
+  }
+  struct io_uring ring;
+  int rc = io_uring_queue_init(8, &ring, 0);
+  if (rc < 0) { printf("  under seccomp:   queue_init -> %d\n", rc); return 1; }
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_data64(sqe, 0xabc);
+  int su = io_uring_submit(&ring);
+  struct io_uring_cqe *cqe;
+  int w = io_uring_wait_cqe(&ring, &cqe);
+  printf("  under seccomp:   submit=%d wait=%d user_data=0x%llx res=%d engine=%d\n",
+         su, w, (unsigned long long) cqe->user_data, cqe->res,
+         slipstream_syscall_uses_engine());
+  io_uring_cq_advance(&ring, 1);
+  io_uring_queue_exit(&ring);
+  const int good = su == 1 && w == 0 && cqe->res == 0 && slipstream_syscall_uses_engine() == 1;
+  printf("%s\n", good ? "with_liburing under seccomp: ok"
+                       : "with_liburing under seccomp: FAILED");
+  return good ? 0 : 1;
+}
+C
+cc -O2 -I"$work/out/include" -I"$here/src" -I"$here/test" -o "$work/blocked" \
+   "$work/blocked.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here/src/slipstream_engine.c"
+"$work/blocked"

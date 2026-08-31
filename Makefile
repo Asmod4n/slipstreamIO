@@ -11,10 +11,10 @@ CXXFLAGS ?= -std=c++20 -Wall -Wextra -O2 -Isrc
 # for a C consumer on its own terms.
 CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
 
-BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch test/available test/syscall test/shim
+BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch test/available test/syscall test/shim test/blocked
 
 test: $(BINS)
-	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch && ./test/available && ./test/syscall && ./test/shim && ./test/with_liburing.sh
+	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch && ./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/with_liburing.sh
 
 test/queue: test/queue.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
@@ -45,6 +45,11 @@ with_liburing:
 # The three calls liburing makes, and the switch behind them.
 test/syscall: test/syscall.c src/slipstream_syscall.c src/slipstream_engine.c src/slipstream_syscall.h src/uring_available.h
 	$(CC) $(CFLAGS) -o $@ test/syscall.c src/slipstream_syscall.c src/slipstream_engine.c
+
+# The blocked half, reached the way the wild reaches it: a seccomp
+# filter refuses the io_uring syscalls and the decision falls on its own.
+test/blocked: test/blocked.c test/seccomp_block.h src/slipstream_syscall.c src/slipstream_engine.c
+	$(CC) $(CFLAGS) -o $@ test/blocked.c src/slipstream_syscall.c src/slipstream_engine.c
 
 # The shim, compiled where liburing puts it. -iquote and NOT -Isrc: this
 # one has to see the REAL <liburing.h>, and -Isrc would hand it ours.
