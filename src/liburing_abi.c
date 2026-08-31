@@ -119,12 +119,21 @@ static int publish(struct slip_ring *s, __u64 user_data, int res, unsigned flags
   return 0;
 }
 
+/* An opcode this engine does not carry is answered the way the kernel
+ * answers one it does not carry: the SQE is accepted and its COMPLETION
+ * says no. Failing the submit instead would take the rest of the batch
+ * down with it, which is not something a caller can have planned for.
+ *
+ * -EOPNOTSUPP and not -EINVAL: the first says "that op, not here", which
+ * is what a caller needs in order to take another route; the second says
+ * "you passed nonsense", which would be a lie about a well-formed SQE.
+ */
 static int run_one(struct slip_ring *s, const struct io_uring_sqe *sqe) {
   switch (sqe->opcode) {
     case IORING_OP_NOP:
       return publish(s, sqe->user_data, 0, 0);
     default:
-      return publish(s, sqe->user_data, -EINVAL, 0);
+      return publish(s, sqe->user_data, -EOPNOTSUPP, 0);
   }
 }
 

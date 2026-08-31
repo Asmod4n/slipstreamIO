@@ -56,6 +56,25 @@ int main(void) {
   io_uring_cq_advance(&ring, seen);
   ok(seen == 8, "for_each_cqe walks all eight, in order");
 
+  /* What we cannot do says so in its own completion, and takes nothing
+   * else down with it. */
+  sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_fsync(sqe, 0, 0);
+  io_uring_sqe_set_data64(sqe, 0xdead);
+  sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_data64(sqe, 0xbeef);
+  ok(io_uring_submit(&ring) == 2, "an unsupported op is still submitted");
+
+  rc = io_uring_wait_cqe(&ring, &cqe);
+  ok(rc == 0 && cqe->user_data == 0xdead && cqe->res == -EOPNOTSUPP,
+     "what this engine cannot do completes with -EOPNOTSUPP");
+  io_uring_cq_advance(&ring, 1);
+  rc = io_uring_wait_cqe(&ring, &cqe);
+  ok(rc == 0 && cqe->user_data == 0xbeef && cqe->res == 0,
+     "and the op behind it in the same batch is unharmed");
+  io_uring_cq_advance(&ring, 1);
+
   io_uring_queue_exit(&ring);                            /* ours */
   printf("%s\n", fails ? "FAILURES" : "all ok");
   return fails ? 1 : 0;
