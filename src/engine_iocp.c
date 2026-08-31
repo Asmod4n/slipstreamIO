@@ -196,6 +196,10 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max) {
   return (int) n;
 }
 
+static const unsigned char iocp_carried_ops[] = {
+  IORING_OP_NOP, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_CLOSE, 255,
+};
+
 const struct eng_backend slip_backend_iocp = {
   .name = "iocp",
   .open_ring = iocp_open_ring,
@@ -203,6 +207,7 @@ const struct eng_backend slip_backend_iocp = {
   .poke = iocp_poke,
   .execute = iocp_execute,
   .wait = iocp_wait,
+  .carried_ops = iocp_carried_ops,
   .arm = NULL,    /* nothing parks here */
   .disarm = NULL,
 };

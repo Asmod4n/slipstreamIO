@@ -355,6 +355,32 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   return idx | SLIP_RING_TOKEN;
 }
 
+/* The register family, grown op by op like the ring ops - and first of
+ * all the PROBE, because it is how liburing itself asks what a ring can
+ * do: io_uring_get_probe drives one, and mruby-io-uring gates
+ * URING_AVAILABLE on its answer. The engine reports its backend's
+ * carried list and nothing more - the probe tells the truth. Everything
+ * else answers -EINVAL, the kernel's word for a register opcode it does
+ * not know. */
+int slipstream_engine_register(int fd, unsigned int opcode, void *arg,
+                               unsigned int nr_args) {
+  struct slip_ring *r = ring_of(fd);
+  if (r == NULL) return -EBADF;
+  if (opcode != IORING_REGISTER_PROBE) return -EINVAL;
+  if (arg == NULL) return -EFAULT;
+  struct io_uring_probe *p = arg;
+  memset(p, 0, sizeof(*p) + (size_t) nr_args * sizeof(struct io_uring_probe_op));
+  unsigned last = 0;
+  for (const unsigned char *c = r->be->carried_ops; *c != 255; c++) {
+    if (*c > last) last = *c;
+    if (*c < nr_args) p->ops[*c].flags = IO_URING_OP_SUPPORTED;
+  }
+  p->last_op = (__u8) last;
+  for (unsigned i = 0; i < nr_args; i++) p->ops[i].op = (__u8) i;
+  p->ops_len = (__u8) (nr_args < 256 ? nr_args : 255);
+  return 0;
+}
+
 void *slipstream_engine_mmap(size_t length, int fd, long long offset) {
   struct slip_ring *r = ring_of(fd);
   if (r == NULL) return NULL;

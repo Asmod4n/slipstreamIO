@@ -28,6 +28,16 @@
 extern long syscall(long number, ...);
 #endif
 
+const unsigned char slip_posix_carried_ops[] = {
+  IORING_OP_NOP,     IORING_OP_READ,    IORING_OP_WRITE,    IORING_OP_RECV,
+  IORING_OP_SEND,    IORING_OP_RECVMSG, IORING_OP_SENDMSG,  IORING_OP_ACCEPT,
+  IORING_OP_CONNECT, IORING_OP_SOCKET,  IORING_OP_BIND,     IORING_OP_LISTEN,
+  IORING_OP_SHUTDOWN, IORING_OP_CLOSE,  IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE,
+  IORING_OP_ASYNC_CANCEL, IORING_OP_STATX, IORING_OP_UNLINKAT, IORING_OP_OPENAT,
+  IORING_OP_OPENAT2,
+  255,
+};
+
 /* ---- the poke pipe ---------------------------------------------------- */
 
 int slip_posix_ctl_open(struct slip_ring *r) {

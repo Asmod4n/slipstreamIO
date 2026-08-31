@@ -111,6 +111,7 @@ const struct eng_backend slip_backend_epoll = {
   .poke = slip_posix_poke,
   .execute = slip_posix_execute,
   .wait = epoll_wait_ready,
+  .carried_ops = slip_posix_carried_ops,
   .arm = epoll_arm,
   .disarm = epoll_disarm,
 };

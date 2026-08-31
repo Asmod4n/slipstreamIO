@@ -72,13 +72,9 @@ static int engine_enter2(unsigned int fd, unsigned int to_submit,
   return slipstream_engine_enter((int) fd, to_submit, min_complete, flags, arg, sz);
 }
 
-/* Registration is what the engine carries in its own tables, and none of
- * it is built yet. It says so instead of reporting success it cannot
- * keep. */
 static int engine_register(unsigned int fd, unsigned int opcode,
                            const void *arg, unsigned int nr_args) {
-  (void) fd; (void) opcode; (void) arg; (void) nr_args;
-  return -EOPNOTSUPP;
+  return slipstream_engine_register((int) fd, opcode, (void *) arg, nr_args);
 }
 
 int slipstream_io_uring_setup(unsigned int entries, struct io_uring_params *p) {

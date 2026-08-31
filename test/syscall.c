@@ -46,9 +46,20 @@ int main(void) {
      "and the offsets liburing will index the blocks by");
   ok(slipstream_io_uring_enter2((unsigned) ering, 0, 0, 0, NULL, 0) == 0,
      "entering an empty ring submits nothing");
-  /* Registration is the engine's own tables, and none of that is built. */
-  ok(slipstream_io_uring_register((unsigned) ering, 0, NULL, 0) == -EOPNOTSUPP,
-     "register says what it cannot do rather than reporting success");
+  /* Register carries the PROBE - liburing's own way of asking what a
+   * ring can do, and the gate mruby-io-uring hangs URING_AVAILABLE on.
+   * Everything else answers -EINVAL, the kernel's word for a register
+   * opcode it does not know. */
+  ok(slipstream_io_uring_register((unsigned) ering, 0, NULL, 0) == -EINVAL,
+     "an unknown register opcode is refused like the kernel refuses it");
+  {
+    char pbuf[sizeof(struct io_uring_probe) + 8 * sizeof(struct io_uring_probe_op)];
+    struct io_uring_probe *pr = (struct io_uring_probe *) pbuf;
+    ok(slipstream_io_uring_register((unsigned) ering, IORING_REGISTER_PROBE, pr, 8) == 0,
+       "the probe answers");
+    ok(pr->ops[IORING_OP_NOP].flags & IO_URING_OP_SUPPORTED,
+       "and carries NOP as supported");
+  }
   ok(slipstream_close(ering) == 0, "and the ring goes when it is closed");
 
   slipstream_syscall_set_engine(0);

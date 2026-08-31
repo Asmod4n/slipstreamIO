@@ -114,6 +114,11 @@ struct eng_backend {
    * backend whose execute never parks leaves them NULL. */
   int (*arm)(struct slip_ring *r, struct eng_op *op);
   void (*disarm)(struct slip_ring *r, struct eng_op *op);
+  /* The opcodes this backend actually runs, 255-terminated (every real
+   * opcode is below IORING_OP_LAST) - what REGISTER_PROBE reports, so
+   * the probe tells the truth per backend instead of a flattering
+   * lie. */
+  const unsigned char *carried_ops;
 };
 
 /* The core's completion door, for whoever finishes an op off the engine
@@ -145,6 +150,9 @@ int slip_posix_finish_ready(struct slip_ring *r, struct eng_op **ready, unsigned
  * flags) but whose platform can still run it correctly off the engine
  * thread. */
 void slip_posix_hand_to_worker(struct slip_ring *r, struct eng_op *op);
+/* One list for the whole readiness family - they all run the same
+ * run_one. */
+extern const unsigned char slip_posix_carried_ops[];
 #endif
 
 extern const struct eng_backend slip_backend_poll;

@@ -249,6 +249,11 @@ static int dsp_wait_done(struct slip_ring *r, struct eng_done *out, unsigned max
   return (int) n; /* zero is a bare poke */
 }
 
+static const unsigned char dsp_carried_ops[] = {
+  IORING_OP_NOP, IORING_OP_READ, IORING_OP_WRITE, IORING_OP_RECV,
+  IORING_OP_SEND, IORING_OP_CLOSE, 255,
+};
+
 const struct eng_backend slip_backend_dispatch = {
   .name = "dispatch",
   .open_ring = dsp_open_ring,
@@ -256,6 +261,7 @@ const struct eng_backend slip_backend_dispatch = {
   .poke = dsp_poke,
   .execute = dsp_execute,
   .wait = dsp_wait_done,
+  .carried_ops = dsp_carried_ops,
   .arm = NULL, /* completion family: nothing parks */
   .disarm = NULL,
 };

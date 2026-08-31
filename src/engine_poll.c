@@ -49,6 +49,7 @@ const struct eng_backend slip_backend_poll = {
   .poke = slip_posix_poke,
   .execute = slip_posix_execute,
   .wait = poll_wait,
+  .carried_ops = slip_posix_carried_ops,
   .arm = poll_arm,
   .disarm = poll_disarm,
 };

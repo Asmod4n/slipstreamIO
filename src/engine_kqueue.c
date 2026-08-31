@@ -110,6 +110,7 @@ const struct eng_backend slip_backend_kqueue = {
   .poke = slip_posix_poke,
   .execute = slip_posix_execute,
   .wait = kqueue_wait,
+  .carried_ops = slip_posix_carried_ops,
   .arm = kqueue_arm,
   .disarm = kqueue_disarm,
 };

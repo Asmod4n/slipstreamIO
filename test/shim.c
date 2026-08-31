@@ -53,7 +53,7 @@ int main(void) {
   /* Reaching us is what is being shown, so the marks are OUR answers:
    * the engine hands out a ring, entering an empty one submits nothing,
    * and registration says what it does not carry. */
-  const int all_engine = fd >= 0 && e1 == 0 && e2 == 0 && rg == -EOPNOTSUPP;
+  const int all_engine = fd >= 0 && e1 == 0 && e2 == 0 && rg == -EINVAL;
   printf("%-54s %s\n", "every __sys_io_uring_* reaches slipstream",
          all_engine ? "ok" : "FAIL");
   printf("%-54s %s\n", "the map and close wrappers still behave",
