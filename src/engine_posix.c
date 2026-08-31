@@ -213,6 +213,14 @@ static enum verdict run_accept_multishot(struct slip_ring *r, struct eng_op *op,
                                          int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   for (;;) {
+    /* accept has no DONTWAIT of its own, and the listener a ring made
+     * with IORING_OP_SOCKET is a BLOCKING one - accepting without asking
+     * first stalls the whole engine thread on an idle listener, which is
+     * exactly what it must never do. Readiness first, every round. */
+    if (!ready_now(s->fd, POLLIN)) {
+      op->wait_events = POLLIN;
+      return PARK;
+    }
     const int fd = accept_one(s);
     if (fd < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
