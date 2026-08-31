@@ -106,9 +106,15 @@ int slipstream_io_uring_register(unsigned int fd, unsigned int opcode,
   return engine_register(fd, opcode, arg, nr_args);
 }
 
+/* Which calls are the engine's is decided by WHAT is named, not by which
+ * mode is on: a ring token goes to the engine, and everything else - an
+ * anonymous mapping, a real file, a real descriptor - stays the OS's,
+ * in either mode. liburing maps more than rings. */
+static int fd_is_ring_token(int fd) { return fd > 0 && (fd & SLIP_RING_TOKEN); }
+
 void *slipstream_mmap(void *addr, size_t length, int prot, int flags, int fd,
                       long long offset) {
-  if (engine_chosen()) {
+  if (fd_is_ring_token(fd)) {
     void *p = slipstream_engine_mmap(length, fd, offset);
     return p ? p : (void *) (intptr_t) -EINVAL;
   }
@@ -117,15 +123,15 @@ void *slipstream_mmap(void *addr, size_t length, int prot, int flags, int fd,
 }
 
 int slipstream_munmap(void *addr, size_t length) {
-  if (engine_chosen()) return slipstream_engine_munmap(addr, length);
+  /* munmap names an address, not a descriptor, so the engine is asked
+   * whether the block is one of its rings; -ENOENT means it is not. */
+  if (engine_chosen() && slipstream_engine_munmap(addr, length) == 0) return 0;
   const int rc = munmap(addr, length);
   return rc < 0 ? -errno : rc;
 }
 
 int slipstream_close(int fd) {
-  /* Only OUR tokens go to the engine. liburing closes real descriptors
-   * too, and in engine mode those are still real. */
-  if (engine_chosen() && (fd & SLIP_RING_TOKEN)) return slipstream_engine_close(fd);
+  if (fd_is_ring_token(fd)) return slipstream_engine_close(fd);
   const int rc = close(fd);
   return rc < 0 ? -errno : rc;
 }

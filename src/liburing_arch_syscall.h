@@ -49,8 +49,8 @@ static inline int __sys_io_uring_enter(unsigned int fd, unsigned int to_submit,
                                     _NSIG / 8);
 }
 
-/* The other eight, unchanged in behaviour from liburing's generic
- * arch header: libc, and a negated errno on failure. */
+/* The rest, unchanged in behaviour from liburing's generic arch
+ * header: libc, and a negated errno on failure. */
 static inline int __sys_open(const char *pathname, int flags, mode_t mode) {
   int ret = open(pathname, flags, mode);
   return (ret < 0) ? -errno : ret;
@@ -61,15 +61,16 @@ static inline ssize_t __sys_read(int fd, void *buffer, size_t size) {
   return (ret < 0) ? -errno : ret;
 }
 
+/* Ours as well, for the same reason as the four above: the ring "fd" is
+ * a token when the engine answers, and only we know which memory it
+ * names. In kernel mode all three route straight back to libc. */
 static inline void *__sys_mmap(void *addr, size_t length, int prot, int flags,
                                int fd, off_t offset) {
-  void *ret = mmap(addr, length, prot, flags, fd, offset);
-  return (ret == MAP_FAILED) ? ERR_PTR(-errno) : ret;
+  return slipstream_mmap(addr, length, prot, flags, fd, (long long) offset);
 }
 
 static inline int __sys_munmap(void *addr, size_t length) {
-  int ret = munmap(addr, length);
-  return (ret < 0) ? -errno : ret;
+  return slipstream_munmap(addr, length);
 }
 
 static inline int __sys_madvise(void *addr, size_t length, int advice) {
@@ -88,8 +89,7 @@ static inline int __sys_setrlimit(int resource, const struct rlimit *rlim) {
 }
 
 static inline int __sys_close(int fd) {
-  int ret = close(fd);
-  return (ret < 0) ? -errno : ret;
+  return slipstream_close(fd);
 }
 
 #endif /* LIBURING_ARCH_SLIPSTREAM_SYSCALL_H */

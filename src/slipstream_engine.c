@@ -156,11 +156,17 @@ void *slipstream_engine_mmap(size_t length, int fd, long long offset) {
   }
 }
 
+/* 0 for a block that is one of a ring's three, -ENOENT for anything
+ * else - the caller then knows the mapping was never ours. The blocks
+ * themselves go with the ring, in close. */
 int slipstream_engine_munmap(void *addr, size_t length) {
-  (void) addr;
   (void) length;
-  /* The blocks belong to the ring and go when it does, in exit. */
-  return 0;
+  for (int i = 0; i < SLIP_RINGS_MAX; i++) {
+    const struct slip_ring *r = &g_rings[i];
+    if (!r->in_use) continue;
+    if (addr == r->sq_block || addr == r->cq_block || addr == (void *) r->sqes) return 0;
+  }
+  return -ENOENT;
 }
 
 int slipstream_engine_close(int fd) {

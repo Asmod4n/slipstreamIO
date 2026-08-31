@@ -68,18 +68,13 @@ int main(void) {
   const int k = run("kernel side:");
   slipstream_syscall_set_engine(1);
   const int e = run("engine forced:");
-  /* The kernel side must work, and liburing must have gone through us
-   * to get there - the archive references above are that half.
-   *
-   * The engine side is NOT asserted yet: our setup hands out a ring and
-   * liburing refuses it before it maps anything, so something we report
-   * in io_uring_params is not what its setup.c expects. That is the next
-   * piece of work, and it is printed rather than hidden. */
-  printf("  %-16s %s\n", "engine side:",
-         e == 0 ? "accepted" : "liburing refused the ring we handed it");
-  printf("%s\n", k == 0 ? "with_liburing: ok (kernel side)"
-                        : "with_liburing: the kernel side failed");
-  return k == 0 ? 0 : 1;
+  /* Both halves are the promise now: the same ordinary program, the same
+   * completion, whichever side answers. The archive references above
+   * prove the calls went through us to get there. */
+  const int good = k == 0 && e == 0;
+  printf("%s\n", good ? "with_liburing: ok, both sides"
+                       : "with_liburing: one side did not answer");
+  return good ? 0 : 1;
 }
 C
 
