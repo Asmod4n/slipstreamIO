@@ -26,6 +26,13 @@
 
 #define SLIP_RINGS_MAX 64
 
+/* The "descriptor" setup hands back is a token, not a file - but it
+ * travels through liburing as an int and lands in mmap and close. A
+ * token that starts at 0 IS stdin: mmap on it answers -ENODEV, close on
+ * it takes the process's input away, and neither says why. So they are
+ * marked, far above anything the kernel hands out, and a stray real call
+ * on one fails loudly instead of hitting a real descriptor. */
+
 /* The layout we report, and therefore the one liburing reads through. */
 struct sq_ring {
   unsigned head, tail, ring_mask, ring_entries, flags, dropped;
@@ -48,8 +55,10 @@ struct slip_ring {
 static struct slip_ring g_rings[SLIP_RINGS_MAX];
 
 static struct slip_ring *ring_of(int fd) {
-  if (fd < 0 || fd >= SLIP_RINGS_MAX || !g_rings[fd].in_use) return NULL;
-  return &g_rings[fd];
+  if ((fd & SLIP_RING_TOKEN) == 0) return NULL;
+  const int i = fd & ~SLIP_RING_TOKEN;
+  if (i < 0 || i >= SLIP_RINGS_MAX || !g_rings[i].in_use) return NULL;
+  return &g_rings[i];
 }
 
 static struct sq_ring *sq_of(struct slip_ring *r) { return (struct sq_ring *) r->sq_block; }
@@ -68,9 +77,20 @@ static unsigned round_up_pow2(unsigned v) {
 int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   if (entries == 0 || p == NULL) return -EINVAL;
   /* Shapes that change what liburing's inlines expect of this memory.
-   * Refused by name rather than half-served. */
+   * Refused by name rather than half-served.
+   *
+   * IORING_SETUP_NO_SQARRAY is in the list for a different reason, and
+   * the -EINVAL is load-bearing: io_uring_queue_init_try_nosqarr asks
+   * for it FIRST every time, and falls back to the classic layout only
+   * when setup answers exactly -EINVAL. That fallback exists for kernels
+   * that do not know the flag, and this is one of them - the ring here
+   * has an array[] and reports sq_off.array, which is what the classic
+   * path indexes through. Accepting the flag and then handing out an
+   * array is the contradiction liburing cannot see, and it fails later
+   * with something that does not name the cause.
+   */
   if (p->flags & (IORING_SETUP_SQPOLL | IORING_SETUP_SQE128 | IORING_SETUP_CQE32 |
-                  IORING_SETUP_IOPOLL | IORING_SETUP_NO_MMAP))
+                  IORING_SETUP_IOPOLL | IORING_SETUP_NO_MMAP | IORING_SETUP_NO_SQARRAY))
     return -EINVAL;
 
   int fd = -1;
@@ -122,7 +142,7 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   p->cq_off.flags = offsetof(struct cq_ring, flags);
 
   r->in_use = 1;
-  return fd;
+  return fd | SLIP_RING_TOKEN;
 }
 
 void *slipstream_engine_mmap(size_t length, int fd, long long offset) {

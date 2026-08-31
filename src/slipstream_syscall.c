@@ -123,7 +123,9 @@ int slipstream_munmap(void *addr, size_t length) {
 }
 
 int slipstream_close(int fd) {
-  if (engine_chosen()) return slipstream_engine_close(fd);
+  /* Only OUR tokens go to the engine. liburing closes real descriptors
+   * too, and in engine mode those are still real. */
+  if (engine_chosen() && (fd & SLIP_RING_TOKEN)) return slipstream_engine_close(fd);
   const int rc = close(fd);
   return rc < 0 ? -errno : rc;
 }

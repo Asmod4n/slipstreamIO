@@ -13,6 +13,11 @@ extern "C" {
 
 struct io_uring_params;
 
+/* Marks the tokens setup hands out. They travel through liburing as
+ * ints and land in mmap and close, so they must not look like a real
+ * descriptor - a token of 0 is stdin. */
+#define SLIP_RING_TOKEN 0x40000000
+
 int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p);
 int slipstream_engine_enter(int fd, unsigned int to_submit, unsigned int min_complete,
                             unsigned int flags);
