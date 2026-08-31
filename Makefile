@@ -11,10 +11,10 @@ CXXFLAGS ?= -std=c++20 -Wall -Wextra -O2 -Isrc
 # for a C consumer on its own terms.
 CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
 
-BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch
+BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch test/abi
 
 test: $(BINS)
-	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch
+	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch && ./test/abi
 
 test/queue: test/queue.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
@@ -27,6 +27,17 @@ test/sockname: test/sockname.cpp src/liburing.h
 
 test/file: test/file.cpp src/liburing.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
+
+# src/liburing_abi.c is the OTHER direction: not our header pretending to
+# be liburing, but our implementation of the symbols the REAL liburing.h
+# calls into. It and its test are therefore the only things here built
+# WITHOUT -Isrc - the two headers describe different machines and must
+# never meet in one translation unit. No -luring either: if this links,
+# nothing of liburing's library is in it.
+ABIFLAGS ?= -std=c11 -Wall -Wextra -O2
+
+test/abi: test/abi.c src/liburing_abi.c
+	$(CC) $(ABIFLAGS) -o $@ test/abi.c src/liburing_abi.c
 
 # The C half of "one header, both languages". Built with $(CC), not
 # $(CXX), and that is the entire point of it.
