@@ -42,9 +42,14 @@ goes to a worker thread. `IOSQE_IO_LINK` failure cancels the rest of the
 chain with `-ECANCELED`, and rings advertise `IORING_FEAT_EXT_ARG` so
 timed waits ride beside `enter` instead of needing a timeout opcode.
 
-Operations the engine does not carry answer `-EOPNOTSUPP` in their own
-completion — the submit itself never fails for an unknown opcode,
-because that is how the kernel behaves.
+Carried today, each held to kernel parity: nop, read, write, recv,
+send, sendmsg, recvmsg, accept, connect, socket, bind, listen,
+shutdown, close, poll_add, poll_remove, async_cancel (by data, by fd,
+all), statx, unlinkat, openat, openat2. Operations the engine does not
+carry answer `-EOPNOTSUPP` in their own completion — the submit itself
+never fails for an unknown opcode, because that is how the kernel
+behaves. The multishot and register families are the named next
+stretch.
 
 The API matching is table stakes; the BEHAVIOR has to match, and the
 kernel is the oracle: `test/parity.c` runs every scenario twice through

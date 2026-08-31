@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 #ifdef __linux__
-#include <linux/io_uring.h>
+#include <liburing/io_uring.h> /* the carried liburing's ABI, every platform */
 #include <sys/syscall.h>
 #endif
 

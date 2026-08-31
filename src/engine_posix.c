@@ -4,9 +4,11 @@
  * to the worker - and how the engine is poked - is the same machine,
  * and it lives here once.
  *
- * pread/pwrite are POSIX names a bare -std=c11 hides; a .c of our own
- * may say what it needs on its first line. */
+ * pread/pwrite and accept4 are names a bare -std=c11 hides; a .c of our
+ * own may say what it needs on its first line, and glibc keeps accept4
+ * behind _GNU_SOURCE where the BSDs show it by default. */
 #ifndef _WIN32
+#define _GNU_SOURCE 1
 #define _DEFAULT_SOURCE 1
 
 #include "engine_internal.h"
@@ -15,9 +17,16 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+/* statx and openat2 have no portable wrappers under -std=c11; the raw
+ * syscall does, self-declared the way src/uring_available.h does. */
+extern long syscall(long number, ...);
+#endif
 
 /* ---- the poke pipe ---------------------------------------------------- */
 
@@ -74,6 +83,52 @@ static int ready_now(int fd, short events) {
   return poll(&p, 1, 0) > 0;
 }
 
+#ifndef __linux__
+#include <linux/stat.h> /* the shim's struct statx, for hosts without one */
+
+/* statx filled from fstatat: the basic stats, and stx_mask honest about
+ * exactly that. macOS spells the timespec fields its own way. */
+static int slip_statx_from_stat(int dfd, const char *path, int flags, void *stxbuf) {
+  struct stat st;
+  int rc;
+  const int at_flags = (flags & AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0;
+#ifdef AT_EMPTY_PATH
+  if ((flags & AT_EMPTY_PATH) && path[0] == '\0')
+    rc = fstat(dfd, &st);
+  else
+#endif
+    rc = fstatat(dfd, path, &st, at_flags);
+  if (rc != 0) return -errno;
+  struct statx *x = stxbuf;
+  memset(x, 0, sizeof(*x));
+  x->stx_mask = STATX_BASIC_STATS;
+  x->stx_blksize = (__u32) st.st_blksize;
+  x->stx_nlink = (__u32) st.st_nlink;
+  x->stx_uid = (__u32) st.st_uid;
+  x->stx_gid = (__u32) st.st_gid;
+  x->stx_mode = (__u16) st.st_mode;
+  x->stx_ino = (__u64) st.st_ino;
+  x->stx_size = (__u64) st.st_size;
+  x->stx_blocks = (__u64) st.st_blocks;
+#ifdef __APPLE__
+  x->stx_atime.tv_sec = st.st_atimespec.tv_sec;
+  x->stx_atime.tv_nsec = (__u32) st.st_atimespec.tv_nsec;
+  x->stx_mtime.tv_sec = st.st_mtimespec.tv_sec;
+  x->stx_mtime.tv_nsec = (__u32) st.st_mtimespec.tv_nsec;
+  x->stx_ctime.tv_sec = st.st_ctimespec.tv_sec;
+  x->stx_ctime.tv_nsec = (__u32) st.st_ctimespec.tv_nsec;
+#else
+  x->stx_atime.tv_sec = st.st_atim.tv_sec;
+  x->stx_atime.tv_nsec = (__u32) st.st_atim.tv_nsec;
+  x->stx_mtime.tv_sec = st.st_mtim.tv_sec;
+  x->stx_mtime.tv_nsec = (__u32) st.st_mtim.tv_nsec;
+  x->stx_ctime.tv_sec = st.st_ctim.tv_sec;
+  x->stx_ctime.tv_nsec = (__u32) st.st_ctim.tv_nsec;
+#endif
+  return 0;
+}
+#endif
+
 static enum verdict run_one(struct eng_op *op, int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   void *buf = (void *) (uintptr_t) s->addr;
@@ -87,6 +142,10 @@ static enum verdict run_one(struct eng_op *op, int *res_out) {
       *res_out = n < 0 ? -errno : 0;
       return RAN;
     case IORING_OP_RECV:
+      if (s->ioprio & IORING_RECV_MULTISHOT) {
+        *res_out = -EOPNOTSUPP;
+        return RAN;
+      }
       n = recv(s->fd, buf, s->len, (int) s->msg_flags | MSG_DONTWAIT);
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
           !(s->msg_flags & MSG_DONTWAIT)) {
@@ -128,6 +187,116 @@ static enum verdict run_one(struct eng_op *op, int *res_out) {
       *res_out = n < 0 ? -errno : (int) n;
       return RAN;
     }
+    case IORING_OP_SOCKET:
+      /* fd carries the domain, off the type, len the protocol -
+       * io_uring_prep_socket. The flags word is refused like the kernel
+       * refuses what it does not know. */
+      if (s->rw_flags != 0) {
+        *res_out = -EINVAL;
+        return RAN;
+      }
+      n = socket(s->fd, (int) s->off, (int) s->len);
+      *res_out = n < 0 ? -errno : (int) n;
+      return RAN;
+    case IORING_OP_BIND:
+      n = bind(s->fd, (const struct sockaddr *) buf, (socklen_t) s->off);
+      *res_out = n < 0 ? -errno : 0;
+      return RAN;
+    case IORING_OP_LISTEN:
+      n = listen(s->fd, (int) s->len);
+      *res_out = n < 0 ? -errno : 0;
+      return RAN;
+    case IORING_OP_SHUTDOWN:
+      n = shutdown(s->fd, (int) s->len);
+      *res_out = n < 0 ? -errno : 0;
+      return RAN;
+    case IORING_OP_ACCEPT: {
+      if (s->ioprio & IORING_ACCEPT_MULTISHOT) {
+        *res_out = -EOPNOTSUPP; /* multishot is the next stretch, said plainly */
+        return RAN;
+      }
+      if (!ready_now(s->fd, POLLIN)) {
+        op->wait_events = POLLIN;
+        return PARK;
+      }
+      struct sockaddr *sa = (struct sockaddr *) buf;
+      socklen_t *sl = (socklen_t *) (uintptr_t) s->off;
+#ifdef __APPLE__
+      n = accept(s->fd, sa, sl);
+      if (n >= 0 && (s->accept_flags & SOCK_CLOEXEC)) fcntl((int) n, F_SETFD, FD_CLOEXEC);
+      if (n >= 0 && (s->accept_flags & SOCK_NONBLOCK))
+        fcntl((int) n, F_SETFL, fcntl((int) n, F_GETFL) | O_NONBLOCK);
+#else
+      n = accept4(s->fd, sa, sl, (int) s->accept_flags);
+#endif
+      *res_out = n < 0 ? -errno : (int) n;
+      return RAN;
+    }
+    case IORING_OP_RECVMSG:
+      if (s->ioprio & IORING_RECV_MULTISHOT) {
+        *res_out = -EOPNOTSUPP;
+        return RAN;
+      }
+      n = recvmsg(s->fd, (struct msghdr *) buf, (int) s->msg_flags | MSG_DONTWAIT);
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+          !(s->msg_flags & MSG_DONTWAIT)) {
+        op->wait_events = POLLIN;
+        return PARK;
+      }
+      *res_out = n < 0 ? -errno : (int) n;
+      return RAN;
+    case IORING_OP_SENDMSG:
+      n = sendmsg(s->fd, (const struct msghdr *) buf, (int) s->msg_flags | MSG_DONTWAIT);
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+          !(s->msg_flags & MSG_DONTWAIT)) {
+        op->wait_events = POLLOUT;
+        return PARK;
+      }
+      *res_out = n < 0 ? -errno : (int) n;
+      return RAN;
+    case IORING_OP_POLL_ADD: {
+      if (s->len & IORING_POLL_ADD_MULTI) {
+        *res_out = -EOPNOTSUPP;
+        return RAN;
+      }
+      /* The readiness IS the answer: ready now completes with revents,
+       * not ready parks on the asked directions - the backends deliver
+       * ERR/HUP regardless, the way poll itself does. poll32_events is
+       * host order on little endian (liburing swaps only on BE). */
+      struct pollfd p = { .fd = s->fd, .events = (short) s->poll32_events };
+      n = poll(&p, 1, 0);
+      if (n < 0) {
+        *res_out = -errno;
+        return RAN;
+      }
+      if (n == 0) {
+        op->wait_events = (short) (s->poll32_events & (POLLIN | POLLOUT));
+        return PARK;
+      }
+      *res_out = (int) (unsigned short) p.revents;
+      return RAN;
+    }
+    case IORING_OP_STATX: {
+      const char *path = (const char *) buf;
+      void *stx = (void *) (uintptr_t) s->off;
+#ifdef __linux__
+      n = syscall(SYS_statx, s->fd, path, (int) s->statx_flags, (unsigned) s->len, stx);
+      *res_out = n < 0 ? -errno : 0;
+#else
+      *res_out = slip_statx_from_stat(s->fd, path, (int) s->statx_flags, stx);
+#endif
+      return RAN;
+    }
+    case IORING_OP_UNLINKAT:
+      n = unlinkat(s->fd, (const char *) buf, (int) s->unlink_flags);
+      *res_out = n < 0 ? -errno : 0;
+      return RAN;
+    case IORING_OP_CONNECT:
+    case IORING_OP_OPENAT:
+    case IORING_OP_OPENAT2:
+      /* connect blocks until the peer answers, open blocks on a FIFO -
+       * the kernel runs both async and so does the worker. */
+      return FILE_OP;
     default:
       /* Known op, not carried here. -EOPNOTSUPP and not -EINVAL: the
        * first says "that op, not here", which is what a caller needs in
@@ -159,6 +328,29 @@ static int run_file_op(const struct io_uring_sqe *s) {
     case IORING_OP_SEND:
       n = send(s->fd, buf, s->len, (int) s->msg_flags);
       break;
+    case IORING_OP_CONNECT:
+      n = connect(s->fd, (const struct sockaddr *) buf, (socklen_t) s->off);
+      if (n == 0) return 0;
+      break;
+    case IORING_OP_OPENAT:
+      n = openat(s->fd, (const char *) buf, (int) s->open_flags, (mode_t) s->len);
+      break;
+    case IORING_OP_OPENAT2: {
+      /* addr2 carries a struct open_how of len bytes - the shape shared
+       * with the kernel. Off Linux only resolve-free asks translate to
+       * openat; a resolve constraint cannot be kept and is refused. */
+      const struct slip_open_how {
+        unsigned long long flags, mode, resolve;
+      } *how = (const void *) (uintptr_t) s->off;
+      if (s->len < sizeof(*how)) return -EINVAL;
+#ifdef __linux__
+      n = syscall(SYS_openat2, s->fd, (const char *) buf, how, (size_t) s->len);
+#else
+      if (how->resolve != 0) return -EOPNOTSUPP;
+      n = openat(s->fd, (const char *) buf, (int) how->flags, (mode_t) how->mode);
+#endif
+      break;
+    }
     default:
       return -EOPNOTSUPP;
   }
@@ -238,7 +430,95 @@ void slip_posix_hand_to_worker(struct slip_ring *r, struct eng_op *op) {
   mtx_unlock(&r->mtx);
 }
 
+/* 1 when the cancel op names this target. POLL_REMOVE only ever aims
+ * at poll_add; ASYNC_CANCEL aims by user_data, or by descriptor with
+ * IORING_ASYNC_CANCEL_FD. */
+static int cancel_names(const struct eng_op *cancel, const struct eng_op *target) {
+  if (cancel->sqe.opcode == IORING_OP_POLL_REMOVE)
+    return target->sqe.opcode == IORING_OP_POLL_ADD &&
+           target->sqe.user_data == cancel->sqe.addr;
+  if (cancel->sqe.cancel_flags & IORING_ASYNC_CANCEL_FD)
+    return target->sqe.fd == cancel->sqe.fd;
+  return target->sqe.user_data == cancel->sqe.addr;
+}
+
+static void cancel_target(struct slip_ring *r, struct eng_op *t) {
+  if (t == r->blocking) {
+    r->blocking = NULL;
+    r->chain_failed = 1;
+  } else if (t->sqe.flags & IOSQE_IO_LINK) {
+    r->chain_failed = 1;
+  }
+  slip_engine_post(r, t, -ECANCELED);
+}
+
+/* The kernel's answers, kept: 0 for the one cancelled (the count with
+ * CANCEL_ALL), -ENOENT for no match, -EALREADY for an op the worker is
+ * already inside - past recall, like the kernel's running ops. */
+static int cancel_matching(struct slip_ring *r, struct eng_op *op) {
+  const int all = (op->sqe.opcode == IORING_OP_ASYNC_CANCEL) &&
+                  (op->sqe.cancel_flags & IORING_ASYNC_CANCEL_ALL);
+  int count = 0;
+
+  for (unsigned i = 0; i < r->waiting_n;) {
+    if (cancel_names(op, r->waiting[i])) {
+      struct eng_op *t = r->waiting[i];
+      unpark(r, t); /* swap-removes index i; rescan the same slot */
+      cancel_target(r, t);
+      count++;
+      if (!all) return 0;
+    } else {
+      i++;
+    }
+  }
+
+  for (struct eng_op **p = &r->queue_head; *p != NULL;) {
+    if (cancel_names(op, *p)) {
+      struct eng_op *t = *p;
+      *p = t->next;
+      if (r->queue_tail == t) {
+        r->queue_tail = NULL;
+        for (struct eng_op *q = r->queue_head; q != NULL; q = q->next) r->queue_tail = q;
+      }
+      cancel_target(r, t);
+      count++;
+      if (!all) return 0;
+    } else {
+      p = &(*p)->next;
+    }
+  }
+
+  mtx_lock(&r->mtx);
+  for (struct eng_op **p = &r->wq_head; *p != NULL;) {
+    if (cancel_names(op, *p)) {
+      struct eng_op *t = *p;
+      *p = t->next;
+      if (r->wq_tail == t) {
+        r->wq_tail = NULL;
+        for (struct eng_op *q = r->wq_head; q != NULL; q = q->next) r->wq_tail = q;
+      }
+      mtx_unlock(&r->mtx);
+      cancel_target(r, t);
+      count++;
+      if (!all) return 0;
+      mtx_lock(&r->mtx);
+    } else {
+      p = &(*p)->next;
+    }
+  }
+  mtx_unlock(&r->mtx);
+
+  if (count > 0) return all ? count : 0;
+  /* The one place left is inside the worker right now. */
+  if (r->blocking != NULL && r->blocked_done == NULL) return -EALREADY;
+  return -ENOENT;
+}
+
 int slip_posix_execute(struct slip_ring *r, struct eng_op *op, int *res) {
+  if (op->sqe.opcode == IORING_OP_ASYNC_CANCEL || op->sqe.opcode == IORING_OP_POLL_REMOVE) {
+    *res = cancel_matching(r, op);
+    return EXEC_DONE;
+  }
   switch (run_one(op, res)) {
     case RAN:
       return EXEC_DONE;

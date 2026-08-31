@@ -10,7 +10,13 @@
 #
 # -std=c11 with NO feature macro on purpose: the exported headers have to
 # stand up for a C consumer on their own terms.
-CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
+CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc -I$(LIBURING_SRC)/src/include
+
+# The engine speaks the ABI of the liburing this project carries - its
+# liburing/io_uring.h, never the host's /usr/include/linux, which can be
+# older than the opcodes the engine serves. Point LIBURING_SRC at a
+# liburing source tree; deps/liburing is the carried default.
+LIBURING_SRC ?= deps/liburing
 
 # The engine core and every backend the platform guards let through -
 # absent ones compile to empty translation units.
@@ -18,7 +24,12 @@ ENGINE = src/slipstream_engine.c src/engine_posix.c src/engine_poll.c src/engine
 
 BINS = test/available test/syscall test/shim test/blocked test/backends
 
-test: $(BINS)
+abi_header:
+	@test -f "$(LIBURING_SRC)/src/include/liburing/io_uring.h" || { \
+	  echo "no liburing tree at $(LIBURING_SRC) - the engine needs its io_uring.h"; \
+	  echo "  (set LIBURING_SRC to one, or add it under deps/liburing)"; exit 1; }
+
+test: abi_header $(BINS)
 	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/backends && ./test/backends_adapters.sh && ./test/backends_wine.sh && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
 
 # The question that runs before liburing exists, so it is built like any
@@ -46,7 +57,7 @@ test/backends: test/backends.c $(ENGINE) src/engine_internal.h src/slipstream_en
 # -std=gnu11 for the same reason liburing builds that way - its own
 # sources need the POSIX names.
 test/shim: test/shim.c src/liburing_arch_syscall.h src/slipstream_syscall.c $(ENGINE)
-	$(CC) -std=gnu11 -Wall -Wextra -O2 -iquote src -o $@ test/shim.c src/slipstream_syscall.c $(ENGINE)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -iquote src -I$(LIBURING_SRC)/src/include -Ishim/common -o $@ test/shim.c src/slipstream_syscall.c $(ENGINE)
 
 # The whole thing, end to end: a real liburing built WITH the shim, its
 # headers installed where we say, and an ordinary liburing program run
@@ -65,4 +76,4 @@ liburing_h_shims:
 clean:
 	rm -f $(BINS)
 
-.PHONY: test clean
+.PHONY: test clean abi_header

@@ -126,12 +126,24 @@ that check fails and this section goes.
 
 ### 1. The opcodes webmachine actually preps
 
-cmd_sock, sendmsg, recvmsg_multishot, recv_multishot, accept_direct,
-socket_direct, poll_add/update/remove, cancel_fd, bind, listen,
-shutdown, statx, unlink, openat2 — plus the register family the server
-uses (files_sparse, file_alloc_range, ring_fd, buf_ring). The old
-header-only engine implemented most of these semantics once; they move
-behind the seam op by op, each with its scene in the tests.
+Delivered, each with its kernel-parity scenario: socket, bind, listen,
+shutdown, accept (single-shot; SOCK_* flags via accept4, spelled out on
+macOS), connect (worker - blocking belongs there), sendmsg, recvmsg,
+poll_add (the readiness is the answer), poll_remove, async_cancel (by
+user_data, by fd, CANCEL_ALL; 0 / -ENOENT / -EALREADY like the kernel),
+statx (raw syscall on Linux, an fstatat fallback filling the shim's
+struct statx elsewhere), unlinkat, openat and openat2 (worker - open on
+a FIFO blocks; off Linux a resolve constraint is refused, not dropped).
+The engine speaks the CARRIED liburing's io_uring.h on every platform,
+Linux included - this host's /usr/include/linux lacked IORING_OP_BIND.
+
+Still open: the multishot family (accept, recv, recvmsg, poll) with
+their CQE flags (F_MORE, buffer ids), cmd_sock
+(SOCKET_URING_OP_SETSOCKOPT and friends), the direct-descriptor
+variants, and the register family (files_sparse, file_alloc_range,
+ring_fd, buf_ring). The old header-only engine implemented most of
+these semantics once; they move behind the seam op by op, each with a
+parity scene.
 
 ### 2. Carrying liburing, and the packaging step
 

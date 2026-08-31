@@ -9,14 +9,13 @@
 #ifndef SLIPSTREAM_ENGINE_INTERNAL_H
 #define SLIPSTREAM_ENGINE_INTERNAL_H
 
-#ifdef __linux__
-#include <linux/io_uring.h>
-#else
-/* The carried liburing's copy of the kernel header - the same file,
- * installed where the packaging says. Off Linux it is the only spelling
- * of these structs there is. */
+/* The carried liburing's copy of the kernel header, on EVERY platform,
+ * Linux included: the engine speaks the ABI of the liburing it stands
+ * under, and a host's /usr/include/linux may be older than that - this
+ * machine's lacked IORING_OP_BIND, measured. The packaging puts the
+ * carried tree on the include path; the Makefile refuses with words
+ * when there is none. */
 #include <liburing/io_uring.h>
-#endif
 
 #include "thrd_compat.h"
 

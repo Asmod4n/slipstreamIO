@@ -15,11 +15,7 @@
 
 #include "slipstream_engine.h"
 
-#ifdef __linux__
-#include <linux/io_uring.h>
-#else
-#include <liburing/io_uring.h>
-#endif
+#include <liburing/io_uring.h> /* the carried liburing's ABI, every platform */
 
 #include <errno.h>
 #include <stdint.h>

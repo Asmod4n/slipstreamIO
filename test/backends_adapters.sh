@@ -11,13 +11,19 @@
 set -e
 
 here=$(cd "$(dirname "$0")/.." && pwd)
+src=${LIBURING_SRC:-$here/deps/liburing}
+if [ ! -f "$src/src/include/liburing/io_uring.h" ]; then
+  echo "backends_adapters: no liburing source at $src - skipped"
+  echo "  (the engine reads liburing's io_uring.h; set LIBURING_SRC)"
+  exit 0
+fi
 eng="$here/src/slipstream_engine.c $here/src/engine_posix.c $here/src/engine_poll.c $here/src/engine_epoll.c \
      $here/src/engine_kqueue.c $here/src/engine_dispatch.c"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 if kq_flags=$(pkg-config --cflags --libs libkqueue 2>/dev/null); then
-  cc -std=c11 -Wall -Wextra -O2 -I"$here/src" -DSLIPSTREAM_HAVE_LIBKQUEUE $kq_flags \
+  cc -std=c11 -Wall -Wextra -O2 -I"$here/src" -I"$src/src/include" -DSLIPSTREAM_HAVE_LIBKQUEUE $kq_flags \
     -o "$work/backends-kq" "$here/test/backends.c" $eng $kq_flags
   "$work/backends-kq" | grep -A13 '^  kqueue:'
   "$work/backends-kq" > /dev/null
@@ -31,7 +37,7 @@ fi
 # (dispatch_io speaks them), and its static BlocksRuntime rides along.
 ld=${LIBDISPATCH_BUILD:-$HOME/swift-corelibs-libdispatch}
 if command -v clang >/dev/null 2>&1 && [ -f "$ld/build/src/libdispatch.a" ]; then
-  clang -std=c11 -Wall -Wextra -fblocks -O2 -I"$here/src" -DSLIPSTREAM_HAVE_LIBDISPATCH \
+  clang -std=c11 -Wall -Wextra -fblocks -O2 -I"$here/src" -I"$src/src/include" -DSLIPSTREAM_HAVE_LIBDISPATCH \
     -I"$ld" -I"$ld/build" -o "$work/backends-dsp" "$here/test/backends.c" $eng \
     "$ld/build/src/libdispatch.a" "$ld/build/src/BlocksRuntime/libBlocksRuntime.a" \
     -lpthread -lstdc++

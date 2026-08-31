@@ -5,7 +5,7 @@
 #include "uring_available.h"
 #include "seccomp_block.h"
 
-#include <linux/io_uring.h>
+#include <liburing/io_uring.h> /* the carried liburing's ABI, every platform */
 #include <stdio.h>
 #include <string.h>
 

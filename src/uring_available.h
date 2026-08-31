@@ -22,7 +22,7 @@
 
 #ifdef __linux__
 
-#include <linux/io_uring.h>
+#include <liburing/io_uring.h> /* the carried liburing's ABI, every platform */
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>

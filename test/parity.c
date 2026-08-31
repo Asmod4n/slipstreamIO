@@ -11,14 +11,22 @@
  *
  * Needs a kernel that allows io_uring - the oracle - and says so and
  * skips when there is none. Built and run by test/with_liburing.sh. */
+
+/* struct statx reaches glibc's sys/stat.h only under _GNU_SOURCE; a .c
+ * of our own may say so on its first line. */
+#define _GNU_SOURCE 1
+
 #include <liburing.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "slipstream_syscall.h"
@@ -31,6 +39,13 @@ struct rec {
 };
 
 #define REC_MAX 16
+
+
+/* A new descriptor's NUMBER is allocation order, not behavior - the two
+ * sides allocate at different moments, so an fd-yielding op records
+ * this token for any success and the scenario proves the fd USABLE
+ * instead of comparing its number. */
+#define FD_OK 900
 
 /* A scenario preps and submits against the ring it is handed and
  * returns how many completions it collected into out[]. It must behave
@@ -173,6 +188,229 @@ static int sc_chain_fails(struct io_uring *ring, struct rec *out) {
   return collect(ring, out, 3);
 }
 
+static int submit_one(struct io_uring *ring, struct rec *out) {
+  io_uring_submit(ring);
+  return collect(ring, out, 1);
+}
+
+/* socket -> bind -> listen -> (plain connect) -> accept, every step an
+ * op, the accepted descriptor proven usable by a send the peer reads. */
+static int sc_socket_lifecycle(struct io_uring *ring, struct rec *out) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_socket(sqe, AF_INET, SOCK_STREAM, 0, 0);
+  io_uring_sqe_set_data64(sqe, 30);
+  if (submit_one(ring, out) != 1 || out[0].res < 0) return 1;
+  const int lfd = out[0].res;
+  out[0].res = FD_OK;
+
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_bind(sqe, lfd, (struct sockaddr *) &a, sizeof(a));
+  io_uring_sqe_set_data64(sqe, 31);
+  if (submit_one(ring, out + 1) != 1) return 2;
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_listen(sqe, lfd, 4);
+  io_uring_sqe_set_data64(sqe, 32);
+  if (submit_one(ring, out + 2) != 1) return 3;
+
+  socklen_t alen = sizeof(a);
+  if (getsockname(lfd, (struct sockaddr *) &a, &alen) != 0) return -1;
+
+  /* The accept parks first - nobody has knocked - and the plain connect
+   * wakes it. */
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_accept(sqe, lfd, NULL, NULL, 0);
+  io_uring_sqe_set_data64(sqe, 33);
+  io_uring_submit(ring);
+  const int cfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (cfd < 0 || connect(cfd, (struct sockaddr *) &a, sizeof(a)) != 0) return -1;
+  if (collect(ring, out + 3, 1) != 1 || out[3].res < 0) return 4;
+  const int afd = out[3].res;
+  out[3].res = FD_OK;
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_send(sqe, afd, "hi", 2, 0);
+  io_uring_sqe_set_data64(sqe, 34);
+  if (submit_one(ring, out + 4) != 1) return 5;
+  char got[4] = { 0 };
+  if (read(cfd, got, sizeof(got)) != 2 || memcmp(got, "hi", 2) != 0) return -1;
+
+  close(cfd);
+  close(afd);
+  close(lfd);
+  return 5;
+}
+
+/* connect through the ring: to a listening socket, and to a port where
+ * nobody listens - loopback answers the second one at once. */
+static int sc_connect(struct io_uring *ring, struct rec *out) {
+  const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t alen = sizeof(a);
+  if (lfd < 0 || bind(lfd, (struct sockaddr *) &a, sizeof(a)) != 0 || listen(lfd, 1) != 0 ||
+      getsockname(lfd, (struct sockaddr *) &a, &alen) != 0)
+    return -1;
+
+  const int c1 = socket(AF_INET, SOCK_STREAM, 0);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c1, (struct sockaddr *) &a, sizeof(a));
+  io_uring_sqe_set_data64(sqe, 40);
+  if (submit_one(ring, out) != 1) return 1;
+
+  close(lfd); /* the port is nobody's now */
+  const int c2 = socket(AF_INET, SOCK_STREAM, 0);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c2, (struct sockaddr *) &a, sizeof(a));
+  io_uring_sqe_set_data64(sqe, 41);
+  const int n = submit_one(ring, out + 1);
+  close(c1);
+  close(c2);
+  return n == 1 ? 2 : 1;
+}
+
+static int sc_msg_roundtrip(struct io_uring *ring, struct rec *out) {
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+  static char txt[] = "msg";
+  struct iovec iov = { .iov_base = txt, .iov_len = 3 };
+  struct msghdr mh;
+  memset(&mh, 0, sizeof(mh));
+  mh.msg_iov = &iov;
+  mh.msg_iovlen = 1;
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_sendmsg(sqe, sp[1], &mh, 0);
+  io_uring_sqe_set_data64(sqe, 50);
+  if (submit_one(ring, out) != 1) return 1;
+
+  static char rbuf[8];
+  struct iovec riov = { .iov_base = rbuf, .iov_len = sizeof(rbuf) };
+  struct msghdr rmh;
+  memset(&rmh, 0, sizeof(rmh));
+  rmh.msg_iov = &riov;
+  rmh.msg_iovlen = 1;
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_recvmsg(sqe, sp[0], &rmh, 0);
+  io_uring_sqe_set_data64(sqe, 51);
+  const int n = submit_one(ring, out + 1);
+  const int data_ok = memcmp(rbuf, "msg", 3) == 0;
+  close(sp[0]);
+  close(sp[1]);
+  return (n == 1 && data_ok) ? 2 : 1;
+}
+
+/* poll_add on quiet data (parks, the peer wakes it) and on data already
+ * there - the revents mask is the res and must match bit for bit. */
+static int sc_poll_add(struct io_uring *ring, struct rec *out) {
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_poll_add(sqe, sp[0], POLLIN);
+  io_uring_sqe_set_data64(sqe, 60);
+  io_uring_submit(ring);
+  if (write(sp[1], "x", 1) != 1) return -1;
+  if (collect(ring, out, 1) != 1) return 0;
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_poll_add(sqe, sp[0], POLLIN);
+  io_uring_sqe_set_data64(sqe, 61);
+  const int n = submit_one(ring, out + 1);
+  close(sp[0]);
+  close(sp[1]);
+  return n == 1 ? 2 : 1;
+}
+
+/* A parked poll cancelled by user_data: the target answers -ECANCELED,
+ * the cancel answers 0; a cancel that names nothing answers -ENOENT. */
+static int sc_cancel(struct io_uring *ring, struct rec *out) {
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_poll_add(sqe, sp[0], POLLIN);
+  io_uring_sqe_set_data64(sqe, 70);
+  io_uring_submit(ring);
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_cancel64(sqe, 70, 0);
+  io_uring_sqe_set_data64(sqe, 71);
+  io_uring_submit(ring);
+  if (collect(ring, out, 2) != 2) return 0;
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_cancel64(sqe, 7777, 0);
+  io_uring_sqe_set_data64(sqe, 72);
+  const int n = submit_one(ring, out + 2);
+  close(sp[0]);
+  close(sp[1]);
+  return n == 1 ? 3 : 2;
+}
+
+static int sc_statx_size(struct io_uring *ring, struct rec *out) {
+  char path[] = "/tmp/slip-parity-sx-XXXXXX";
+  const int fd = mkstemp(path);
+  if (fd < 0) return -1;
+  if (pwrite(fd, "12345", 5, 0) != 5) return -1;
+  struct statx stx;
+  memset(&stx, 0, sizeof(stx));
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_statx(sqe, AT_FDCWD, path, 0, STATX_BASIC_STATS, &stx);
+  io_uring_sqe_set_data64(sqe, 80);
+  const int n = submit_one(ring, out);
+  const int size_ok = stx.stx_size == 5;
+  close(fd);
+  unlink(path);
+  return (n == 1 && size_ok) ? 1 : 0;
+}
+
+static int sc_unlink_and_open(struct io_uring *ring, struct rec *out) {
+  char path[] = "/tmp/slip-parity-un-XXXXXX";
+  const int fd = mkstemp(path);
+  if (fd < 0) return -1;
+  if (pwrite(fd, "keep", 4, 0) != 4) return -1;
+  close(fd);
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_openat(sqe, AT_FDCWD, path, O_RDONLY, 0);
+  io_uring_sqe_set_data64(sqe, 90);
+  if (submit_one(ring, out) != 1 || out[0].res < 0) return 1;
+  const int rfd = out[0].res;
+  out[0].res = FD_OK;
+  char got[4] = { 0 };
+  if (read(rfd, got, 4) != 4 || memcmp(got, "keep", 4) != 0) return -1;
+  close(rfd);
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_unlinkat(sqe, AT_FDCWD, path, 0);
+  io_uring_sqe_set_data64(sqe, 91);
+  if (submit_one(ring, out + 1) != 1) return 2;
+
+  /* Gone means gone: the same open must now say -ENOENT. */
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_openat(sqe, AT_FDCWD, path, O_RDONLY, 0);
+  io_uring_sqe_set_data64(sqe, 92);
+  return submit_one(ring, out + 2) == 1 ? 3 : 2;
+}
+
+static int sc_shutdown_means_eof(struct io_uring *ring, struct rec *out) {
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_shutdown(sqe, sp[1], SHUT_WR);
+  io_uring_sqe_set_data64(sqe, 100);
+  const int n = submit_one(ring, out);
+  char b;
+  const int eof_ok = read(sp[0], &b, 1) == 0;
+  close(sp[0]);
+  close(sp[1]);
+  return (n == 1 && eof_ok) ? 1 : 0;
+}
+
 static int sc_wait_times_out(struct io_uring *ring, struct rec *out) {
   struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000000LL };
   struct io_uring_cqe *cqe = NULL;
@@ -198,6 +436,14 @@ static const struct scenario scenarios[] = {
   { "a close on fd -1", sc_close_bad_fd, 0 },
   { "a link chain, in order", sc_chain_ok, 1 },
   { "a failing link head cancels the chain, in order", sc_chain_fails, 1 },
+  { "socket/bind/listen/accept, the accepted fd usable", sc_socket_lifecycle, 1 },
+  { "connect to a listener, and to a dead port", sc_connect, 1 },
+  { "sendmsg and recvmsg round a message", sc_msg_roundtrip, 1 },
+  { "poll_add parked and woken, and already-ready", sc_poll_add, 1 },
+  { "cancel takes a parked poll; a stranger is -ENOENT", sc_cancel, 0 },
+  { "statx sees the size just written", sc_statx_size, 1 },
+  { "openat reads, unlinkat removes, reopen says so", sc_unlink_and_open, 1 },
+  { "shutdown SHUT_WR reads as EOF at the peer", sc_shutdown_means_eof, 1 },
   { "a wait with nothing coming times out", sc_wait_times_out, 1 },
 };
 
