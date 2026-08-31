@@ -27,11 +27,11 @@ else
   echo "  (zypper in libkqueue-devel / apt install libkqueue-dev)"
 fi
 
-# swift-corelibs-libdispatch: clang-dialect headers, C++ inside, and its
-# static BlocksRuntime rides along.
+# swift-corelibs-libdispatch: clang-dialect headers, C++ inside, blocks
+# (dispatch_io speaks them), and its static BlocksRuntime rides along.
 ld=${LIBDISPATCH_BUILD:-$HOME/swift-corelibs-libdispatch}
 if command -v clang >/dev/null 2>&1 && [ -f "$ld/build/src/libdispatch.a" ]; then
-  clang -std=c11 -Wall -Wextra -O2 -I"$here/src" -DSLIPSTREAM_HAVE_LIBDISPATCH \
+  clang -std=c11 -Wall -Wextra -fblocks -O2 -I"$here/src" -DSLIPSTREAM_HAVE_LIBDISPATCH \
     -I"$ld" -I"$ld/build" -o "$work/backends-dsp" "$here/test/backends.c" $eng \
     "$ld/build/src/libdispatch.a" "$ld/build/src/BlocksRuntime/libBlocksRuntime.a" \
     -lpthread -lstdc++

@@ -85,25 +85,33 @@ The engine core - order, chains, the CQ, enter - holds not one OS call
 and compiles everywhere, Windows included. How ops RUN is a backend,
 chosen per platform and overridable by name until the first ring runs:
 
+Two families. READINESS - the OS says a descriptor came ready, one
+shared machine (`src/engine_posix.c`) does everything else:
+
 - `epoll` — Linux, the default there, for the case the engine exists
   for on Linux at all: io_uring refused at runtime
 - `kqueue` — the BSDs; proven natively by `test/freebsd_vm.sh` and on
   Linux through libkqueue (`test/backends_adapters.sh`)
-- `dispatch` — macOS' default: GCD `dispatch_source` readiness, since
-  kqueue is ruled out there and `dispatch_io` cannot carry recv/send
-  flags; proven against Apple's own swift-corelibs-libdispatch
-- `iocp` — Windows, the one completion-shaped motor: nothing parks,
-  ops fly as overlapped and the port reports them done; proven as a
-  MinGW binary under Wine (`test/backends_wine.sh`), with a thrd/mtx/cnd
-  shim because MinGW ships no `<threads.h>` in either thread model
 - `poll` — the POSIX baseline, always compiled
 
-The four readiness motors share one implementation of everything but
-the wakeup (`src/engine_posix.c`); `test/backends.c` drives every
-carried backend through the same scenes - inline NOP, a pending recv
-that enter must not wait for, `-ETIME` after a real deadline. Still
-named next: overlapped file IO on Windows (a CRT descriptor's handle is
-not `FILE_FLAG_OVERLAPPED`), and a native macOS run, which needs a Mac.
+COMPLETION - the OS runs the op and reports the outcome, the same
+shape io_uring itself has; nothing parks:
+
+- `iocp` — Windows: ops fly as overlapped and the port reports them
+  done; proven as a MinGW binary under Wine (`test/backends_wine.sh`),
+  with a thrd/mtx/cnd shim because MinGW ships no `<threads.h>`
+- `dispatch` — macOS' default: real `dispatch_io` channels, because GCD
+  then does what uring does - runs the IO and hands back results. Short
+  reads kept (low water 1, first delivery completes), channels stopped
+  cancellable at close; recv/send WITH flags have no dispatch spelling
+  and run on the worker instead. Proven against Apple's own
+  swift-corelibs-libdispatch
+
+`test/backends.c` drives every carried backend through the same scenes
+- inline NOP, a pending recv that enter must not wait for, `-ETIME`
+after a real deadline. Still named next: overlapped file IO on Windows
+(a CRT descriptor's handle is not `FILE_FLAG_OVERLAPPED`), and a native
+macOS run, which needs a Mac.
 
 ## Tests
 

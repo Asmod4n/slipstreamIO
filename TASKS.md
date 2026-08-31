@@ -99,16 +99,18 @@ caller moves the head on its own, so free CQ room is recomputed, never
 tracked, and completions the CQ had no room for wait in a backlog that
 drains wherever the lock is already held.
 
-### macOS gets dispatch_source, not kqueue and not select
+### macOS gets dispatch_io, in the completion family
 
 kqueue on macOS is unreliable in practice (operational experience); it
-is the native, maintained thing on the real BSDs and nowhere else. The
-earlier answer here was select; it fell to GCD, which is the surface
-Apple actually keeps working: the dispatch backend takes readiness from
-`dispatch_source` and the shared POSIX machinery runs the ops.
-`dispatch_io` itself was refused for a stated reason - it owns the
-reads and writes, a stream of buffers with no recv flags, and cannot
-carry io_uring's op semantics.
+is the native, maintained thing on the real BSDs and nowhere else.
+select fell first, then dispatch_source too: dispatch_io DOES what
+io_uring does - it runs the IO and reports the outcome - so the macOS
+backend sits beside iocp in the completion family instead of
+interpreting readiness. The flags objection that briefly picked
+dispatch_source resolves cleanly: recv/send WITH flags have no dispatch
+spelling and run on the worker, blocking where blocking belongs;
+everything else rides real channels, cancellable at close via
+DISPATCH_IO_STOP, short reads kept via a low water mark of 1.
 
 ### liburing.h's LP64 assumption stays visible
 

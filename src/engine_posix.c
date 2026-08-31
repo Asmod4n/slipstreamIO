@@ -153,6 +153,12 @@ static int run_file_op(const struct io_uring_sqe *s) {
       n = off_is_current(s->off) ? write(s->fd, buf, s->len)
                                  : pwrite(s->fd, buf, s->len, (off_t) s->off);
       break;
+    case IORING_OP_RECV:
+      n = recv(s->fd, buf, s->len, (int) s->msg_flags);
+      break;
+    case IORING_OP_SEND:
+      n = send(s->fd, buf, s->len, (int) s->msg_flags);
+      break;
     default:
       return -EOPNOTSUPP;
   }
@@ -219,6 +225,19 @@ static void unpark(struct slip_ring *r, struct eng_op *op) {
   }
 }
 
+void slip_posix_hand_to_worker(struct slip_ring *r, struct eng_op *op) {
+  /* stalls_queue rides on the op BEFORE the worker can see it - the
+   * ticket compare in the core needs it set by then. */
+  if (op->sqe.flags & IOSQE_IO_LINK) op->stalls_queue = 1;
+  mtx_lock(&r->mtx);
+  if (r->wq_tail) r->wq_tail->next = op;
+  else r->wq_head = op;
+  r->wq_tail = op;
+  worker_start_once(r);
+  cnd_signal(&r->wq_cv);
+  mtx_unlock(&r->mtx);
+}
+
 int slip_posix_execute(struct slip_ring *r, struct eng_op *op, int *res) {
   switch (run_one(op, res)) {
     case RAN:
@@ -228,16 +247,7 @@ int slip_posix_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       *res = -EBUSY; /* a full waiting set is refused, not dropped */
       return EXEC_DONE;
     case FILE_OP:
-      /* stalls_queue rides on the op BEFORE the worker can see it - the
-       * ticket compare in the core needs it set by then. */
-      if (op->sqe.flags & IOSQE_IO_LINK) op->stalls_queue = 1;
-      mtx_lock(&r->mtx);
-      if (r->wq_tail) r->wq_tail->next = op;
-      else r->wq_head = op;
-      r->wq_tail = op;
-      worker_start_once(r);
-      cnd_signal(&r->wq_cv);
-      mtx_unlock(&r->mtx);
+      slip_posix_hand_to_worker(r, op);
       return EXEC_PENDING;
   }
   *res = -EINVAL;

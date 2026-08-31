@@ -43,7 +43,7 @@ struct eng_op {
   struct eng_op *next;
   short wait_events; /* POLLIN/POLLOUT while parked (readiness backends) */
   int stalls_queue;  /* a linked op left the queue unfinished: it waits */
-  void *be_source;   /* dispatch: the source; iocp: the overlapped wrapper */
+  void *be_source;   /* dispatch: the channel wrapper; iocp: the overlapped one */
 };
 
 struct slip_ring {
@@ -73,7 +73,7 @@ struct slip_ring {
 
   const struct eng_backend *be;
   int be_fd;      /* epoll/kqueue descriptor; poll keeps none */
-  void *be_state; /* dispatch: queue+semaphore+fired; iocp: the port */
+  void *be_state; /* dispatch: queue+semaphore+done; iocp: the port */
 
   int ctl_r, ctl_w; /* the POSIX poke pipe; iocp pokes its port instead */
   thrd_t engine;
@@ -122,13 +122,17 @@ struct eng_backend {
  * frees the op (or backlogs it when the CQ is full). */
 void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res);
 
-/* ---- shared by the readiness backends (engine_posix.c) ---------------
- * poll, epoll, kqueue and dispatch differ ONLY in how they learn that a
- * parked descriptor came ready. Everything else - the poke pipe, the
- * DONTWAIT/poll-guarded try, parking, the worker for regular files, the
- * retry when readiness fires - is one implementation. A backend
- * supplies arm/disarm as the mirror of waiting[] membership and calls
- * finish_ready from its wait. */
+/* ---- the two families -------------------------------------------------
+ * READINESS (poll, epoll, kqueue): the OS says "that descriptor came
+ * ready" and the shared machinery in engine_posix.c does everything
+ * else - the poke pipe, the DONTWAIT-guarded try, parking mirrored via
+ * arm/disarm, the retry, the worker for regular files. A backend of
+ * this family is only its wakeup.
+ * COMPLETION (iocp, dispatch_io): the OS RUNS the op and reports the
+ * outcome - the same shape io_uring itself has. Nothing parks; execute
+ * issues, wait translates results, arm/disarm stay NULL. The worker
+ * still serves what the platform API cannot spell (recv flags under
+ * dispatch). */
 #ifndef _WIN32
 int slip_posix_ctl_open(struct slip_ring *r);
 void slip_posix_ctl_close(struct slip_ring *r);
@@ -137,6 +141,11 @@ void slip_posix_poke(struct slip_ring *r);
 int slip_posix_execute(struct slip_ring *r, struct eng_op *op, int *res);
 int slip_posix_finish_ready(struct slip_ring *r, struct eng_op **ready, unsigned ready_n,
                             struct eng_done *out, unsigned max);
+/* Hand one op to the blocking worker directly - for a completion
+ * backend whose API cannot express the op (dispatch_io has no recv
+ * flags) but whose platform can still run it correctly off the engine
+ * thread. */
+void slip_posix_hand_to_worker(struct slip_ring *r, struct eng_op *op);
 #endif
 
 extern const struct eng_backend slip_backend_poll;
