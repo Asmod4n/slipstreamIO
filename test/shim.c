@@ -40,9 +40,9 @@ int main(void) {
   struct io_uring_params p;
   memset(&p, 0, sizeof(p));
   const int fd = __sys_io_uring_setup(1, &p);
-  const int e1 = __sys_io_uring_enter(0, 0, 0, 0, NULL);
-  const int e2 = __sys_io_uring_enter2(0, 0, 0, 0, NULL, 0);
-  const int rg = __sys_io_uring_register(0, 0, NULL, 0);
+  const int e1 = __sys_io_uring_enter((unsigned) fd, 0, 0, 0, NULL);
+  const int e2 = __sys_io_uring_enter2((unsigned) fd, 0, 0, 0, NULL, 0);
+  const int rg = __sys_io_uring_register((unsigned) fd, 0, NULL, 0);
 
   void *m = __sys_mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
