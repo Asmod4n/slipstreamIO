@@ -91,6 +91,12 @@ make test
 - `test/with_liburing.sh` — end to end: a real liburing built with the
   seam, one ordinary program, the same completion on the kernel side,
   with the engine forced, and under seccomp
+- `test/freebsd_vm.sh` — the same shim proof on a REAL FreeBSD, booted
+  in a VM with stock tools (qemu, xorriso, curl, xz): the official
+  BASIC-CLOUDINIT image, a NoCloud seed whose user-data is the test
+  script, the verdict over the serial port. First find on first
+  contact: `CMSG_ALIGN` is glibc spelling — FreeBSD hides it, and
+  `shim/posix/sys/socket.h` now supplies the platform's own alignment
 
 ## Licence
 

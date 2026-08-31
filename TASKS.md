@@ -167,7 +167,9 @@ other gaps are filled. Plus the select swap under "Decided" above.
 Lowest priority: a correct `poll` loop already serves them, so this is
 a performance step, not an enablement one. Factor the readiness loop
 once before writing the third backend, so it does not copy the first
-two.
+two. `test/freebsd_vm.sh` is the proving ground: a real FreeBSD in a
+VM, running the repo's own test scripts with its base system - it
+already caught `CMSG_ALIGN` being glibc spelling on first contact.
 
 ### 7. The operations are still Linux syscalls
 
