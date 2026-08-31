@@ -179,10 +179,11 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
   }
 }
 
-static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max) {
+static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
+                     int timeout_ms) {
   struct iocp_state *st = r->be_state;
   unsigned n = 0;
-  DWORD timeout = INFINITE;
+  DWORD timeout = timeout_ms < 0 ? INFINITE : (DWORD) timeout_ms;
   while (n < max) {
     DWORD bytes = 0;
     ULONG_PTR key = 0;

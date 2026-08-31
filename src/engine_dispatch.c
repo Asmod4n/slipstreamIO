@@ -231,9 +231,13 @@ static int dsp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
   }
 }
 
-static int dsp_wait_done(struct slip_ring *r, struct eng_done *out, unsigned max) {
+static int dsp_wait_done(struct slip_ring *r, struct eng_done *out, unsigned max,
+                         int timeout_ms) {
   struct dsp_state *st = r->be_state;
-  dispatch_semaphore_wait(st->sem, DISPATCH_TIME_FOREVER);
+  const dispatch_time_t until =
+      timeout_ms < 0 ? DISPATCH_TIME_FOREVER
+                     : dispatch_time(DISPATCH_TIME_NOW, (int64_t) timeout_ms * NSEC_PER_MSEC);
+  if (dispatch_semaphore_wait(st->sem, until) != 0) return 0; /* the deadline, not an event */
   mtx_lock(&st->mtx);
   unsigned n = 0;
   while (st->done_n > 0 && n < max) {

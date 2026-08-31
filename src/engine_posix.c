@@ -20,6 +20,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h> /* preadv2/pwritev2 and their iovec */
 #include <unistd.h>
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -138,10 +139,40 @@ static int fd_is_pollable(int fd) {
   return !(S_ISREG(st.st_mode) || S_ISBLK(st.st_mode) || S_ISDIR(st.st_mode));
 }
 
-static int ready_now(int fd, short events) {
-  struct pollfd p = { .fd = fd, .events = events };
-  return poll(&p, 1, 0) > 0;
+/* io_uring TRIES, it never asks first: every op is issued nonblocking
+ * and -EAGAIN is the answer that sends it to the poll set. A pre-flight
+ * poll() would be a second syscall per op for information the op itself
+ * hands back. Userspace cannot pass the kernel's internal force_nonblock
+ * to accept, so the descriptors this engine touches carry O_NONBLOCK
+ * instead - set once, where they are made or first used. */
+static void set_nonblock(int fd) {
+  const int fl = fcntl(fd, F_GETFL, 0);
+  if (fl >= 0 && !(fl & O_NONBLOCK)) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
+
+#ifdef __linux__
+#ifndef RWF_NOWAIT
+#define RWF_NOWAIT 0x00000008
+#endif
+/* The page cache question, answered the way io_uring answers it: the
+ * read is ISSUED with NOWAIT, which serves whatever is resident and says
+ * -EAGAIN for the rest. A short read is a normal answer here - only the
+ * cached part came back - and that is what the kernel's own ring does
+ * before it pays for a worker. mincore() cannot replace this: it speaks
+ * about a mapping, and about the moment before the read. */
+static ssize_t file_try_nowait(const struct io_uring_sqe *s, void *buf, int writing) {
+  struct iovec iov = { .iov_base = buf, .iov_len = s->len };
+  const off_t off = off_is_current(s->off) ? (off_t) -1 : (off_t) s->off;
+  return writing ? pwritev2(s->fd, &iov, 1, off, RWF_NOWAIT)
+                 : preadv2(s->fd, &iov, 1, off, RWF_NOWAIT);
+}
+
+/* Whether the miss is worth a thread, or is the real answer. */
+static int nowait_missed(void) {
+  return errno == EAGAIN || errno == EWOULDBLOCK || errno == EOPNOTSUPP ||
+         errno == ENOSYS || errno == EINVAL;
+}
+#endif
 
 #ifndef __linux__
 #include <linux/stat.h> /* the shim's struct statx, for hosts without one */
@@ -213,14 +244,7 @@ static enum verdict run_accept_multishot(struct slip_ring *r, struct eng_op *op,
                                          int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   for (;;) {
-    /* accept has no DONTWAIT of its own, and the listener a ring made
-     * with IORING_OP_SOCKET is a BLOCKING one - accepting without asking
-     * first stalls the whole engine thread on an idle listener, which is
-     * exactly what it must never do. Readiness first, every round. */
-    if (!ready_now(s->fd, POLLIN)) {
-      op->wait_events = POLLIN;
-      return PARK;
-    }
+    set_nonblock(s->fd); /* accept takes its nonblocking from the listener */
     const int fd = accept_one(s);
     if (fd < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -344,25 +368,53 @@ static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out
       return RAN;
     case IORING_OP_READ: {
       const int pollable = fd_is_pollable(s->fd);
-      if (pollable == 0) return FILE_OP;
-      if (pollable > 0 && !ready_now(s->fd, POLLIN)) {
+      if (pollable == 0) {
+#ifdef __linux__
+        n = file_try_nowait(s, buf, 0);
+        if (n >= 0) {
+          *res_out = (int) n; /* served out of the page cache, on this thread */
+          return RAN;
+        }
+        if (!nowait_missed()) {
+          *res_out = -errno;
+          return RAN;
+        }
+#endif
+        return FILE_OP; /* a real disk wait: that is what the worker is for */
+      }
+      if (pollable > 0) set_nonblock(s->fd);
+      n = off_is_current(s->off) ? read(s->fd, buf, s->len)
+                                 : pread(s->fd, buf, s->len, (off_t) s->off);
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         op->wait_events = POLLIN;
         return PARK;
       }
-      n = off_is_current(s->off) ? read(s->fd, buf, s->len)
-                                 : pread(s->fd, buf, s->len, (off_t) s->off);
       *res_out = n < 0 ? -errno : (int) n;
       return RAN;
     }
     case IORING_OP_WRITE: {
       const int pollable = fd_is_pollable(s->fd);
-      if (pollable == 0) return FILE_OP;
-      if (pollable > 0 && !ready_now(s->fd, POLLOUT)) {
+      if (pollable == 0) {
+#ifdef __linux__
+        n = file_try_nowait(s, buf, 1);
+        if (n >= 0) {
+          *res_out = (int) n;
+          return RAN;
+        }
+        if (!nowait_missed()) {
+          *res_out = -errno;
+          return RAN;
+        }
+#endif
+        return FILE_OP;
+      }
+      if (pollable > 0) set_nonblock(s->fd);
+      n = off_is_current(s->off) ? write(s->fd, buf, s->len)
+                                 : pwrite(s->fd, buf, s->len, (off_t) s->off);
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         op->wait_events = POLLOUT;
         return PARK;
       }
-      n = off_is_current(s->off) ? write(s->fd, buf, s->len)
-                                 : pwrite(s->fd, buf, s->len, (off_t) s->off);
       *res_out = n < 0 ? -errno : (int) n;
       return RAN;
     }
@@ -395,12 +447,13 @@ static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out
       return RAN;
     case IORING_OP_ACCEPT: {
       if (s->ioprio & IORING_ACCEPT_MULTISHOT) return run_accept_multishot(r, op, res_out);
-      if (!ready_now(s->fd, POLLIN)) {
-        op->wait_events = POLLIN;
-        return PARK;
-      }
+      set_nonblock(s->fd);
       n = accept_one(s);
       if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          op->wait_events = POLLIN;
+          return PARK;
+        }
         *res_out = -errno;
         return RAN;
       }
@@ -597,7 +650,11 @@ static int worker_main(void *arg) {
       mtx_unlock(&r->mtx);
     }
     slip_engine_post(r, op, res); /* frees op */
-    if (stalls) slip_posix_poke(r); /* the queue is waiting on this */
+    /* ALWAYS, not just for a stalled chain: the submitter waits inside
+     * the backend now, and this pipe is the only door into that wait.
+     * While an engine thread owned the loop, posting alone was enough -
+     * the waiter sat on a condvar that posting signalled. */
+    slip_posix_poke(r);
 
     mtx_lock(&r->mtx);
   }

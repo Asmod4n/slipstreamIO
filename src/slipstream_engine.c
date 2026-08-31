@@ -142,7 +142,6 @@ static void post_locked(struct slip_ring *r, __u64 user_data, int res, unsigned 
   c->res = res;
   c->flags = flags;
   __atomic_store_n(&cq->tail, cq->tail + 1, __ATOMIC_RELEASE);
-  cnd_broadcast(&r->cv);
 }
 
 /* The caller moves khead without telling us, so room can appear at any
@@ -311,46 +310,21 @@ static void process_queue(struct slip_ring *r) {
   }
 }
 
-static int engine_main(void *arg) {
-  struct slip_ring *r = arg;
-  struct eng_done done[SLIP_WAITING_MAX];
-
-  for (;;) {
-    const int n = r->be->wait(r, done, SLIP_WAITING_MAX);
-    if (n < 0) break;
-
-    /* Wakeups are level-noisy and pokes coalesce, so every wakeup does
-     * the whole drain: shutdown, new submissions, the worker's ticket,
-     * backlog room. */
-    mtx_lock(&r->mtx);
-    if (r->stopping) {
-      mtx_unlock(&r->mtx);
-      break;
+/* A chain whose head went to the worker: the ticket says it finished.
+ * The pointer is compared, never read - the op behind it is already
+ * posted and freed. */
+static void settle_worker_ticket(struct slip_ring *r) {
+  mtx_lock(&r->mtx);
+  if (r->blocked_done != NULL && r->blocked_done == r->blocking) {
+    r->blocking = NULL;
+    r->blocked_done = NULL;
+    if (r->blocked_failed) {
+      r->chain_failed = 1;
+      r->blocked_failed = 0;
     }
-    if (r->inbox_head != NULL) {
-      if (r->queue_tail) r->queue_tail->next = r->inbox_head;
-      else r->queue_head = r->inbox_head;
-      r->queue_tail = r->inbox_tail;
-      r->inbox_head = r->inbox_tail = NULL;
-    }
-    if (r->blocked_done != NULL && r->blocked_done == r->blocking) {
-      /* The pointer is a ticket - the op behind it is already posted
-       * and freed, so it is compared, never read. */
-      r->blocking = NULL;
-      r->blocked_done = NULL;
-      if (r->blocked_failed) {
-        r->chain_failed = 1;
-        r->blocked_failed = 0;
-      }
-    }
-    drain_backlog_locked(r);
-    mtx_unlock(&r->mtx);
-
-    for (int i = 0; i < n; i++) complete(r, done[i].op, done[i].res);
-
-    process_queue(r);
   }
-  return 0;
+  drain_backlog_locked(r);
+  mtx_unlock(&r->mtx);
 }
 
 /* ---- the exported five, and the backend switch ------------------------ */
@@ -393,7 +367,7 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   r->sqes = calloc(r->sq_entries, sizeof(struct io_uring_sqe));
   if (!r->sq_block || !r->cq_block || !r->sqes ||
       mtx_init(&r->mtx, mtx_plain) != thrd_success ||
-      cnd_init(&r->cv) != thrd_success || cnd_init(&r->wq_cv) != thrd_success) {
+      cnd_init(&r->wq_cv) != thrd_success) {
     free(r->sq_block); free(r->cq_block); free(r->sqes);
     memset(r, 0, sizeof(*r));
     return -ENOMEM;
@@ -401,7 +375,6 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
 
   if (r->be->open_ring(r) != 0) {
     mtx_destroy(&r->mtx);
-    cnd_destroy(&r->cv);
     cnd_destroy(&r->wq_cv);
     free(r->sq_block); free(r->cq_block); free(r->sqes);
     memset(r, 0, sizeof(*r));
@@ -412,17 +385,6 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   sq_of(r)->ring_entries = r->sq_entries;
   cq_of(r)->ring_mask = r->cq_entries - 1;
   cq_of(r)->ring_entries = r->cq_entries;
-
-  if (thrd_create(&r->engine, engine_main, r) != thrd_success) {
-    r->be->close_ring(r);
-    mtx_destroy(&r->mtx);
-    cnd_destroy(&r->cv);
-    cnd_destroy(&r->wq_cv);
-    free(r->sq_block); free(r->cq_block); free(r->sqes);
-    memset(r, 0, sizeof(*r));
-    return -ENOMEM;
-  }
-  r->engine_live = 1;
 
   p->sq_entries = r->sq_entries;
   p->cq_entries = r->cq_entries;
@@ -621,14 +583,10 @@ int slipstream_engine_close(int fd) {
   mtx_lock(&r->mtx);
   r->stopping = 1;
   cnd_broadcast(&r->wq_cv);
-  cnd_broadcast(&r->cv);
   mtx_unlock(&r->mtx);
-  r->be->poke(r);
-  if (r->engine_live) thrd_join(r->engine, NULL);
   if (r->worker_live) thrd_join(r->worker, NULL);
   r->be->close_ring(r);
 
-  free_op_list(r->inbox_head);
   free_op_list(r->backlog_head);
   free_op_list(r->wq_head);
   free_op_list(r->queue_head);
@@ -642,7 +600,6 @@ int slipstream_engine_close(int fd) {
     free(r->fixed);
   }
   mtx_destroy(&r->mtx);
-  cnd_destroy(&r->cv);
   cnd_destroy(&r->wq_cv);
   free(r->sq_block);
   free(r->cq_block);
@@ -704,37 +661,49 @@ int slipstream_engine_enter(int fd, unsigned int to_submit, unsigned int min_com
     __atomic_store_n(&sq->head, sq->head + 1, __ATOMIC_RELEASE);
     submitted++;
   }
+  /* THE SUBMITTER RUNS THE OPS. No handoff, no second thread: what can
+   * finish without blocking finishes right here and its CQE is already
+   * there when this returns - and what cannot is parked with the
+   * backend, for this same loop to pick up. */
   if (batch_head != NULL) {
-    mtx_lock(&r->mtx);
-    if (r->inbox_tail) r->inbox_tail->next = batch_head;
-    else r->inbox_head = batch_head;
-    r->inbox_tail = batch_tail;
-    mtx_unlock(&r->mtx);
-    r->be->poke(r);
+    if (r->queue_tail) r->queue_tail->next = batch_head;
+    else r->queue_head = batch_head;
+    r->queue_tail = batch_tail;
+    process_queue(r);
   }
 
+  /* ONE PASS, never a loop. The kernel's enter does not spin either -
+   * it fills what it can and returns, and the repeating is the caller's:
+   * liburing's own __io_uring_get_cqe peeks the CQ and calls enter again
+   * while it comes up short. So this waits AT MOST once, and every call
+   * makes progress or blocks. */
   if ((flags & IORING_ENTER_GETEVENTS) && min_complete > 0) {
     struct cq_ring *cq = cq_of(r);
-    mtx_lock(&r->mtx);
-    for (;;) {
-      drain_backlog_locked(r);
-      const unsigned avail = __atomic_load_n(&cq->tail, __ATOMIC_ACQUIRE) -
-                             __atomic_load_n(&cq->head, __ATOMIC_ACQUIRE);
-      if (avail >= min_complete) break;
-      if (r->stopping) {
-        mtx_unlock(&r->mtx);
-        return -EBADF;
-      }
+    settle_worker_ticket(r); /* the worker's results, and the backlog */
+    unsigned avail = __atomic_load_n(&cq->tail, __ATOMIC_ACQUIRE) -
+                     __atomic_load_n(&cq->head, __ATOMIC_ACQUIRE);
+    if (avail < min_complete) {
+      int timeout_ms = -1;
       if (has_deadline) {
-        if (cnd_timedwait(&r->cv, &r->mtx, &deadline) == thrd_timedout) {
-          mtx_unlock(&r->mtx);
-          return -ETIME;
-        }
-      } else {
-        cnd_wait(&r->cv, &r->mtx);
+        struct timespec now;
+        timespec_get(&now, TIME_UTC);
+        const long long left = (long long) (deadline.tv_sec - now.tv_sec) * 1000 +
+                               (deadline.tv_nsec - now.tv_nsec) / 1000000;
+        if (left <= 0) return -ETIME;
+        timeout_ms = left > 0x7fffffff ? 0x7fffffff : (int) left;
       }
+      struct eng_done done[SLIP_WAITING_MAX];
+      const int n = r->be->wait(r, done, SLIP_WAITING_MAX, timeout_ms);
+      if (n < 0) return -EBADF;
+      for (int i = 0; i < n; i++) complete(r, done[i].op, done[i].res);
+      process_queue(r); /* a settled chain may have more to run now */
+      settle_worker_ticket(r);
+      avail = __atomic_load_n(&cq->tail, __ATOMIC_ACQUIRE) -
+              __atomic_load_n(&cq->head, __ATOMIC_ACQUIRE);
+      /* The deadline is the ONE thing enter answers for itself: the
+       * caller asked to be told, not to be called again. */
+      if (avail < min_complete && has_deadline) return -ETIME;
     }
-    mtx_unlock(&r->mtx);
   }
 
   return (int) submitted;

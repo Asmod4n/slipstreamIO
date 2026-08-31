@@ -69,16 +69,17 @@ struct slip_ring {
   size_t sq_size, cq_size, sqes_size;
 
   /* ---- the handoff, and the completions ---------------------------- */
-  mtx_t mtx;  /* inbox, worker queue, CQ posting, backlog, blocked_done */
-  cnd_t cv;   /* a completion was posted - enter's wait side */
+  mtx_t mtx;  /* worker queue, CQ posting, backlog, blocked_done */
   cnd_t wq_cv;
-  struct eng_op *inbox_head, *inbox_tail; /* enter -> engine */
   struct eng_op *backlog_head, *backlog_tail; /* completions the CQ had no room for */
   struct eng_op *wq_head, *wq_tail; /* engine -> worker (regular files, POSIX) */
   struct eng_op *blocked_done; /* the op the queue stalled on, finished off-thread */
   int blocked_failed; /* that op's result was negative - the chain must know */
 
-  /* ---- what the ENGINE THREAD owns --------------------------------- */
+  /* ---- what WHOEVER IS INSIDE ENTER owns ---------------------------
+   * The submitter runs the ops, parks them and drains the backend on its
+   * own thread, so these need no lock: io_uring's own single-issuer
+   * shape, and the one this engine is used in. */
   struct eng_op *queue_head, *queue_tail; /* submitted, in order */
   struct eng_op *waiting[SLIP_WAITING_MAX]; /* parked (readiness backends) */
   unsigned waiting_n;
@@ -100,9 +101,10 @@ struct slip_ring {
   int be_fd;      /* epoll/kqueue descriptor; poll keeps none */
   void *be_state; /* dispatch: queue+semaphore+done; iocp: the port */
 
-  int ctl_r, ctl_w; /* the POSIX poke pipe; iocp pokes its port instead */
-  thrd_t engine;
-  int engine_live;
+  /* The poke: the WORKER's door to a submitter blocked in the backend's
+   * wait. Nothing else knocks - a submit runs on the submitter's own
+   * thread and has nobody to wake. */
+  int ctl_r, ctl_w;
   thrd_t worker;
   int worker_live;
   int stopping;
@@ -134,7 +136,10 @@ struct eng_backend {
   void (*close_ring)(struct slip_ring *r);
   void (*poke)(struct slip_ring *r);
   int (*execute)(struct slip_ring *r, struct eng_op *op, int *res);
-  int (*wait)(struct slip_ring *r, struct eng_done *out, unsigned max);
+  /* Blocks until something happened, at most timeout_ms (-1 forever, 0
+   * a look). Runs on the CALLER's thread, inside enter - there is no
+   * engine thread; see slipstream_engine.c. */
+  int (*wait)(struct slip_ring *r, struct eng_done *out, unsigned max, int timeout_ms);
   /* Readiness backends only: the mirror of waiting[] membership - arm
    * on park, disarm on unpark, called by the shared POSIX machinery. A
    * backend whose execute never parks leaves them NULL. */

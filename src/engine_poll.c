@@ -22,7 +22,8 @@ static void poll_disarm(struct slip_ring *r, struct eng_op *op) {
   (void) op;
 }
 
-static int poll_wait(struct slip_ring *r, struct eng_done *out, unsigned max) {
+static int poll_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
+                     int timeout_ms) {
   struct pollfd pfds[SLIP_WAITING_MAX + 1];
   pfds[0].fd = r->ctl_r;
   pfds[0].events = POLLIN;
@@ -30,7 +31,7 @@ static int poll_wait(struct slip_ring *r, struct eng_done *out, unsigned max) {
     pfds[i + 1].fd = r->waiting[i]->sqe.fd;
     pfds[i + 1].events = r->waiting[i]->wait_events;
   }
-  if (poll(pfds, r->waiting_n + 1, -1) < 0) return 0; /* EINTR: a harmless drain */
+  if (poll(pfds, r->waiting_n + 1, timeout_ms) < 0) return 0; /* EINTR: a harmless drain */
   if (pfds[0].revents & POLLIN) slip_posix_ctl_drain(r);
 
   struct eng_op *ready[SLIP_WAITING_MAX];

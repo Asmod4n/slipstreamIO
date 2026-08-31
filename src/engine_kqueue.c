@@ -79,9 +79,15 @@ static void kqueue_disarm(struct slip_ring *r, struct eng_op *op) {
   (void) kevent(r->be_fd, &ev, 1, NULL, 0, NULL);
 }
 
-static int kqueue_wait(struct slip_ring *r, struct eng_done *out, unsigned max) {
+static int kqueue_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
+                       int timeout_ms) {
   struct kevent evs[64];
-  const int got = kevent(r->be_fd, NULL, 0, evs, 64, NULL);
+  struct timespec ts;
+  if (timeout_ms >= 0) {
+    ts.tv_sec = timeout_ms / 1000;
+    ts.tv_nsec = (long) (timeout_ms % 1000) * 1000000L;
+  }
+  const int got = kevent(r->be_fd, NULL, 0, evs, 64, timeout_ms >= 0 ? &ts : NULL);
   if (got < 0) return 0; /* EINTR: a harmless drain */
 
   struct eng_op *ready[SLIP_WAITING_MAX];

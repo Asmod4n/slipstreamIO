@@ -78,9 +78,10 @@ static void epoll_disarm(struct slip_ring *r, struct eng_op *op) {
   }
 }
 
-static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned max) {
+static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned max,
+                            int timeout_ms) {
   struct epoll_event evs[64];
-  const int got = epoll_wait(r->be_fd, evs, 64, -1);
+  const int got = epoll_wait(r->be_fd, evs, 64, timeout_ms);
   if (got < 0) return 0; /* EINTR: a harmless drain */
 
   struct eng_op *ready[SLIP_WAITING_MAX];
