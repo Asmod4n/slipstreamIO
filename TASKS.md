@@ -99,14 +99,16 @@ caller moves the head on its own, so free CQ room is recomputed, never
 tracked, and completions the CQ had no room for wait in a backlog that
 drains wherever the lock is already held.
 
-### macOS gets select, not kqueue; the BSDs get kqueue later
+### macOS gets dispatch_source, not kqueue and not select
 
 kqueue on macOS is unreliable in practice (operational experience); it
 is the native, maintained thing on the real BSDs and nowhere else. The
-engine's readiness loop is `poll` today, which is fine on Linux and the
-BSDs and broken on macOS for several fd types — the macOS port swaps
-that loop for `select` with `_DARWIN_UNLIMITED_SELECT` and heap
-`fd_set`s.
+earlier answer here was select; it fell to GCD, which is the surface
+Apple actually keeps working: the dispatch backend takes readiness from
+`dispatch_source` and the shared POSIX machinery runs the ops.
+`dispatch_io` itself was refused for a stated reason - it owns the
+reads and writes, a stream of buffers with no recv flags, and cannot
+carry io_uring's op semantics.
 
 ### liburing.h's LP64 assumption stays visible
 
@@ -140,6 +142,14 @@ a packaging refinement, not a prerequisite.
 
 ### 3. Pass liburing's own test suite, for the ops we implement
 
+The first rung of this ladder exists: test/parity.c runs every carried
+op through the same liburing calls against the kernel and against the
+engine and demands field-identical completion streams - the kernel as
+the oracle, divergence printed side by side. It caught the parked
+read-on-fd-minus-one on its first outing. liburing's own suite remains
+the bigger goal - it also carries semantics no scenario of ours has
+thought of yet.
+
 The suite is what makes every next engine SAFE: an allowlist of test
 files for carried ops, an exclusion list with a NAMED reason for every
 file not on it, liburing's own skip discipline honoured (`T_EXIT_SKIP`
@@ -147,31 +157,30 @@ is skipped, never passed). Pinned to the same liburing revision the
 consumer carries — one revision for symbols and suite, or failures stop
 meaning anything.
 
-### 4. Windows: IOCP
+### 4. The backends that now exist, and what is still open on them
 
-The only foreign API that is completion-based, so it maps onto the
-model instead of being interpreted on top of it; parking disappears
-because the OS holds the operations. The header side is done (shim/);
-the engine side is the largest single piece of work and the one with
-the most to gain. MSVC needs `#include_next`-free shims or a MinGW
-toolchain; the engine itself also needs a `<threads.h>` story there.
+epoll, kqueue, dispatch and iocp are BUILT (see README, "The
+backends"), each proven where it could be: epoll natively, kqueue
+natively in the FreeBSD VM and through libkqueue, dispatch against
+swift-corelibs-libdispatch, iocp as a MinGW binary under Wine. The
+engine core is OS-free and the readiness motors share one POSIX
+implementation - the factor-once rule, kept. Open remains:
 
-### 5. macOS: the select loop, and a `<threads.h>` of its own
+- Windows file IO: a CRT descriptor's HANDLE is not
+  FILE_FLAG_OVERLAPPED, so READ/WRITE answer -EOPNOTSUPP there until
+  the engine owns an open path; MSVC also needs #include_next-free
+  shims (MinGW is the compiler of record today).
+- macOS natively: the dispatch backend and thrd_compat.h's pthreads arm
+  have never met a real Mac - thrd_compat carries only the Win32 arm,
+  macOS still takes <threads.h> it does not have. Needs forgecore or a
+  Mac.
+- OpenBSD/NetBSD/DragonFly: the kqueue backend compiles for them by
+  guard; no VM run yet - test/freebsd_vm.sh is the template.
+- An earlier doctrine fell with this work: "macOS gets select" became
+  "macOS gets dispatch_source"; dispatch_io itself cannot carry
+  recv/send flags and was refused for that stated reason.
 
-macOS has never shipped `<threads.h>` — the engine needs a small
-`thrd_`/`mtx_`/`cnd_` shim over pthreads there, in the same place its
-other gaps are filled. Plus the select swap under "Decided" above.
-
-### 6. BSDs: kqueue
-
-Lowest priority: a correct `poll` loop already serves them, so this is
-a performance step, not an enablement one. Factor the readiness loop
-once before writing the third backend, so it does not copy the first
-two. `test/freebsd_vm.sh` is the proving ground: a real FreeBSD in a
-VM, running the repo's own test scripts with its base system - it
-already caught `CMSG_ALIGN` being glibc spelling on first contact.
-
-### 7. The operations are still Linux syscalls
+### 5. The operations are still Linux syscalls
 
 `MSG_DONTWAIT`, `SOCK_CLOEXEC`, `statx`, the `SOCKET_URING_OP_*`
 commands. The shape is portable; the calls are not. Do the per-platform

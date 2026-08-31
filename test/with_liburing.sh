@@ -88,7 +88,7 @@ cc -I"$work/out/include" -I"$here/src" -H -E "$work/consumer.c" 2>&1 >/dev/null 
   echo "  it took the system header"; exit 1; }
 
 cc -O2 -I"$work/out/include" -I"$here/src" -o "$work/consumer" \
-   "$work/consumer.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here/src/slipstream_engine.c"
+   "$work/consumer.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here"/src/slipstream_engine.c "$here"/src/engine_*.c
 "$work/consumer"
 
 # And the case all of this exists for: the syscalls seccomp'd away, the
@@ -127,5 +127,12 @@ int main(void) {
 }
 C
 cc -O2 -I"$work/out/include" -I"$here/src" -I"$here/test" -o "$work/blocked" \
-   "$work/blocked.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here/src/slipstream_engine.c"
+   "$work/blocked.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here"/src/slipstream_engine.c "$here"/src/engine_*.c
 "$work/blocked"
+
+# The behavior, not only the API: the same scenarios against the kernel
+# and against the engine, compared field for field - test/parity.c, the
+# kernel as the oracle.
+cc -O2 -I"$work/out/include" -I"$here/src" -o "$work/parity" \
+   "$here/test/parity.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here"/src/slipstream_engine.c "$here"/src/engine_*.c
+"$work/parity"

@@ -46,6 +46,14 @@ Operations the engine does not carry answer `-EOPNOTSUPP` in their own
 completion — the submit itself never fails for an unknown opcode,
 because that is how the kernel behaves.
 
+The API matching is table stakes; the BEHAVIOR has to match, and the
+kernel is the oracle: `test/parity.c` runs every scenario twice through
+the same liburing calls — kernel answering, then engine forced — and
+the completion streams must agree field for field, in order where
+io_uring promises order. That harness is what caught a read on fd -1
+being parked forever where the kernel says `-EBADF`; every op the
+engine gains must land in it.
+
 ## liburing.h off Linux
 
 `liburing.h` pulls `<linux/types.h>`, `<linux/fs.h>`,
@@ -71,9 +79,31 @@ a Windows binary under Wine. liburing.h itself casts pointers through
 and the Wine run measures it — a pointer above 4G arrives in the SQE
 with only its low 32 bits — rather than patching it over.
 
-The engine source itself is POSIX today (`poll`, `<threads.h>`); the
-native motors for the BSDs and Windows — `kqueue`, IOCP — are the
-roadmap, not the present. The *shape* is what is already portable.
+## The backends
+
+The engine core - order, chains, the CQ, enter - holds not one OS call
+and compiles everywhere, Windows included. How ops RUN is a backend,
+chosen per platform and overridable by name until the first ring runs:
+
+- `epoll` — Linux, the default there, for the case the engine exists
+  for on Linux at all: io_uring refused at runtime
+- `kqueue` — the BSDs; proven natively by `test/freebsd_vm.sh` and on
+  Linux through libkqueue (`test/backends_adapters.sh`)
+- `dispatch` — macOS' default: GCD `dispatch_source` readiness, since
+  kqueue is ruled out there and `dispatch_io` cannot carry recv/send
+  flags; proven against Apple's own swift-corelibs-libdispatch
+- `iocp` — Windows, the one completion-shaped motor: nothing parks,
+  ops fly as overlapped and the port reports them done; proven as a
+  MinGW binary under Wine (`test/backends_wine.sh`), with a thrd/mtx/cnd
+  shim because MinGW ships no `<threads.h>` in either thread model
+- `poll` — the POSIX baseline, always compiled
+
+The four readiness motors share one implementation of everything but
+the wakeup (`src/engine_posix.c`); `test/backends.c` drives every
+carried backend through the same scenes - inline NOP, a pending recv
+that enter must not wait for, `-ETIME` after a real deadline. Still
+named next: overlapped file IO on Windows (a CRT descriptor's handle is
+not `FILE_FLAG_OVERLAPPED`), and a native macOS run, which needs a Mac.
 
 ## Tests
 
@@ -90,7 +120,8 @@ make test
   headers, and under MinGW
 - `test/with_liburing.sh` — end to end: a real liburing built with the
   seam, one ordinary program, the same completion on the kernel side,
-  with the engine forced, and under seccomp
+  with the engine forced, and under seccomp — then `test/parity.c`,
+  the kernel-as-oracle differential run over every carried op
 - `test/freebsd_vm.sh` — the same shim proof on a REAL FreeBSD, booted
   in a VM with stock tools (qemu, xorriso, curl, xz): the official
   BASIC-CLOUDINIT image, a NoCloud seed whose user-data is the test
