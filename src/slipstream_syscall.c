@@ -63,14 +63,13 @@ static int engine_setup(unsigned int entries, struct io_uring_params *p) {
   return slipstream_engine_setup(entries, p);
 }
 
-/* The signal set and its size are the kernel's business, and there is no
- * kernel on this side. */
+/* With IORING_ENTER_EXT_ARG the pointer is a getevents struct carrying a
+ * wait timeout; without it, a signal set - the kernel's business, and
+ * there is no kernel on this side, so the engine only reads the former. */
 static int engine_enter2(unsigned int fd, unsigned int to_submit,
                          unsigned int min_complete, unsigned int flags,
                          void *arg, size_t sz) {
-  (void) arg;
-  (void) sz;
-  return slipstream_engine_enter((int) fd, to_submit, min_complete, flags);
+  return slipstream_engine_enter((int) fd, to_submit, min_complete, flags, arg, sz);
 }
 
 /* Registration is what the engine carries in its own tables, and none of

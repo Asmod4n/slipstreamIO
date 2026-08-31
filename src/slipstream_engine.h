@@ -20,7 +20,7 @@ struct io_uring_params;
 
 int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p);
 int slipstream_engine_enter(int fd, unsigned int to_submit, unsigned int min_complete,
-                            unsigned int flags);
+                            unsigned int flags, const void *arg, size_t argsz);
 int slipstream_engine_close(int fd);
 void *slipstream_engine_mmap(size_t length, int fd, long long offset);
 int slipstream_engine_munmap(void *addr, size_t length);
