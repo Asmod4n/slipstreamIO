@@ -34,9 +34,55 @@ const unsigned char slip_posix_carried_ops[] = {
   IORING_OP_CONNECT, IORING_OP_SOCKET,  IORING_OP_BIND,     IORING_OP_LISTEN,
   IORING_OP_SHUTDOWN, IORING_OP_CLOSE,  IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE,
   IORING_OP_ASYNC_CANCEL, IORING_OP_STATX, IORING_OP_UNLINKAT, IORING_OP_OPENAT,
-  IORING_OP_OPENAT2,
+  IORING_OP_OPENAT2, IORING_OP_URING_CMD,
   255,
 };
+
+/* ---- provided buffers -------------------------------------------------
+ * The ring's entries live in the CALLER's memory: it fills them and
+ * advances the tail with a release store, the engine consumes at its own
+ * head. Both indices are free-running 16-bit counters masked by the ring
+ * size, which is how the kernel reads the same memory. */
+
+static int bufring_take(struct slip_ring *r, unsigned short bgid, void **addr,
+                        unsigned *len, unsigned short *bid) {
+  struct slip_bufring *b = slip_bufring_of(r, bgid);
+  if (b == NULL) return -ENOBUFS;
+  const unsigned short tail = __atomic_load_n(&b->bufs[0].resv, __ATOMIC_ACQUIRE);
+  if (tail == b->head) return -ENOBUFS;
+  const struct io_uring_buf *e = &b->bufs[b->head & (b->entries - 1)];
+  *addr = (void *) (uintptr_t) e->addr;
+  *len = e->len;
+  *bid = e->bid;
+  b->head++;
+  return 0;
+}
+
+/* A buffer taken for a recv that then had nothing to read goes back: the
+ * kernel consumes one only when it hands bytes over with
+ * IORING_CQE_F_BUFFER, and an entry taken without a CQE would be one the
+ * caller never learns to refill. Only the engine thread consumes, so
+ * rewinding the head is the whole of it. */
+static void bufring_unget(struct slip_ring *r, unsigned short bgid) {
+  struct slip_bufring *b = slip_bufring_of(r, bgid);
+  if (b != NULL) b->head--;
+}
+
+/* ---- direct descriptors -----------------------------------------------
+ * An op that INSTANTIATES a descriptor (socket, accept, open) may put it
+ * straight into the fixed table instead of handing back a number:
+ * file_index is the slot plus one, or IORING_FILE_INDEX_ALLOC to let the
+ * table pick inside its alloc range. The completion then carries the
+ * chosen slot for ALLOC and 0 for a named one - the kernel's own two
+ * answers. */
+static int install_direct(struct slip_ring *r, const struct io_uring_sqe *s, int newfd) {
+  const int slot = slip_fixed_install(r, s->file_index, newfd);
+  if (slot < 0) {
+    close(newfd);
+    return slot;
+  }
+  return s->file_index == IORING_FILE_INDEX_ALLOC ? slot : 0;
+}
 
 /* ---- the poke pipe ---------------------------------------------------- */
 
@@ -143,7 +189,84 @@ static int slip_statx_from_stat(int dfd, const char *path, int flags, void *stxb
 }
 #endif
 
-static enum verdict run_one(struct eng_op *op, int *res_out) {
+/* accept4 where it exists, spelled out where it does not. */
+static int accept_one(const struct io_uring_sqe *s) {
+  struct sockaddr *sa = (struct sockaddr *) (uintptr_t) s->addr;
+  socklen_t *sl = (socklen_t *) (uintptr_t) s->off;
+#ifdef __APPLE__
+  const int fd = accept(s->fd, sa, sl);
+  if (fd >= 0 && (s->accept_flags & SOCK_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
+  if (fd >= 0 && (s->accept_flags & SOCK_NONBLOCK))
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+  return fd;
+#else
+  return accept4(s->fd, sa, sl, (int) s->accept_flags);
+#endif
+}
+
+/* MULTISHOT: one submission, a CQE per event, each carrying
+ * IORING_CQE_F_MORE to say the op is still armed. The op itself is never
+ * completed here - it goes back to the parked set and the LAST word is
+ * the one that returns RAN, without F_MORE, exactly as the kernel ends a
+ * multishot. */
+static enum verdict run_accept_multishot(struct slip_ring *r, struct eng_op *op,
+                                         int *res_out) {
+  const struct io_uring_sqe *s = &op->sqe;
+  for (;;) {
+    const int fd = accept_one(s);
+    if (fd < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        op->wait_events = POLLIN;
+        return PARK;
+      }
+      *res_out = -errno;
+      return RAN;
+    }
+    const int answer = s->file_index != 0 ? install_direct(r, s, fd) : fd;
+    if (answer < 0) {
+      *res_out = answer;
+      return RAN;
+    }
+    slip_engine_emit(r, s->user_data, answer, IORING_CQE_F_MORE);
+  }
+}
+
+static enum verdict run_recv_multishot(struct slip_ring *r, struct eng_op *op,
+                                       int *res_out) {
+  const struct io_uring_sqe *s = &op->sqe;
+  for (;;) {
+    void *rbuf = (void *) (uintptr_t) s->addr;
+    unsigned rlen = s->len;
+    unsigned short bid = 0;
+    unsigned cflags = 0;
+    const int select = (s->flags & IOSQE_BUFFER_SELECT) != 0;
+    if (select) {
+      const int rc = bufring_take(r, s->buf_group, &rbuf, &rlen, &bid);
+      if (rc != 0) {
+        /* Out of buffers ENDS a multishot recv - the caller refills and
+         * arms a new one; that is the kernel's contract, not a stall. */
+        *res_out = rc;
+        return RAN;
+      }
+      cflags = IORING_CQE_F_BUFFER | ((unsigned) bid << IORING_CQE_BUFFER_SHIFT);
+    }
+    const ssize_t n = recv(s->fd, rbuf, rlen, (int) s->msg_flags | MSG_DONTWAIT);
+    if (n > 0) {
+      slip_engine_emit(r, s->user_data, (int) n, cflags | IORING_CQE_F_MORE);
+      continue;
+    }
+    /* Nothing came: the buffer was never filled, so it is not consumed. */
+    if (select) bufring_unget(r, s->buf_group);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      op->wait_events = POLLIN;
+      return PARK;
+    }
+    *res_out = n < 0 ? -errno : 0; /* 0 is EOF, and it ends the multishot */
+    return RAN;
+  }
+}
+
+static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   void *buf = (void *) (uintptr_t) s->addr;
   ssize_t n;
@@ -152,22 +275,56 @@ static enum verdict run_one(struct eng_op *op, int *res_out) {
       *res_out = 0;
       return RAN;
     case IORING_OP_CLOSE:
+      /* close_direct names a SLOT in file_index, not a descriptor: the
+       * table hands the real one over and forgets it, and this closes
+       * it. A plain close carries no file_index and closes its fd. */
+      if (s->file_index != 0) {
+        const unsigned slot = s->file_index - 1;
+        const int real = slip_fixed_lookup(r, (int) slot);
+        if (real < 0) {
+          *res_out = real;
+          return RAN;
+        }
+        slip_fixed_clear(r, slot);
+        *res_out = close(real) < 0 ? -errno : 0;
+        return RAN;
+      }
       n = close(s->fd);
       *res_out = n < 0 ? -errno : 0;
       return RAN;
-    case IORING_OP_RECV:
-      if (s->ioprio & IORING_RECV_MULTISHOT) {
+    case IORING_OP_RECV: {
+      /* A bundle answers ONE completion for several buffers at once, and
+       * this engine never reports IORING_FEAT_RECVSEND_BUNDLE - a caller
+       * that asks anyway is told, not quietly served one buffer. */
+      if (s->ioprio & IORING_RECVSEND_BUNDLE) {
         *res_out = -EOPNOTSUPP;
         return RAN;
       }
-      n = recv(s->fd, buf, s->len, (int) s->msg_flags | MSG_DONTWAIT);
+      if (s->ioprio & IORING_RECV_MULTISHOT) return run_recv_multishot(r, op, res_out);
+      void *rbuf = buf;
+      unsigned rlen = s->len;
+      unsigned short bid = 0;
+      unsigned cflags = 0;
+      const int select = (s->flags & IOSQE_BUFFER_SELECT) != 0;
+      if (select) {
+        const int rc = bufring_take(r, s->buf_group, &rbuf, &rlen, &bid);
+        if (rc != 0) {
+          *res_out = rc;
+          return RAN;
+        }
+        cflags = IORING_CQE_F_BUFFER | ((unsigned) bid << IORING_CQE_BUFFER_SHIFT);
+      }
+      n = recv(s->fd, rbuf, rlen, (int) s->msg_flags | MSG_DONTWAIT);
+      if (n <= 0 && select) bufring_unget(r, s->buf_group); /* never filled, never consumed */
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
           !(s->msg_flags & MSG_DONTWAIT)) {
         op->wait_events = POLLIN;
         return PARK;
       }
+      if (n > 0) op->cqe_flags = cflags;
       *res_out = n < 0 ? -errno : (int) n;
       return RAN;
+    }
     case IORING_OP_SEND:
       n = send(s->fd, buf, s->len, (int) s->msg_flags | MSG_DONTWAIT);
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
@@ -210,7 +367,11 @@ static enum verdict run_one(struct eng_op *op, int *res_out) {
         return RAN;
       }
       n = socket(s->fd, (int) s->off, (int) s->len);
-      *res_out = n < 0 ? -errno : (int) n;
+      if (n < 0) {
+        *res_out = -errno;
+        return RAN;
+      }
+      *res_out = s->file_index != 0 ? install_direct(r, s, (int) n) : (int) n;
       return RAN;
     case IORING_OP_BIND:
       n = bind(s->fd, (const struct sockaddr *) buf, (socklen_t) s->off);
@@ -225,25 +386,17 @@ static enum verdict run_one(struct eng_op *op, int *res_out) {
       *res_out = n < 0 ? -errno : 0;
       return RAN;
     case IORING_OP_ACCEPT: {
-      if (s->ioprio & IORING_ACCEPT_MULTISHOT) {
-        *res_out = -EOPNOTSUPP; /* multishot is the next stretch, said plainly */
-        return RAN;
-      }
+      if (s->ioprio & IORING_ACCEPT_MULTISHOT) return run_accept_multishot(r, op, res_out);
       if (!ready_now(s->fd, POLLIN)) {
         op->wait_events = POLLIN;
         return PARK;
       }
-      struct sockaddr *sa = (struct sockaddr *) buf;
-      socklen_t *sl = (socklen_t *) (uintptr_t) s->off;
-#ifdef __APPLE__
-      n = accept(s->fd, sa, sl);
-      if (n >= 0 && (s->accept_flags & SOCK_CLOEXEC)) fcntl((int) n, F_SETFD, FD_CLOEXEC);
-      if (n >= 0 && (s->accept_flags & SOCK_NONBLOCK))
-        fcntl((int) n, F_SETFL, fcntl((int) n, F_GETFL) | O_NONBLOCK);
-#else
-      n = accept4(s->fd, sa, sl, (int) s->accept_flags);
-#endif
-      *res_out = n < 0 ? -errno : (int) n;
+      n = accept_one(s);
+      if (n < 0) {
+        *res_out = -errno;
+        return RAN;
+      }
+      *res_out = s->file_index != 0 ? install_direct(r, s, (int) n) : (int) n;
       return RAN;
     }
     case IORING_OP_RECVMSG:
@@ -305,6 +458,48 @@ static enum verdict run_one(struct eng_op *op, int *res_out) {
       n = unlinkat(s->fd, (const char *) buf, (int) s->unlink_flags);
       *res_out = n < 0 ? -errno : 0;
       return RAN;
+    case IORING_OP_URING_CMD:
+      /* SOCKET_URING_OP_*: the socket calls, as ring ops. The SQE unions
+       * carry them the way cmd_net.c reads them - level/optname share the
+       * word that GETSOCKNAME uses as its sockaddr pointer, so each cmd
+       * reads the member that is actually its own. */
+      switch (s->cmd_op) {
+        case SOCKET_URING_OP_SETSOCKOPT:
+          n = setsockopt(s->fd, (int) s->level, (int) s->optname,
+                         (const void *) (uintptr_t) s->optval, (socklen_t) s->optlen);
+          *res_out = n < 0 ? -errno : 0;
+          return RAN;
+        case SOCKET_URING_OP_GETSOCKOPT: {
+          socklen_t len = (socklen_t) s->optlen;
+          n = getsockopt(s->fd, (int) s->level, (int) s->optname,
+                         (void *) (uintptr_t) s->optval, &len);
+          /* The kernel answers the LENGTH it wrote, not zero. */
+          *res_out = n < 0 ? -errno : (int) len;
+          return RAN;
+        }
+        case SOCKET_URING_OP_GETSOCKNAME: {
+          /* addr is the sockaddr, optval an int* holding its size, and
+           * optlen picks the side: 0 this socket's name, 1 the peer's. */
+          struct sockaddr *sa = (struct sockaddr *) (uintptr_t) s->addr;
+          int *slen = (int *) (uintptr_t) s->optval;
+          if (sa == NULL || slen == NULL) {
+            *res_out = -EFAULT;
+            return RAN;
+          }
+          socklen_t len = (socklen_t) *slen;
+          n = s->optlen != 0 ? getpeername(s->fd, sa, &len) : getsockname(s->fd, sa, &len);
+          if (n < 0) {
+            *res_out = -errno;
+            return RAN;
+          }
+          *slen = (int) len;
+          *res_out = 0;
+          return RAN;
+        }
+        default:
+          *res_out = -EOPNOTSUPP;
+          return RAN;
+      }
     case IORING_OP_CONNECT:
     case IORING_OP_OPENAT:
     case IORING_OP_OPENAT2:
@@ -533,7 +728,7 @@ int slip_posix_execute(struct slip_ring *r, struct eng_op *op, int *res) {
     *res = cancel_matching(r, op);
     return EXEC_DONE;
   }
-  switch (run_one(op, res)) {
+  switch (run_one(r, op, res)) {
     case RAN:
       return EXEC_DONE;
     case PARK:
@@ -555,7 +750,7 @@ int slip_posix_finish_ready(struct slip_ring *r, struct eng_op **ready, unsigned
     struct eng_op *op = ready[i];
     unpark(r, op);
     int res = 0;
-    enum verdict v = run_one(op, &res);
+    enum verdict v = run_one(r, op, &res);
     if (v == FILE_OP) { /* a parked op never becomes a file op */
       v = RAN;
       res = -EOPNOTSUPP;
