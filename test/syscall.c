@@ -39,10 +39,17 @@ int main(void) {
   slipstream_syscall_set_engine(1);
   ok(slipstream_syscall_uses_engine() == 1, "the engine can be asked for");
   memset(&p, 0, sizeof(p));
-  ok(slipstream_io_uring_setup(1, &p) == -ENOSYS,
-     "and it says -ENOSYS rather than pretending, for now");
-  ok(slipstream_io_uring_enter2(0, 0, 0, 0, NULL, 0) == -ENOSYS, "enter2 likewise");
-  ok(slipstream_io_uring_register(0, 0, NULL, 0) == -ENOSYS, "register likewise");
+  const int ering = slipstream_io_uring_setup(4, &p);
+  ok(ering >= 0, "the engine hands out a ring of its own");
+  ok(p.sq_entries == 4 && p.cq_entries == 8, "with the entry counts it chose");
+  ok(p.sq_off.array != 0 && p.cq_off.cqes != 0,
+     "and the offsets liburing will index the blocks by");
+  ok(slipstream_io_uring_enter2((unsigned) ering, 0, 0, 0, NULL, 0) == 0,
+     "entering an empty ring submits nothing");
+  /* Registration is the engine's own tables, and none of that is built. */
+  ok(slipstream_io_uring_register((unsigned) ering, 0, NULL, 0) == -EOPNOTSUPP,
+     "register says what it cannot do rather than reporting success");
+  ok(slipstream_close(ering) == 0, "and the ring goes when it is closed");
 
   slipstream_syscall_set_engine(0);
   memset(&p, 0, sizeof(p));

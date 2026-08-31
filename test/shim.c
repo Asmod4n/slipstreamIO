@@ -47,12 +47,16 @@ int main(void) {
   void *m = __sys_mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   const int un = IS_ERR(m) ? -1 : __sys_munmap(m, 4096);
+  __sys_close(fd);
   const int cl = __sys_close(-1);
 
-  const int all_engine = fd == -ENOSYS && e1 == -ENOSYS && e2 == -ENOSYS && rg == -ENOSYS;
+  /* Reaching us is what is being shown, so the marks are OUR answers:
+   * the engine hands out a ring, entering an empty one submits nothing,
+   * and registration says what it does not carry. */
+  const int all_engine = fd >= 0 && e1 == 0 && e2 == 0 && rg == -EOPNOTSUPP;
   printf("%-54s %s\n", "every __sys_io_uring_* reaches slipstream",
          all_engine ? "ok" : "FAIL");
-  printf("%-54s %s\n", "the eight libc wrappers still behave",
+  printf("%-54s %s\n", "the map and close wrappers still behave",
          (un == 0 && cl == -EBADF) ? "ok" : "FAIL");
   printf("shim: %s\n", (all_engine && un == 0 && cl == -EBADF) ? "ok" : "FAILURES");
   return (all_engine && un == 0 && cl == -EBADF) ? 0 : 1;

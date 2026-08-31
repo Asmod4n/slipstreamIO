@@ -43,15 +43,15 @@ with_liburing:
 	./test/with_liburing.sh
 
 # The three calls liburing makes, and the switch behind them.
-test/syscall: test/syscall.c src/slipstream_syscall.c src/slipstream_syscall.h src/uring_available.h
-	$(CC) $(CFLAGS) -o $@ test/syscall.c src/slipstream_syscall.c
+test/syscall: test/syscall.c src/slipstream_syscall.c src/slipstream_engine.c src/slipstream_syscall.h src/uring_available.h
+	$(CC) $(CFLAGS) -o $@ test/syscall.c src/slipstream_syscall.c src/slipstream_engine.c
 
 # The shim, compiled where liburing puts it. -iquote and NOT -Isrc: this
 # one has to see the REAL <liburing.h>, and -Isrc would hand it ours.
 # -std=gnu11 for the same reason liburing builds that way - its own
 # sources need the POSIX names.
-test/shim: test/shim.c src/liburing_arch_syscall.h src/slipstream_syscall.c
-	$(CC) -std=gnu11 -Wall -Wextra -O2 -iquote src -o $@ test/shim.c src/slipstream_syscall.c
+test/shim: test/shim.c src/liburing_arch_syscall.h src/slipstream_syscall.c src/slipstream_engine.c
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -iquote src -o $@ test/shim.c src/slipstream_syscall.c src/slipstream_engine.c
 
 # The C half of "one header, both languages". Built with $(CC), not
 # $(CXX), and that is the entire point of it.

@@ -49,6 +49,14 @@ SLIPSTREAM_API int slipstream_io_uring_enter2(unsigned int fd, unsigned int to_s
 SLIPSTREAM_API int slipstream_io_uring_register(unsigned int fd, unsigned int opcode,
                                                 const void *arg, unsigned int nr_args);
 
+/* Three more, because when the rings are not the kernel's, liburing's
+ * map and close have to reach the memory setup handed out. In kernel
+ * mode they are libc, unchanged. */
+SLIPSTREAM_API void *slipstream_mmap(void *addr, size_t length, int prot, int flags,
+                                     int fd, long long offset);
+SLIPSTREAM_API int slipstream_munmap(void *addr, size_t length);
+SLIPSTREAM_API int slipstream_close(int fd);
+
 /* Which side answers. Decided once, on first use, by asking the kernel
  * (src/uring_available.h) - never before main, where a refusal would
  * have nobody to tell.
