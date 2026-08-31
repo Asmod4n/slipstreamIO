@@ -2,142 +2,91 @@
 
 **Carries io_uring's model to every platform that does not have it.**
 
-The model is both halves. One is the API — submission queue entries in,
-completion queue entries out. The other is the engine that runs them:
-in real io_uring that is the kernel, and here it is one per platform.
-An implementation that shipped only the first half would be a shape
-without a motor: no completions arriving while you compute, no pollable
-ring descriptor, no file IO. So both are implemented.
-
-A consumer writes
+There is exactly one `liburing.h`: liburing's own. A consumer writes
 
 ```c
 #include <liburing.h>
 ```
 
-and gets the whole model: asynchronous completions that arrive while the
-caller is computing, a pollable `ring_fd`, provided-buffer rings, direct
-descriptors, linked operations, and file IO — sockets and files through
-one API.
+against the real header, from a liburing tree carried at a place we
+define — and slipstream supplies what that header and liburing's sources
+need underneath. Compatibility is to liburing, never to the kernel ABI:
+skipping liburing and talking to the kernel directly is exactly what
+io_uring's authors say not to do, and this project does not offer it.
 
-## What is here today
+## The seam
 
-`src/liburing.h` — that API, in C11, with `select(2)` as the portable
-baseline engine. It is a header and nothing else: no library to link, no
-build step, no configuration. It is named for the API it implements,
-because that is the only name anyone ever writes — and it deliberately
-does not sit on an include path by itself. `mrbgem.rake` copies it into
-`include/` exactly when the host has no other `liburing.h`, and leaves
-it alone otherwise.
+liburing's own `.c` files reach the kernel through twelve `__sys_*`
+wrappers chosen by its `src/syscall.h`. `test/with_liburing.sh` shows
+the whole move: that one file is replaced when we build liburing, so
+every one of those calls lands in `src/slipstream_syscall.c` first. No
+consumer ever sees this — `liburing.h` does not include `syscall.h`.
 
-C, not C++, for the same reason it carries that name: real `liburing.h`
-is C and is consumable from both, so this one is too. `test/cconsume.c`
-compiles it as `-std=c11`; the other tests compile it as C++20.
+At first use, slipstream asks the kernel whether io_uring is allowed for
+this process — by attempting `io_uring_setup(2)`, not by reading version
+numbers, because seccomp and `io_uring_disabled` say no on kernels whose
+version says yes. If the kernel answers, every call goes to the kernel.
+If it refuses — or there is no Linux underneath at all — the engine in
+`src/slipstream_engine.c` answers instead, and the program does not have
+to know. `test/blocked.c` proves that under a real seccomp filter.
 
-### The engine, and the work threads
+## The engine
 
-The kernel half, implemented the way the kernel implements it:
+One rule, the same one the kernel keeps: **enter never hangs on a single
+operation.** Immediate work completes inline — the kernel completes
+inline too; io_uring is asynchronous in contract, not by ceremony. An
+operation that would block is parked with the events it waits for, an
+engine thread polls the parked set and posts the completion when the
+descriptor comes ready. Regular files have no readiness, so file work
+goes to a worker thread. `IOSQE_IO_LINK` failure cancels the rest of the
+chain with `-ECANCELED`, and rings advertise `IORING_FEAT_EXT_ARG` so
+timed waits ride beside `enter` instead of needing a timeout opcode.
 
-- **the engine** — one thread per `struct io_uring`, born in
-  `io_uring_queue_init*`, joined in `io_uring_queue_exit`. It owns the
-  `select` loop and every readiness operation, posts every completion,
-  and is the only thread that makes `ring_fd` readable. It never blocks
-  on work.
-- **the work threads** — io_uring's io-wq by another name. A file has no
-  readiness (`select` calls every regular file ready, always), so
-  `openat`, `read`, `statx` and closing a file descriptor are simply
-  blocking work, and blocking work goes to a small pool that is spawned
-  on demand. A ring that never touches a file never starts one.
+Operations the engine does not carry answer `-EOPNOTSUPP` in their own
+completion — the submit itself never fails for an unknown opcode,
+because that is how the kernel behaves.
 
-Neither has any API surface: no `run` method, no callback, no handle,
-nothing to configure. **The driver loop stays entirely the embedder's** —
-this header never calls user code. Completions are collected with
-`io_uring_submit_and_wait_timeout`, `io_uring_wait_cqe`,
-`io_uring_for_each_cqe` and `io_uring_cq_advance`, or by polling
-`ring_fd` inside whatever loop the embedder already has.
+## liburing.h off Linux
 
-`ring_fd` is readable if and only if there are completions the caller
-has not consumed. That invariant is the point of the whole design, and
-`src/liburing.h` documents the two critical sections that hold it up.
+`liburing.h` pulls `<linux/types.h>`, `<linux/fs.h>`,
+`<linux/time_types.h>`, `<linux/swab.h>` and two files liburing's
+`configure` generates. `shim/` carries stand-ins:
 
-## What it does not do
+- `shim/common/` — the four `linux/` headers and, as quoted-include
+  fallbacks, `liburing/compat.h` and `liburing/io_uring_version.h` for
+  trees no configure ever ran in
+- `shim/posix/` — macOS and the BSDs: `cpu_set_t` after the platform's
+  own `sched.h`
+- `shim/windows/` — the POSIX headers Windows lacks: `sys/socket.h`
+  (msghdr/cmsghdr; sockaddr stays Winsock's), `sys/uio.h`, `sys/wait.h`,
+  plus `AT_FDCWD` and the `sigset_t` name MinGW hides
 
-It never looks for the implementation it stands in for. It does not
-probe, does not include it, does not decide anything. Choosing between
-them is the packaging layer's job — the way `libkqueue` is chosen on
-Linux: whoever assembles the build decides what `<liburing.h>` resolves
-to, by installing this header under that name or by not installing it.
-So consuming code contains no `__has_include`, no define to keep in
-sync, no template parameter and no runtime branch. A binary built
-against it also stays statically linkable — there is nothing to
-`dlopen`, which matters because a static `dlopen` fails on glibc and
-musl alike.
+`test/liburing_h_shims.sh` proves both stacks: on Linux the six shimmed
+includes must each resolve inside `shim/` — asked with `-H`, not assumed
+— and a MinGW cross compile takes the Windows set. liburing.h itself
+casts pointers through `unsigned long`, 32 bits on Win64; that is
+upstream's LP64 assumption and it is left visible, not patched over.
 
-The header states a PROPERTY for callers to branch on, never its own
-name: `IO_URING_FD_CEILING` — every descriptor handed to these functions
-must stay strictly below it, which here is `FD_SETSIZE`, because a
-connection is a process fd and `select` addresses nothing higher.
-Absence is the other half of the contract: an implementation without a
-ceiling of its own — real liburing, for one — defines nothing, and a
-caller that finds nothing has been told its rlimits are the only bound.
-So the question to ask is `#ifdef IO_URING_FD_CEILING`.
-
-`SLIPSTREAM_IO` is also defined, for saying *which* implementation
-answered — a startup banner that reports "correct, not fast" is the
-whole use case. Nothing may be derived from it: a name is not a
-property, and any limit hung on this one's name would be inherited by
-every implementation that comes later.
-
-## Correct, not fast
-
-That is the design goal, stated rather than discovered later.
-
-- every socket operation is readiness plus a classic syscall
-- submission is pure handoff: `io_uring_submit` gives the prepped SQEs
-  to the engine, in order, and returns
-- receive bundles do not exist — one buffer per completion, so the
-  dense-fill contract holds trivially
-- the pool is four threads and has no knob. It exists to keep the engine
-  free, not to parallelise a disk
-
-### Why select is the baseline
-
-`select` is the one readiness primitive that exists everywhere *and* has
-been debugged everywhere. macOS' `poll` is permanently broken on several
-fd types; `WSAPoll` does not report failed connections (acknowledged by
-Microsoft, never fixed). That is why the baseline is `select` and not
-`poll`.
-
-Baseline is not the whole plan. `kqueue` on the BSDs and IOCP on Windows
-are the native engines this project intends to grow — same API, same
-completions, a different motor underneath, which is exactly what having
-a model instead of a wrapper is for. `TASKS.md` holds that roadmap and
-the reasons.
-
-The operations themselves are still Linux syscalls today. The *shape* is
-what is portable, and nothing here pretends the port has been done.
+The engine source itself is POSIX today (`poll`, `<threads.h>`); the
+native motors for the BSDs and Windows — `kqueue`, IOCP — are the
+roadmap, not the present. The *shape* is what is already portable.
 
 ## Tests
 
 ```
-make test        # C++ consumers and the C one
-make tsan        # the same under ThreadSanitizer
-make asan        # ... and under AddressSanitizer + UBSan
+make test
 ```
 
-- `test/queue.cpp` — completions, deadlines, partial batch advance, the
-  pollable `ring_fd`, the drained pipe, overflow past the ring's size,
-  and teardown with operations still parked
-- `test/wire.cpp` — a real connection: socket/bind/listen as one linked
-  chain, multishot accept onto a direct descriptor, multishot receive
-  off a provided-buffer ring, and a send the peer reads back
-- `test/sockname.cpp` — the three socket commands: the bound name of a
-  port-0 listener, the peer's name at accept, and `SO_MEMINFO` — all
-  three through `IORING_OP_URING_CMD`
-- `test/file.cpp` — `openat`/`statx`/`read` through the ring, a socket
-  completion overtaking a blocked file read, and a linked chain whose
-  first member is blocking
-- `test/cconsume.c` — the header, compiled as C11
+- `test/available.c` — the probe: asked twice, answered the same
+- `test/syscall.c` — the three exported calls and the switch behind them
+- `test/shim.c` — the wrappers, compiled exactly where liburing puts them
+- `test/blocked.c` — a seccomp filter refuses the syscalls; the decision
+  falls on its own and the ring still answers
+- `test/liburing_h_shims.sh` — liburing's header compiled with no Linux
+  headers, and under MinGW
+- `test/with_liburing.sh` — end to end: a real liburing built with the
+  seam, one ordinary program, the same completion on the kernel side,
+  with the engine forced, and under seccomp
 
 ## Licence
 

@@ -3,9 +3,9 @@
 # point at, installs its headers where WE say, and then runs an ordinary
 # liburing program against exactly those - never the system's.
 #
-# Two runs, and the second is the proof: with the engine asked for,
-# liburing's OWN io_uring_queue_init has to come back with our -ENOSYS.
-# It can only reach that through __sys_io_uring_setup.
+# Two runs, and the second is the proof: with the engine asked for, the
+# same ordinary program completes the same NOP - and it can only reach
+# the engine through __sys_io_uring_setup.
 #
 #   LIBURING_SRC=/path/to/liburing test/with_liburing.sh
 set -e

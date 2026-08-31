@@ -1,46 +1,27 @@
-# No build system: the implementation is one header. This only runs the
-# tests, which are the proof that the header does what its name says.
+# This only runs the tests. What ships is the seam - the two files
+# test/with_liburing.sh copies into a liburing tree - the engine behind
+# it, and the shim/ headers that let liburing.h compile off Linux.
 #
 # LINKING, measured on the build host and not guessed: the engine uses
 # C11 <threads.h>, and glibc has carried thrd_* in libc itself since
 # 2.34 - so nothing extra is linked here. A host whose thrd_* still live
 # in libpthread needs -pthread; that is a property of the host, so it is
 # the packaging layer's call (mrbgem.rake), not a flag hardcoded here.
-CXXFLAGS ?= -std=c++20 -Wall -Wextra -O2 -Isrc
-# -std=c11 with NO feature macro on purpose: the header has to stand up
-# for a C consumer on its own terms.
+#
+# -std=c11 with NO feature macro on purpose: the exported headers have to
+# stand up for a C consumer on their own terms.
 CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc
 
-BINS = test/queue test/wire test/sockname test/file test/cconsume test/watch test/available test/syscall test/shim test/blocked
+BINS = test/available test/syscall test/shim test/blocked
 
 test: $(BINS)
-	./test/queue && ./test/wire && ./test/sockname && ./test/file && ./test/cconsume && ./test/watch && ./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/with_liburing.sh
-
-test/queue: test/queue.cpp src/liburing.h
-	$(CXX) $(CXXFLAGS) -o $@ $<
-
-test/wire: test/wire.cpp src/liburing.h
-	$(CXX) $(CXXFLAGS) -o $@ $<
-
-test/sockname: test/sockname.cpp src/liburing.h
-	$(CXX) $(CXXFLAGS) -o $@ $<
-
-test/file: test/file.cpp src/liburing.h
-	$(CXX) $(CXXFLAGS) -o $@ $<
+	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
 
 # The question that runs before liburing exists, so it is built like any
 # other C consumer of a header here - and deliberately does not link or
 # include liburing, because it is what decides whether liburing is loaded.
 test/available: test/available.c src/uring_available.h
 	$(CC) $(CFLAGS) -o $@ $<
-
-# The whole thing, end to end: a real liburing built WITH the shim, its
-# headers installed where we say, and an ordinary liburing program run
-# against exactly those. Needs a liburing source tree - LIBURING_SRC, or
-# deps/liburing - and says so and skips when there is none.
-.PHONY: with_liburing
-with_liburing:
-	./test/with_liburing.sh
 
 # The three calls liburing makes, and the switch behind them.
 test/syscall: test/syscall.c src/slipstream_syscall.c src/slipstream_engine.c src/slipstream_syscall.h src/uring_available.h
@@ -58,39 +39,21 @@ test/blocked: test/blocked.c test/seccomp_block.h src/slipstream_syscall.c src/s
 test/shim: test/shim.c src/liburing_arch_syscall.h src/slipstream_syscall.c src/slipstream_engine.c
 	$(CC) -std=gnu11 -Wall -Wextra -O2 -iquote src -o $@ test/shim.c src/slipstream_syscall.c src/slipstream_engine.c
 
-# The C half of "one header, both languages". Built with $(CC), not
-# $(CXX), and that is the entire point of it.
-test/cconsume: test/cconsume.c src/liburing.h
-	$(CC) $(CFLAGS) -o $@ $<
+# The whole thing, end to end: a real liburing built WITH the shim, its
+# headers installed where we say, and an ordinary liburing program run
+# against exactly those. Needs a liburing source tree - LIBURING_SRC, or
+# deps/liburing - and says so and skips when there is none.
+.PHONY: with_liburing
+with_liburing:
+	./test/with_liburing.sh
 
-# ---- the sanitizers ---------------------------------------------------
-#
-# TSan is the verdict that matters here: the engine and the caller share
-# a completion ring, and "it passed" means nothing without one. It needs
-# ONE workaround, and it is a harness file, not a change to src/ - see
-# test/thrd_tsan_shim.c for why glibc's C11 threads are invisible to it.
-SAN_TSAN = -O1 -g -fsanitize=thread
-SAN_ASAN = -O1 -g -fsanitize=address,undefined
-
-tsan: test/thrd_tsan_shim.c src/liburing.h test/queue.cpp test/wire.cpp test/sockname.cpp test/file.cpp test/cconsume.c
-	$(CC) $(CFLAGS) $(SAN_TSAN) -c -o test/thrd_tsan_shim.o test/thrd_tsan_shim.c
-	for t in queue wire sockname file; do \
-	  $(CXX) $(CXXFLAGS) $(SAN_TSAN) -o test/$$t-tsan test/$$t.cpp test/thrd_tsan_shim.o || exit 1; \
-	done
-	$(CC) $(CFLAGS) $(SAN_TSAN) -o test/cconsume-tsan test/cconsume.c test/thrd_tsan_shim.o
-	./test/queue-tsan && ./test/wire-tsan && ./test/sockname-tsan && ./test/file-tsan && ./test/cconsume-tsan
-
-asan: src/liburing.h test/queue.cpp test/wire.cpp test/sockname.cpp test/file.cpp test/cconsume.c
-	for t in queue wire sockname file; do \
-	  $(CXX) $(CXXFLAGS) $(SAN_ASAN) -o test/$$t-asan test/$$t.cpp || exit 1; \
-	done
-	$(CC) $(CFLAGS) $(SAN_ASAN) -o test/cconsume-asan test/cconsume.c
-	./test/queue-asan && ./test/wire-asan && ./test/sockname-asan && ./test/file-asan && ./test/cconsume-asan
+# liburing's liburing.h compiled against shim/ instead of a Linux:
+# the posix stand-ins on this host, MinGW when one is installed.
+.PHONY: liburing_h_shims
+liburing_h_shims:
+	./test/liburing_h_shims.sh
 
 clean:
-	rm -f $(BINS) test/*-tsan test/*-asan test/thrd_tsan_shim.o
+	rm -f $(BINS)
 
-.PHONY: test tsan asan clean
-
-test/watch: test/watch.cpp src/liburing.h
-	$(CXX) $(CXXFLAGS) -o $@ $<
+.PHONY: test clean
