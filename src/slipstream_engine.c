@@ -152,28 +152,103 @@ static void drain_backlog_locked(struct slip_ring *r) {
     struct eng_op *op = r->backlog_head;
     r->backlog_head = op->next;
     if (r->backlog_head == NULL) r->backlog_tail = NULL;
-    post_locked(r, op->sqe.user_data, (int) op->sqe.__pad2[0], 0);
+    post_locked(r, op->sqe.user_data, (int) op->sqe.__pad2[0], op->cqe_flags);
     free(op);
   }
+}
+
+static void backlog_locked(struct slip_ring *r, struct eng_op *op, int res) {
+  /* Parked as a finished result; __pad2[0] is OUR copy of the SQE, not
+   * ring memory the caller sees, so the result may ride there. */
+  op->sqe.__pad2[0] = (__u64) (unsigned) res;
+  op->next = NULL;
+  if (r->backlog_tail) r->backlog_tail->next = op;
+  else r->backlog_head = op;
+  r->backlog_tail = op;
+  cq_of(r)->overflow++;
 }
 
 void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res) {
   mtx_lock(&r->mtx);
   drain_backlog_locked(r);
   if (cq_room(r)) {
-    post_locked(r, op->sqe.user_data, res, 0);
+    post_locked(r, op->sqe.user_data, res, op->cqe_flags);
     free(op);
   } else {
-    /* Parked as a finished result; __pad2[0] is OUR copy of the SQE, not
-     * ring memory the caller sees, so the result may ride there. */
-    op->sqe.__pad2[0] = (__u64) (unsigned) res;
-    op->next = NULL;
-    if (r->backlog_tail) r->backlog_tail->next = op;
-    else r->backlog_head = op;
-    r->backlog_tail = op;
-    cq_of(r)->overflow++;
+    backlog_locked(r, op, res);
   }
   mtx_unlock(&r->mtx);
+}
+
+/* A multishot emission: the CQE without the op. When the CQ is full the
+ * emission rides the backlog on a carrier op of its own; when even that
+ * cannot be had, the overflow counter is the honest remainder. */
+void slip_engine_emit(struct slip_ring *r, __u64 user_data, int res, unsigned flags) {
+  mtx_lock(&r->mtx);
+  drain_backlog_locked(r);
+  if (cq_room(r)) {
+    post_locked(r, user_data, res, flags);
+  } else {
+    struct eng_op *carrier = calloc(1, sizeof(*carrier));
+    if (carrier != NULL) {
+      carrier->sqe.user_data = user_data;
+      carrier->cqe_flags = flags;
+      backlog_locked(r, carrier, res);
+    } else {
+      cq_of(r)->overflow++;
+    }
+  }
+  mtx_unlock(&r->mtx);
+}
+
+/* ---- the fixed file table ---------------------------------------------
+ * Slots holding real descriptors, the alloc range naming which slots a
+ * direct accept may pick. Created by register before traffic, mutated
+ * only on the engine thread after that. */
+
+int slip_fixed_lookup(struct slip_ring *r, int slot) {
+  if (slot < 0 || (unsigned) slot >= r->fixed_n || r->fixed[slot] < 0) return -EBADF;
+  return r->fixed[slot];
+}
+
+int slip_fixed_install(struct slip_ring *r, __u32 file_index, int realfd) {
+  if (r->fixed == NULL) return -ENXIO;
+  if (file_index == IORING_FILE_INDEX_ALLOC) {
+    const unsigned end = r->alloc_off + r->alloc_len;
+    unsigned probe = r->alloc_hint;
+    if (probe < r->alloc_off || probe >= end) probe = r->alloc_off;
+    for (unsigned tried = 0; tried < r->alloc_len; tried++) {
+      if (r->fixed[probe] < 0) {
+        r->fixed[probe] = realfd;
+        r->alloc_hint = probe + 1;
+        return (int) probe;
+      }
+      if (++probe >= end) probe = r->alloc_off;
+    }
+    return -ENFILE; /* the alloc range is full - the kernel's word */
+  }
+  const unsigned slot = file_index - 1;
+  if (slot >= r->fixed_n) return -EBADF;
+  /* The kernel REPLACES an occupied slot and closes what it held; no
+   * consumer of this engine does, and this file holds no OS call to
+   * close with - refused until someone needs it. */
+  if (r->fixed[slot] >= 0) return -EBUSY;
+  r->fixed[slot] = realfd;
+  return (int) slot;
+}
+
+int slip_fixed_clear(struct slip_ring *r, unsigned slot) {
+  if (r->fixed == NULL || slot >= r->fixed_n || r->fixed[slot] < 0) return -EBADF;
+  r->fixed[slot] = -1;
+  if (slot >= r->alloc_off && slot < r->alloc_hint) r->alloc_hint = slot;
+  return 0;
+}
+
+struct slip_bufring *slip_bufring_of(struct slip_ring *r, unsigned short bgid) {
+  for (int i = 0; i < SLIP_BUFRINGS_MAX; i++) {
+    if (r->bufrings[i].in_use && r->bufrings[i].bgid == bgid) return &r->bufrings[i];
+  }
+  return NULL;
 }
 
 /* ---- the engine thread ------------------------------------------------ */
@@ -205,6 +280,25 @@ static void process_queue(struct slip_ring *r) {
       slip_engine_post(r, op, -ECANCELED);
       if (!linked) r->chain_failed = 0;
       continue;
+    }
+
+    /* IOSQE_FIXED_FILE resolves HERE, once, before any backend sees the
+     * op: the slot becomes the real descriptor and the flag comes off,
+     * so parking, retries, cancel-by-fd and the worker all speak real
+     * descriptors. SOCKET is the one op whose fd field is not a
+     * descriptor (it carries the domain) and NOP has none - neither is
+     * translated. The install ops keep their table side in file_index,
+     * which survives untouched. */
+    if ((op->sqe.flags & IOSQE_FIXED_FILE) && op->sqe.opcode != IORING_OP_SOCKET &&
+        op->sqe.opcode != IORING_OP_NOP) {
+      const int realfd = slip_fixed_lookup(r, op->sqe.fd);
+      if (realfd < 0) {
+        if (linked) r->chain_failed = 1;
+        slip_engine_post(r, op, -EBADF);
+        continue;
+      }
+      op->sqe.fd = realfd;
+      op->sqe.flags &= (__u8) ~IOSQE_FIXED_FILE;
     }
 
     int res = 0;
@@ -359,26 +453,125 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
  * all the PROBE, because it is how liburing itself asks what a ring can
  * do: io_uring_get_probe drives one, and mruby-io-uring gates
  * URING_AVAILABLE on its answer. The engine reports its backend's
- * carried list and nothing more - the probe tells the truth. Everything
+ * carried list and nothing more - the probe tells the truth.
+ *
+ * The rest is what webmachine's ring setup performs, in its order:
+ * the sparse fixed file table, the alloc range direct accepts pick
+ * from, the ring's own registration for enter, and the provided-buffer
+ * ring the recvs select from. Each registers STATE; the ops that use it
+ * live in the backends. Registration happens before traffic and
+ * unregistration after it (SINGLE_ISSUER's shape); the engine thread
+ * synchronizes with all of it through the inbox handoff. Everything
  * else answers -EINVAL, the kernel's word for a register opcode it does
  * not know. */
 int slipstream_engine_register(int fd, unsigned int opcode, void *arg,
                                unsigned int nr_args) {
   struct slip_ring *r = ring_of(fd);
   if (r == NULL) return -EBADF;
-  if (opcode != IORING_REGISTER_PROBE) return -EINVAL;
-  if (arg == NULL) return -EFAULT;
-  struct io_uring_probe *p = arg;
-  memset(p, 0, sizeof(*p) + (size_t) nr_args * sizeof(struct io_uring_probe_op));
-  unsigned last = 0;
-  for (const unsigned char *c = r->be->carried_ops; *c != 255; c++) {
-    if (*c > last) last = *c;
-    if (*c < nr_args) p->ops[*c].flags = IO_URING_OP_SUPPORTED;
+  switch (opcode) {
+    case IORING_REGISTER_PROBE: {
+      if (arg == NULL) return -EFAULT;
+      struct io_uring_probe *p = arg;
+      memset(p, 0, sizeof(*p) + (size_t) nr_args * sizeof(struct io_uring_probe_op));
+      unsigned last = 0;
+      for (const unsigned char *c = r->be->carried_ops; *c != 255; c++) {
+        if (*c > last) last = *c;
+        if (*c < nr_args) p->ops[*c].flags = IO_URING_OP_SUPPORTED;
+      }
+      p->last_op = (__u8) last;
+      for (unsigned i = 0; i < nr_args; i++) p->ops[i].op = (__u8) i;
+      p->ops_len = (__u8) (nr_args < 256 ? nr_args : 255);
+      return 0;
+    }
+    case IORING_REGISTER_FILES2: {
+      /* Sparse only - a table of empty slots for direct installs, which
+       * is the one shape the consumers ask for (register_files_sparse).
+       * A table of caller descriptors is refused until someone needs
+       * it. */
+      if (arg == NULL) return -EFAULT;
+      const struct io_uring_rsrc_register *rr = arg;
+      if (!(rr->flags & IORING_RSRC_REGISTER_SPARSE) || rr->data != 0 || rr->tags != 0)
+        return -EINVAL;
+      if (rr->nr == 0 || rr->nr > (1u << 20)) return -EINVAL;
+      if (r->fixed != NULL) return -EBUSY; /* one table per ring, like the kernel */
+      int *table = malloc((size_t) rr->nr * sizeof(int));
+      if (table == NULL) return -ENOMEM;
+      for (unsigned i = 0; i < rr->nr; i++) table[i] = -1;
+      r->fixed = table;
+      r->fixed_n = rr->nr;
+      r->alloc_off = 0;
+      r->alloc_len = rr->nr;
+      r->alloc_hint = 0;
+      return 0;
+    }
+    case IORING_UNREGISTER_FILES: {
+      if (r->fixed == NULL) return -ENXIO;
+      for (unsigned i = 0; i < r->fixed_n; i++) {
+        if (r->fixed[i] >= 0) slip_native_fd_close(r->fixed[i]);
+      }
+      free(r->fixed);
+      r->fixed = NULL;
+      r->fixed_n = r->alloc_off = r->alloc_len = r->alloc_hint = 0;
+      return 0;
+    }
+    case IORING_REGISTER_FILE_ALLOC_RANGE: {
+      if (arg == NULL) return -EFAULT;
+      const struct io_uring_file_index_range *range = arg;
+      if (r->fixed == NULL) return -ENXIO;
+      if (range->resv != 0 || range->off > r->fixed_n ||
+          range->len > r->fixed_n - range->off)
+        return -EINVAL;
+      r->alloc_off = range->off;
+      r->alloc_len = range->len;
+      r->alloc_hint = range->off;
+      return 0;
+    }
+    case IORING_REGISTER_RING_FDS: {
+      /* The kernel hands back a table offset that enter then names with
+       * IORING_ENTER_REGISTERED_RING. The engine's rings are already
+       * tokens, so the token IS the offset - enter resolves it the same
+       * way with or without the flag, and nothing needs a table. */
+      if (arg == NULL) return -EFAULT;
+      struct io_uring_rsrc_update *up = arg;
+      for (unsigned i = 0; i < nr_args; i++) up[i].offset = (__u32) fd;
+      return (int) nr_args;
+    }
+    case IORING_UNREGISTER_RING_FDS:
+      return (int) nr_args;
+    case IORING_REGISTER_PBUF_RING: {
+      if (arg == NULL) return -EFAULT;
+      const struct io_uring_buf_reg *reg = arg;
+      /* IOU_PBUF_RING_MMAP wants the engine to own the memory, and the
+       * incremental flag a second protocol - neither consumer asks;
+       * refused, not half-served. */
+      if (reg->flags != 0 || reg->ring_addr == 0) return -EINVAL;
+      if (reg->ring_entries == 0 || (reg->ring_entries & (reg->ring_entries - 1)) != 0 ||
+          reg->ring_entries > (1u << 15))
+        return -EINVAL;
+      if (slip_bufring_of(r, reg->bgid) != NULL) return -EEXIST;
+      for (int i = 0; i < SLIP_BUFRINGS_MAX; i++) {
+        struct slip_bufring *b = &r->bufrings[i];
+        if (b->in_use) continue;
+        b->bufs = (struct io_uring_buf *) (uintptr_t) reg->ring_addr;
+        b->entries = reg->ring_entries;
+        b->bgid = reg->bgid;
+        b->head = 0;
+        b->in_use = 1;
+        return 0;
+      }
+      return -ENOMEM;
+    }
+    case IORING_UNREGISTER_PBUF_RING: {
+      if (arg == NULL) return -EFAULT;
+      const struct io_uring_buf_reg *reg = arg;
+      struct slip_bufring *b = slip_bufring_of(r, reg->bgid);
+      if (b == NULL) return -ENOENT;
+      memset(b, 0, sizeof(*b));
+      return 0;
+    }
+    default:
+      return -EINVAL;
   }
-  p->last_op = (__u8) last;
-  for (unsigned i = 0; i < nr_args; i++) p->ops[i].op = (__u8) i;
-  p->ops_len = (__u8) (nr_args < 256 ? nr_args : 255);
-  return 0;
 }
 
 void *slipstream_engine_mmap(size_t length, int fd, long long offset) {
@@ -432,6 +625,14 @@ int slipstream_engine_close(int fd) {
   free_op_list(r->wq_head);
   free_op_list(r->queue_head);
   for (unsigned i = 0; i < r->waiting_n; i++) free(r->waiting[i]);
+  if (r->fixed != NULL) {
+    /* The ring held these descriptors the way the kernel holds
+     * registered files - the ring's exit is their close. */
+    for (unsigned i = 0; i < r->fixed_n; i++) {
+      if (r->fixed[i] >= 0) slip_native_fd_close(r->fixed[i]);
+    }
+    free(r->fixed);
+  }
   mtx_destroy(&r->mtx);
   cnd_destroy(&r->cv);
   cnd_destroy(&r->wq_cv);

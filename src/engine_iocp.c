@@ -23,6 +23,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <io.h> /* _close: a CRT descriptor is not a SOCKET */
 #include <stdlib.h>
 
 struct iocp_op {
@@ -73,6 +74,13 @@ static int iocp_open_ring(struct slip_ring *r) {
   }
   r->be_state = st;
   return 0;
+}
+
+/* The fixed file table's close: a descriptor here came from socket() or
+ * from the CRT, and closesocket refuses the latter - the same two-step
+ * IORING_OP_CLOSE takes. */
+void slip_native_fd_close(int fd) {
+  if (closesocket((SOCKET) fd) != 0) (void) _close(fd);
 }
 
 static void iocp_close_ring(struct slip_ring *r) {

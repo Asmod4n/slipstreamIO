@@ -34,6 +34,7 @@
 
 #define SLIP_RINGS_MAX 64
 #define SLIP_WAITING_MAX 1024
+#define SLIP_BUFRINGS_MAX 16
 
 /* One submitted op, copied out of the caller's SQE slot so the slot is
  * reusable the moment enter returns - the same promise the kernel makes. */
@@ -42,7 +43,21 @@ struct eng_op {
   struct eng_op *next;
   short wait_events; /* POLLIN/POLLOUT while parked (readiness backends) */
   int stalls_queue;  /* a linked op left the queue unfinished: it waits */
+  unsigned cqe_flags; /* rides into the completion CQE (F_BUFFER and its bid) */
   void *be_source;   /* dispatch: the channel wrapper; iocp: the overlapped one */
+};
+
+/* One registered provided-buffer ring (IORING_REGISTER_PBUF_RING). The
+ * entries live in the CALLER's memory at ring_addr - the tail overlays
+ * bufs[0].resv and the caller advances it with a release store, exactly
+ * the shared layout the kernel reads - so the engine holds a pointer and
+ * its own consumed head, nothing more. */
+struct slip_bufring {
+  struct io_uring_buf *bufs; /* the caller's ring memory */
+  unsigned entries;          /* power of two */
+  unsigned short bgid;
+  unsigned short head; /* engine-consumed; the caller owns the tail */
+  int in_use;
 };
 
 struct slip_ring {
@@ -69,6 +84,17 @@ struct slip_ring {
   unsigned waiting_n;
   int chain_failed; /* a linked op failed: cancel the rest of its chain */
   struct eng_op *blocking; /* a linked op is pending somewhere; the queue waits */
+
+  /* ---- registered resources ----------------------------------------
+   * Created by the register path before traffic and torn down after it
+   * (webmachine's shape, and SINGLE_ISSUER's); the ops that mutate
+   * entries at runtime - a direct accept installing, close_direct
+   * clearing - run on the engine thread only. */
+  int *fixed;       /* the fixed file table: real descriptors, -1 empty */
+  unsigned fixed_n;
+  unsigned alloc_off, alloc_len; /* FILE_ALLOC_RANGE; the whole table until set */
+  unsigned alloc_hint;           /* where the next ALLOC scan starts */
+  struct slip_bufring bufrings[SLIP_BUFRINGS_MAX];
 
   const struct eng_backend *be;
   int be_fd;      /* epoll/kqueue descriptor; poll keeps none */
@@ -125,6 +151,30 @@ struct eng_backend {
  * thread's own loop - the worker, and iocp's drain. Takes the CQ lock,
  * frees the op (or backlogs it when the CQ is full). */
 void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res);
+
+/* A CQE that is NOT an op's completion - a multishot emission. The op
+ * stays alive and parked; only the CQE goes out. Engine thread only. */
+void slip_engine_emit(struct slip_ring *r, __u64 user_data, int res, unsigned flags);
+
+/* The fixed file table, owned by the core beside the register path.
+ * lookup: slot -> real descriptor, -EBADF outside the table or empty.
+ * install: file_index as the SQE carries it - slot+1, or
+ * IORING_FILE_INDEX_ALLOC to pick from the alloc range - returns the
+ * slot, -ENFILE when the range is full, -EBADF outside the table. An
+ * occupied explicit slot is replaced and the old descriptor closed, the
+ * kernel's update semantics. clear: empties the slot WITHOUT closing -
+ * close_direct closes, a replace already closed. Engine thread only. */
+int slip_fixed_lookup(struct slip_ring *r, int slot);
+int slip_fixed_install(struct slip_ring *r, __u32 file_index, int realfd);
+int slip_fixed_clear(struct slip_ring *r, unsigned slot);
+
+/* The registered buffer ring of one group, NULL when none is. */
+struct slip_bufring *slip_bufring_of(struct slip_ring *r, unsigned short bgid);
+
+/* Closing a real descriptor is the one OS call the fixed table needs and
+ * the core does not hold - each family supplies its platform's spelling
+ * (close on POSIX, closesocket/CloseHandle territory on Windows). */
+void slip_native_fd_close(int fd);
 
 /* ---- the two families -------------------------------------------------
  * READINESS (poll, epoll, kqueue): the OS says "that descriptor came
