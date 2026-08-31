@@ -468,6 +468,14 @@ int slipstream_engine_register(int fd, unsigned int opcode, void *arg,
                                unsigned int nr_args) {
   struct slip_ring *r = ring_of(fd);
   if (r == NULL) return -EBADF;
+  /* Once the ring fd is registered, liburing ORs
+   * IORING_REGISTER_USE_REGISTERED_RING into EVERY later opcode and
+   * passes the registered index instead of the descriptor
+   * (register.c, do_register). Here the token is both, so the flag
+   * says nothing this engine has to act on - but it has to come OFF
+   * before the opcode is read, or every register after
+   * register_ring_fd is an unknown one. */
+  opcode &= ~(unsigned int) IORING_REGISTER_USE_REGISTERED_RING;
   switch (opcode) {
     case IORING_REGISTER_PROBE: {
       if (arg == NULL) return -EFAULT;
