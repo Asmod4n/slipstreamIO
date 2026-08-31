@@ -113,7 +113,10 @@ that loop for `select` with `_DARWIN_UNLIMITED_SELECT` and heap
 `liburing.h` casts pointers through `unsigned long`, which is 32 bits
 on Win64. That is upstream's assumption, not the shim's; it is left as
 the warnings it produces, not patched over in a header we promised not
-to change.
+to change - and it is measured, not asserted: the Wine run in
+`test/liburing_h_run.c` hands a pointer above 4G to `prep_read` and
+finds only its low 32 bits in the SQE. The day upstream fixes the cast,
+that check fails and this section goes.
 
 ## Open, in the order they are worth doing
 

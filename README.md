@@ -63,9 +63,13 @@ because that is how the kernel behaves.
 
 `test/liburing_h_shims.sh` proves both stacks: on Linux the six shimmed
 includes must each resolve inside `shim/` — asked with `-H`, not assumed
-— and a MinGW cross compile takes the Windows set. liburing.h itself
-casts pointers through `unsigned long`, 32 bits on Win64; that is
-upstream's LP64 assumption and it is left visible, not patched over.
+— and a MinGW cross compile takes the Windows set. The header's inlines
+are then RUN, not only compiled — `test/liburing_h_run.c` drives layout,
+preps, cursor math across a mask wrap and the CMSG walk, natively and as
+a Windows binary under Wine. liburing.h itself casts pointers through
+`unsigned long`, 32 bits on Win64; that is upstream's LP64 assumption,
+and the Wine run measures it — a pointer above 4G arrives in the SQE
+with only its low 32 bits — rather than patching it over.
 
 The engine source itself is POSIX today (`poll`, `<threads.h>`); the
 native motors for the BSDs and Windows — `kqueue`, IOCP — are the

@@ -11,6 +11,11 @@
 #   2. MinGW, a libc with no Linux in it at all - skipped with words when
 #      no cross compiler is installed
 #
+# And then RUN, not only compiled: test/liburing_h_run.c drives the
+# header's inlines - layout, preps, cursor math, the CMSG walk - natively
+# here, and as a Windows binary under Wine when one is installed. That
+# run also MEASURES the pointer-cast truncation the README talks about.
+#
 #   LIBURING_SRC=/path/to/liburing test/liburing_h_shims.sh
 set -e
 
@@ -53,6 +58,10 @@ for h in linux/types.h linux/fs.h linux/time_types.h linux/swab.h \
 done
 echo "liburing_h_shims: posix shims answered all six includes"
 
+cc -std=gnu11 -Wall -Wextra -Werror $posix_inc \
+  -o "$work/run-native" "$here/test/liburing_h_run.c"
+"$work/run-native"
+
 mingw=${MINGW_CC:-x86_64-w64-mingw32-gcc}
 if ! command -v "$mingw" >/dev/null 2>&1; then
   echo "liburing_h_shims: no $mingw - the Windows scene is skipped"
@@ -63,10 +72,20 @@ fi
 # No -Werror on this side: liburing.h itself casts pointers through
 # unsigned long, which is 32 bits on Win64 - upstream's LP64 assumption,
 # not the shim's. A warning out of shim/ still fails.
-"$mingw" -std=gnu11 -Wall -Wextra \
-  -I"$here/shim/windows" -I"$here/shim/common" -I"$work/include" \
+win_inc="-I$here/shim/windows -I$here/shim/common -I$work/include"
+
+"$mingw" -std=gnu11 -Wall -Wextra $win_inc \
   -c "$work/consume.c" -o "$work/consume-win.o" 2> "$work/win.log" || {
     cat "$work/win.log"; echo "liburing_h_shims: MinGW compile FAILED"; exit 1; }
 grep -F "$here/shim/" "$work/win.log" && {
   echo "liburing_h_shims: a shim header warned under MinGW"; exit 1; }
 echo "liburing_h_shims: MinGW compiled liburing.h with the Windows shims"
+
+if ! command -v wine >/dev/null 2>&1; then
+  echo "liburing_h_shims: no wine - the Windows binary stays unrun"
+  exit 0
+fi
+"$mingw" -std=gnu11 $win_inc \
+  -o "$work/run-win.exe" "$here/test/liburing_h_run.c" 2>/dev/null
+WINEDEBUG=-all wine "$work/run-win.exe"
+echo "liburing_h_shims: and the inlines ran under Wine"
