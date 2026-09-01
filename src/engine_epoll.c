@@ -36,8 +36,14 @@
 /* What the kernel was last told, per descriptor; 0 means not in the
  * set. Indexed by the descriptor itself - they are small integers by
  * definition, and the table grows to the largest one seen. */
+struct ep_fd {
+  uint32_t interest; /* 0: not in the set */
+  struct eng_op *in;
+  struct eng_op *out;
+};
+
 struct ep_state {
-  uint32_t *interest;
+  struct ep_fd *fds;
   unsigned n;
 };
 
@@ -48,34 +54,25 @@ static uint32_t ep_events_of(short wait_events) {
   return e;
 }
 
-static uint32_t *ep_slot(struct slip_ring *r, int fd) {
+static struct ep_fd *ep_slot(struct slip_ring *r, int fd) {
   struct ep_state *st = r->be_state;
   if (fd < 0) return NULL;
   if ((unsigned) fd >= st->n) {
     unsigned want = st->n ? st->n : 64;
     while (want <= (unsigned) fd) want *= 2;
-    uint32_t *grown = realloc(st->interest, (size_t) want * sizeof(*grown));
+    struct ep_fd *grown = realloc(st->fds, (size_t) want * sizeof(*grown));
     if (grown == NULL) return NULL;
     memset(grown + st->n, 0, (size_t) (want - st->n) * sizeof(*grown));
-    st->interest = grown;
+    st->fds = grown;
     st->n = want;
   }
-  return &st->interest[fd];
-}
-
-/* 1 when some parked op still wants this descriptor. */
-static int ep_still_wanted(struct slip_ring *r, int fd) {
-  for (unsigned i = 0; i < r->waiting_n; i++) {
-    if (r->waiting[i]->sqe.fd == fd) return 1;
-  }
-  return 0;
+  return &st->fds[fd];
 }
 
 /* Out of the set, and out of the cache with it. */
-static void ep_drop(struct slip_ring *r, int fd) {
+static void ep_drop(struct slip_ring *r, struct ep_fd *slot, int fd) {
   epoll_ctl(r->be_fd, EPOLL_CTL_DEL, fd, NULL);
-  uint32_t *slot = ep_slot(r, fd);
-  if (slot != NULL) *slot = 0;
+  slot->interest = 0;
 }
 
 static int epoll_open_ring(struct slip_ring *r) {
@@ -108,7 +105,7 @@ static void epoll_close_ring(struct slip_ring *r) {
   r->be_fd = -1;
   struct ep_state *st = r->be_state;
   if (st != NULL) {
-    free(st->interest);
+    free(st->fds);
     free(st);
     r->be_state = NULL;
   }
@@ -118,28 +115,37 @@ static void epoll_close_ring(struct slip_ring *r) {
 /* Nothing to do when the kernel already watches this direction - the
  * usual case for a connection that parks a read after every request. */
 static int epoll_arm(struct slip_ring *r, struct eng_op *op) {
-  uint32_t *slot = ep_slot(r, op->sqe.fd);
+  struct ep_fd *slot = ep_slot(r, op->sqe.fd);
   if (slot == NULL) return -1;
   const uint32_t want = ep_events_of(op->wait_events);
-  if ((*slot & want) == want && *slot != 0) return 0;
 
-  const uint32_t merged = *slot | want;
+  /* The op joins its side of this descriptor - that is what makes a
+   * delivery answerable without searching for it later. */
+  struct eng_op **side = (op->wait_events & POLLOUT) ? &slot->out : &slot->in;
+  op->next = *side;
+  *side = op;
+
+  if (slot->interest != 0 && (slot->interest & want) == want) return 0;
+
+  const uint32_t merged = slot->interest | want;
   struct epoll_event ev = { .events = merged, .data.fd = op->sqe.fd };
-  const int op_first = *slot == 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
-  if (epoll_ctl(r->be_fd, op_first, op->sqe.fd, &ev) == 0) {
-    *slot = merged;
+  const int first = slot->interest == 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+  if (epoll_ctl(r->be_fd, first, op->sqe.fd, &ev) == 0) {
+    slot->interest = merged;
     return 0;
   }
-  /* The cache and the kernel disagree - a closed descriptor whose
+  /* The table and the kernel disagree - a closed descriptor whose
    * number came back. Whichever way round it is, the other call is
    * the right one. */
-  const int op_other = op_first == EPOLL_CTL_ADD ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+  const int other = first == EPOLL_CTL_ADD ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
   if ((errno == EEXIST || errno == ENOENT) &&
-      epoll_ctl(r->be_fd, op_other, op->sqe.fd, &ev) == 0) {
-    *slot = merged;
+      epoll_ctl(r->be_fd, other, op->sqe.fd, &ev) == 0) {
+    slot->interest = merged;
     return 0;
   }
-  *slot = 0;
+  *side = op->next;
+  op->next = NULL;
+  slot->interest = 0;
   return -1;
 }
 
@@ -147,8 +153,17 @@ static int epoll_arm(struct slip_ring *r, struct eng_op *op) {
  * level triggering, so leaving it costs nothing, and re-arming it for
  * the next request then costs nothing either. */
 static void epoll_disarm(struct slip_ring *r, struct eng_op *op) {
-  (void) r;
-  (void) op;
+  struct ep_fd *slot = ep_slot(r, op->sqe.fd);
+  if (slot == NULL) return;
+  struct eng_op **side = (op->wait_events & POLLOUT) ? &slot->out : &slot->in;
+  while (*side != NULL) {
+    if (*side == op) {
+      *side = op->next;
+      op->next = NULL;
+      return;
+    }
+    side = &(*side)->next;
+  }
 }
 
 static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned max,
@@ -164,21 +179,26 @@ static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned 
       slip_posix_ctl_drain(r);
       continue;
     }
-    short fired = 0;
-    if (evs[e].events & EPOLLIN) fired |= POLLIN;
-    if (evs[e].events & EPOLLOUT) fired |= POLLOUT;
-    if (evs[e].events & (EPOLLERR | EPOLLHUP)) fired |= POLLERR | POLLHUP;
-    unsigned before = n;
-    for (unsigned i = 0; i < r->waiting_n && n < SLIP_WAITING_MAX; i++) {
-      struct eng_op *op = r->waiting[i];
-      if (op->sqe.fd == evs[e].data.fd &&
-          (fired & (op->wait_events | POLLERR | POLLHUP)))
+    struct ep_fd *slot = ep_slot(r, evs[e].data.fd);
+    if (slot == NULL) continue;
+    /* NO SEARCH: the descriptor that woke hands over its own waiters.
+     * An error or a hangup wakes both sides - what it means is what
+     * the retry finds out, the way poll reports them regardless. */
+    const int broken = (evs[e].events & (EPOLLERR | EPOLLHUP)) != 0;
+    const unsigned before = n;
+    if ((evs[e].events & EPOLLIN) || broken) {
+      for (struct eng_op *op = slot->in; op != NULL && n < SLIP_WAITING_MAX; op = op->next)
         ready[n++] = op;
     }
-    /* Ready, and nobody waiting for it: a registration that outlived
-     * its ops. Left in place it would report on every wait and spin, so
-     * it goes now - and comes back the moment something parks on it. */
-    if (n == before && !ep_still_wanted(r, evs[e].data.fd)) ep_drop(r, evs[e].data.fd);
+    if ((evs[e].events & EPOLLOUT) || broken) {
+      for (struct eng_op *op = slot->out; op != NULL && n < SLIP_WAITING_MAX; op = op->next)
+        ready[n++] = op;
+    }
+    /* Ready, with nobody waiting for it: a registration that outlived
+     * its ops. Left in place it would be reported on every wait and
+     * spin, so it goes now - and returns the moment something parks. */
+    if (n == before && slot->in == NULL && slot->out == NULL)
+      ep_drop(r, slot, evs[e].data.fd);
   }
   return slip_posix_finish_ready(r, ready, n, out, max);
 }
