@@ -114,6 +114,9 @@ static struct io_uring_cqe *cq_cqes(struct slip_ring *r) {
   return (struct io_uring_cqe *) ((char *) r->cq_block + sizeof(struct cq_ring));
 }
 
+/* Every slice of the ring's one block starts on a cache line. */
+static size_t block_align(size_t n) { return (n + 63u) & ~(size_t) 63u; }
+
 static unsigned round_up_pow2(unsigned v) {
   unsigned n = 1;
   while (n < v) n <<= 1;
@@ -121,23 +124,23 @@ static unsigned round_up_pow2(unsigned v) {
 }
 
 /* ---- where ops come from -----------------------------------------------
- * The pool first, the heap only when it is empty - a ring sized for its
- * own traffic never reaches the fallback, and one that is briefly
- * oversubscribed keeps working instead of refusing.
+ * The caller said how many at setup, so that is how many there are.
+ * Empty means empty: submit takes fewer SQEs and says so in what it
+ * returns, which is the answer a full queue gives anyway. There is no
+ * allocation on this path, and no growing behind the caller's back
+ * past the size it asked for.
  *
- * The free list is SHARED: the submitter takes from it, and the worker
+ * The free list is SHARED: the submitter takes from it, the worker
  * gives back through slip_engine_post, which already holds mtx. malloc
  * did that locking itself; a bare list does not, so the two entry
  * points differ only in who holds the lock when they are called. */
 
 static struct eng_op *op_alloc_locked(struct slip_ring *r) {
   struct eng_op *op = r->op_free;
-  if (op != NULL) {
-    r->op_free = op->next;
-    memset(op, 0, sizeof(*op));
-    return op;
-  }
-  return calloc(1, sizeof(struct eng_op));
+  if (op == NULL) return NULL;
+  r->op_free = op->next;
+  memset(op, 0, sizeof(*op));
+  return op;
 }
 
 static struct eng_op *op_alloc(struct slip_ring *r) {
@@ -149,12 +152,8 @@ static struct eng_op *op_alloc(struct slip_ring *r) {
 
 /* Callers hold mtx: every release runs where a completion is posted. */
 static void op_release(struct slip_ring *r, struct eng_op *op) {
-  if (r->op_pool != NULL && op >= r->op_pool && op < r->op_pool + r->op_pool_n) {
-    op->next = r->op_free;
-    r->op_free = op;
-    return;
-  }
-  free(op);
+  op->next = r->op_free;
+  r->op_free = op;
 }
 
 /* ---- completions ------------------------------------------------------
@@ -398,25 +397,41 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   r->sq_size = sizeof(struct sq_ring) + (size_t) r->sq_entries * sizeof(unsigned);
   r->cq_size = sizeof(struct cq_ring) + (size_t) r->cq_entries * sizeof(struct io_uring_cqe);
   r->sqes_size = (size_t) r->sq_entries * sizeof(struct io_uring_sqe);
+  /* As many ops as the ring can owe answers for: one per completion it
+   * can hold. A submitted SQE slot is the caller's again the moment
+   * enter returns, so the queue is not the bound - the CQ is. */
+  r->op_pool_n = r->cq_entries;
 
-  r->sq_block = calloc(1, r->sq_size);
-  r->cq_block = calloc(1, r->cq_size);
-  r->sqes = calloc(r->sq_entries, sizeof(struct io_uring_sqe));
-  /* One op per SQE slot: what a full submission can hand over at once,
-   * which is the most this ring can owe answers for before the caller
-   * has to read some back. */
-  r->op_pool_n = r->sq_entries;
-  r->op_pool = calloc(r->op_pool_n, sizeof(struct eng_op));
-  if (r->op_pool != NULL) {
+  /* ONE REGION, sliced - the shape io_uring has: the rings and the SQE
+   * array are mapped memory a caller is handed a piece of, not objects
+   * allocated one at a time. The op vault is carved from the same
+   * block, so a ring is one allocation and one free, and an op is
+   * taken from it rather than asked of the heap. Each slice starts on
+   * a cache line so neighbours do not share one. */
+  const size_t sq_part = block_align(r->sq_size);
+  const size_t cq_part = block_align(r->cq_size);
+  const size_t sqes_part = block_align(r->sqes_size);
+  const size_t ops_part = block_align((size_t) r->op_pool_n * sizeof(struct eng_op));
+  r->block_size = sq_part + cq_part + sqes_part + ops_part;
+  r->block = calloc(1, r->block_size);
+  if (r->block != NULL) {
+    char *at = r->block;
+    r->sq_block = at;
+    at += sq_part;
+    r->cq_block = at;
+    at += cq_part;
+    r->sqes = (struct io_uring_sqe *) at;
+    at += sqes_part;
+    r->op_pool = (struct eng_op *) at;
     for (unsigned i = r->op_pool_n; i-- > 0;) {
       r->op_pool[i].next = r->op_free;
       r->op_free = &r->op_pool[i];
     }
   }
-  if (!r->sq_block || !r->cq_block || !r->sqes || !r->op_pool ||
+  if (!r->block ||
       mtx_init(&r->mtx, mtx_plain) != thrd_success ||
       cnd_init(&r->wq_cv) != thrd_success) {
-    free(r->sq_block); free(r->cq_block); free(r->sqes); free(r->op_pool);
+    free(r->block);
     memset(r, 0, sizeof(*r));
     return -ENOMEM;
   }
@@ -424,7 +439,7 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   if (r->be->open_ring(r) != 0) {
     mtx_destroy(&r->mtx);
     cnd_destroy(&r->wq_cv);
-    free(r->sq_block); free(r->cq_block); free(r->sqes); free(r->op_pool);
+    free(r->block);
     memset(r, 0, sizeof(*r));
     return -ENOMEM;
   }
@@ -649,10 +664,7 @@ int slipstream_engine_close(int fd) {
   }
   mtx_destroy(&r->mtx);
   cnd_destroy(&r->wq_cv);
-  free(r->sq_block);
-  free(r->cq_block);
-  free(r->sqes);
-  free(r->op_pool);
+  free(r->block);
   memset(r, 0, sizeof(*r));
   return 0;
 }

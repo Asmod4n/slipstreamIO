@@ -72,6 +72,10 @@ struct slip_ring {
   struct eng_op *op_pool;
   unsigned op_pool_n;
   struct eng_op *op_free;
+
+  /* The one block a ring is, and the four views into it. */
+  void *block;
+  size_t block_size;
   void *sq_block;
   void *cq_block;
   struct io_uring_sqe *sqes;
