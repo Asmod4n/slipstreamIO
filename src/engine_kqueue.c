@@ -1,10 +1,15 @@
 /* The BSD backend: kqueue holds the parked set. A knote is per
  * descriptor AND filter, so a recv and a send parked on one socket are
- * two registrations with no merging - the merge question epoll answers
- * only arises when two parked ops want the SAME direction of the same
- * descriptor, and then the second registration is the same knote again,
- * which EV_ADD updates harmlessly. Deliveries are resolved against
- * waiting[]; the array is the truth, the kqueue its mirror.
+ * two registrations with no merging.
+ *
+ * KNOTES STAY, and a delivery hands over its own waiters - the same two
+ * things the epoll backend learned from measuring, and for the same
+ * reasons. kqueue is level triggered unless EV_CLEAR says otherwise, so
+ * a knote whose op has finished reports nothing while the socket is
+ * drained; keeping it saves an EV_DELETE now and an EV_ADD for the next
+ * request. And the ops wait in a table beside the knote, per descriptor
+ * and side, so an event is answered by reading them out instead of
+ * walking every parked op to find out whose descriptor it was.
  *
  * Also compiles and runs against libkqueue on Linux - the kqueue API
  * over epoll, the same packaging move this project makes for liburing.h
@@ -16,33 +21,57 @@
 #include "engine_internal.h"
 
 #include <poll.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/event.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-static short filter_direction(int filter) {
-  return filter == EVFILT_WRITE ? POLLOUT : POLLIN;
-}
-
 static int kq_filter_of(short wait_events) {
   return (wait_events & POLLOUT) ? EVFILT_WRITE : EVFILT_READ;
 }
 
-/* 1 while some parked op still wants this descriptor and direction. */
-static int kq_still_wanted(struct slip_ring *r, int fd, int filter) {
-  for (unsigned i = 0; i < r->waiting_n; i++) {
-    if (r->waiting[i]->sqe.fd == fd &&
-        kq_filter_of(r->waiting[i]->wait_events) == filter)
-      return 1;
+/* Per descriptor: which knotes are registered, and who waits behind
+ * them. A second op on the same side chains through the op's own next
+ * pointer, which a parked op is not otherwise using. */
+struct kq_fd {
+  int armed_read, armed_write;
+  struct eng_op *in, *out;
+};
+
+struct kq_state {
+  struct kq_fd *fds;
+  unsigned n;
+};
+
+static struct kq_fd *kq_slot(struct slip_ring *r, int fd) {
+  struct kq_state *st = r->be_state;
+  if (fd < 0) return NULL;
+  if ((unsigned) fd >= st->n) {
+    unsigned want = st->n ? st->n : 64;
+    while (want <= (unsigned) fd) want *= 2;
+    struct kq_fd *grown = realloc(st->fds, (size_t) want * sizeof(*grown));
+    if (grown == NULL) return NULL;
+    memset(grown + st->n, 0, (size_t) (want - st->n) * sizeof(*grown));
+    st->fds = grown;
+    st->n = want;
   }
-  return 0;
+  return &st->fds[fd];
 }
 
 static int kqueue_open_ring(struct slip_ring *r) {
   if (slip_posix_ctl_open(r) != 0) return -1;
+  struct kq_state *st = calloc(1, sizeof(*st));
+  if (st == NULL) {
+    slip_posix_ctl_close(r);
+    return -1;
+  }
+  r->be_state = st;
   r->be_fd = kqueue();
   if (r->be_fd < 0) {
+    free(st);
+    r->be_state = NULL;
     slip_posix_ctl_close(r);
     return -1;
   }
@@ -60,23 +89,50 @@ static int kqueue_open_ring(struct slip_ring *r) {
 static void kqueue_close_ring(struct slip_ring *r) {
   if (r->be_fd >= 0) close(r->be_fd);
   r->be_fd = -1;
+  struct kq_state *st = r->be_state;
+  if (st != NULL) {
+    free(st->fds);
+    free(st);
+    r->be_state = NULL;
+  }
   slip_posix_ctl_close(r);
 }
 
 static int kqueue_arm(struct slip_ring *r, struct eng_op *op) {
+  struct kq_fd *slot = kq_slot(r, op->sqe.fd);
+  if (slot == NULL) return -1;
+  const int writing = (op->wait_events & POLLOUT) != 0;
+  struct eng_op **side = writing ? &slot->out : &slot->in;
+  int *armed = writing ? &slot->armed_write : &slot->armed_read;
+  op->next = *side;
+  *side = op;
+  if (*armed) return 0; /* the knote is already there */
+
   struct kevent ev;
   EV_SET(&ev, (uintptr_t) op->sqe.fd, kq_filter_of(op->wait_events), EV_ADD, 0, 0, NULL);
-  return kevent(r->be_fd, &ev, 1, NULL, 0, NULL) == 0 ? 0 : -1;
+  if (kevent(r->be_fd, &ev, 1, NULL, 0, NULL) == 0) {
+    *armed = 1;
+    return 0;
+  }
+  *side = op->next;
+  op->next = NULL;
+  return -1;
 }
 
-/* The op is already out of waiting[]: the knote goes only when nobody
- * left wants its descriptor and direction. */
+/* The op leaves its side; the KNOTE stays, for the next request on
+ * this descriptor to find already there. */
 static void kqueue_disarm(struct slip_ring *r, struct eng_op *op) {
-  const int filter = kq_filter_of(op->wait_events);
-  if (kq_still_wanted(r, op->sqe.fd, filter)) return;
-  struct kevent ev;
-  EV_SET(&ev, (uintptr_t) op->sqe.fd, filter, EV_DELETE, 0, 0, NULL);
-  (void) kevent(r->be_fd, &ev, 1, NULL, 0, NULL);
+  struct kq_fd *slot = kq_slot(r, op->sqe.fd);
+  if (slot == NULL) return;
+  struct eng_op **side = (op->wait_events & POLLOUT) ? &slot->out : &slot->in;
+  while (*side != NULL) {
+    if (*side == op) {
+      *side = op->next;
+      op->next = NULL;
+      return;
+    }
+    side = &(*side)->next;
+  }
 }
 
 static int kqueue_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
@@ -97,13 +153,23 @@ static int kqueue_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
       slip_posix_ctl_drain(r);
       continue;
     }
-    /* EV_EOF and EV_ERROR ride on the direction they were seen on - the
+    /* NO SEARCH: the descriptor that woke hands over its own waiters.
+     * EV_EOF and EV_ERROR ride on the direction they were seen on - the
      * op's retry then reads the answer, the way POLLERR/POLLHUP land. */
-    const short fired = filter_direction(evs[e].filter);
-    for (unsigned i = 0; i < r->waiting_n && n < SLIP_WAITING_MAX; i++) {
-      struct eng_op *op = r->waiting[i];
-      if (op->sqe.fd == (int) evs[e].ident && (op->wait_events & fired))
-        ready[n++] = op;
+    struct kq_fd *slot = kq_slot(r, (int) evs[e].ident);
+    if (slot == NULL) continue;
+    const int writing = evs[e].filter == EVFILT_WRITE;
+    struct eng_op **side = writing ? &slot->out : &slot->in;
+    const unsigned before = n;
+    for (struct eng_op *op = *side; op != NULL && n < SLIP_WAITING_MAX; op = op->next)
+      ready[n++] = op;
+    /* Woken with nobody behind it: a knote that outlived its ops. */
+    if (n == before) {
+      struct kevent del;
+      EV_SET(&del, evs[e].ident, evs[e].filter, EV_DELETE, 0, 0, NULL);
+      (void) kevent(r->be_fd, &del, 1, NULL, 0, NULL);
+      if (writing) slot->armed_write = 0;
+      else slot->armed_read = 0;
     }
   }
   return slip_posix_finish_ready(r, ready, n, out, max);
