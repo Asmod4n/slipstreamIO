@@ -1,5 +1,11 @@
-/* The macOS backend, spelled in GCD - and it is a READINESS backend,
- * because that is what io_uring is: try the op, and only what answers
+/* The macOS backend, spelled in GCD - because GCD is the API Apple
+ * supports. What it uses underneath does not enter into it: a dispatch
+ * source on Darwin IS a kevent, so this is not a route around kqueue,
+ * it is a route around OUR OWN use of it and onto the surface Apple
+ * maintains and runs everything else on. The BSDs keep the kqueue
+ * backend, because there kqueue is what the platform supports.
+ *
+ * And it is a READINESS backend, because that is what io_uring is: try the op, and only what answers
  * EAGAIN waits for the descriptor to say it is ready. A dispatch source
  * says exactly that, so the source's handler does NOT run anything - it
  * notes which descriptor woke and signals the semaphore, and the op

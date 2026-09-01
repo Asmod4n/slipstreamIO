@@ -98,7 +98,9 @@ shared machine (`src/engine_posix.c`) does everything else:
 - `kqueue` — the BSDs; proven natively by `test/freebsd_vm.sh` and on
   Linux through libkqueue (`test/backends_adapters.sh`)
 - `select` — the floor, always compiled: every platform has it
-- `dispatch` — macOS' default: a dispatch source per parked side says
+- `dispatch` — macOS' default, because GCD is the API Apple supports
+  (a dispatch source is a `kevent` underneath; the point is whose
+  surface it is, not what is under it). A source per parked side says
   "ready" and the same shared machine runs the op, so macOS answers
   every opcode Linux does. What has no readiness goes to GCD and never
   to a thread of ours - a positioned file read or write to a
