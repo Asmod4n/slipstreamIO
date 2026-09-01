@@ -36,7 +36,24 @@ static int failed;
 struct rec {
   unsigned long long user_data;
   int res;
+  unsigned flags;
 };
+
+/* WHICH CQE flags are the contract. IORING_CQE_F_SOCK_NONEMPTY is a
+ * hint the kernel may add to a recv and the engine never claims, so it
+ * is masked out by name rather than left to make every recv scenario
+ * lie. What is compared: the buffer a recv was given (F_BUFFER and the
+ * bid in the top 16 bits) and whether a multishot said it is still
+ * armed (F_MORE). */
+#define REC_FLAG_MASK (IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | 0xffff0000u)
+
+/* A scenario that finds this kernel cannot answer at all says so with
+ * this, and the pair is skipped instead of counted as a difference. */
+#define NO_ORACLE (-2)
+
+/* Which side is running - a scenario needs it only to tell "this kernel
+ * has no such op" from "the engine got it wrong". */
+static int side_is_engine;
 
 #define REC_MAX 16
 
@@ -59,6 +76,7 @@ static int collect(struct io_uring *ring, struct rec *out, int want) {
     if (io_uring_wait_cqe(ring, &cqe) != 0) break;
     out[n].user_data = cqe->user_data;
     out[n].res = cqe->res;
+    out[n].flags = cqe->flags & REC_FLAG_MASK;
     io_uring_cqe_seen(ring, cqe);
     n++;
   }
@@ -68,7 +86,8 @@ static int collect(struct io_uring *ring, struct rec *out, int want) {
 static int cmp_rec(const void *a, const void *b) {
   const struct rec *x = a, *y = b;
   if (x->user_data != y->user_data) return x->user_data < y->user_data ? -1 : 1;
-  return x->res - y->res;
+  if (x->res != y->res) return x->res - y->res;
+  return (int) x->flags - (int) y->flags;
 }
 
 static int sc_single_nop(struct io_uring *ring, struct rec *out) {
@@ -417,7 +436,173 @@ static int sc_wait_times_out(struct io_uring *ring, struct rec *out) {
   const int rc = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
   out[0].user_data = 0xE;
   out[0].res = rc;
+  out[0].flags = 0; /* no CQE came, so there are no flags to carry */
   return 1;
+}
+
+
+/* ---- the register family, and the ops that stand on it ----------------
+ * A sparse fixed table, a slot a new descriptor lands in, a provided
+ * buffer ring a recv picks from, and the socket commands - the four
+ * things webmachine's ring does before it serves a byte. */
+
+/* A listener on a fixed SLOT: socket_direct into slot 0, then bind and
+ * listen through IOSQE_FIXED_FILE, then close_direct empties the slot.
+ * The port is ephemeral and therefore not compared - what is compared
+ * is that every stage answered the same on both sides. */
+static int sc_direct_listener(struct io_uring *ring, struct rec *out) {
+  if (io_uring_register_files_sparse(ring, 4) != 0) return -1;
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_socket_direct(sqe, AF_INET, SOCK_STREAM, 0, 0, 0);
+  io_uring_sqe_set_data64(sqe, 200);
+  if (submit_one(ring, out) != 1) return -1;
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_bind(sqe, 0, (struct sockaddr *) &addr, sizeof(addr));
+  sqe->flags |= IOSQE_FIXED_FILE;
+  io_uring_sqe_set_data64(sqe, 201);
+  if (submit_one(ring, out + 1) != 1) return 1;
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_listen(sqe, 0, 8);
+  sqe->flags |= IOSQE_FIXED_FILE;
+  io_uring_sqe_set_data64(sqe, 202);
+  if (submit_one(ring, out + 2) != 1) return 2;
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_close_direct(sqe, 0);
+  io_uring_sqe_set_data64(sqe, 203);
+  if (submit_one(ring, out + 3) != 1) return 3;
+  return 4;
+}
+
+/* A slot that was never filled is -EBADF, exactly as the kernel answers
+ * a fixed-file op on an empty one. */
+static int sc_empty_slot_is_ebadf(struct io_uring *ring, struct rec *out) {
+  if (io_uring_register_files_sparse(ring, 4) != 0) return -1;
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  char buf[4];
+  io_uring_prep_read(sqe, 2, buf, sizeof(buf), 0);
+  sqe->flags |= IOSQE_FIXED_FILE;
+  io_uring_sqe_set_data64(sqe, 210);
+  return submit_one(ring, out) == 1 ? 1 : -1;
+}
+
+/* A recv that picks its own buffer: the CQE carries IORING_CQE_F_BUFFER
+ * and the bid in its top bits, and the bytes land in THAT buffer. */
+static int sc_recv_buffer_select(struct io_uring *ring, struct rec *out) {
+  enum { NBUF = 4, BUFSZ = 64 };
+  static char pool[NBUF * BUFSZ];
+  int err = 0;
+  struct io_uring_buf_ring *br = io_uring_setup_buf_ring(ring, NBUF, 7, 0, &err);
+  if (br == NULL) return NO_ORACLE;
+  const int mask = io_uring_buf_ring_mask(NBUF);
+  for (int i = 0; i < NBUF; i++)
+    io_uring_buf_ring_add(br, pool + i * BUFSZ, BUFSZ, (unsigned short) i, mask, i);
+  io_uring_buf_ring_advance(br, NBUF);
+
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+  if (write(sp[1], "hello", 5) != 5) return -1;
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_recv(sqe, sp[0], NULL, 0, 0);
+  sqe->flags |= IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 7;
+  io_uring_sqe_set_data64(sqe, 220);
+  const int n = submit_one(ring, out);
+
+  /* The bytes must be in the buffer the CQE named, not merely somewhere. */
+  int landed = 0;
+  if (n == 1 && out[0].res == 5) {
+    const unsigned bid = out[0].flags >> IORING_CQE_BUFFER_SHIFT;
+    landed = bid < NBUF && memcmp(pool + bid * BUFSZ, "hello", 5) == 0;
+  }
+  close(sp[0]);
+  close(sp[1]);
+  io_uring_free_buf_ring(ring, br, NBUF, 7);
+  if (!landed) return -1;
+  return n;
+}
+
+/* Multishot recv: one CQE per arrival carrying F_MORE, and EOF ends it
+ * with a res of 0 and no F_MORE - the kernel's own way of saying the
+ * multishot is over. */
+static int sc_recv_multishot(struct io_uring *ring, struct rec *out) {
+  enum { NBUF = 4, BUFSZ = 64 };
+  static char pool[NBUF * BUFSZ];
+  int err = 0;
+  struct io_uring_buf_ring *br = io_uring_setup_buf_ring(ring, NBUF, 9, 0, &err);
+  if (br == NULL) return NO_ORACLE;
+  const int mask = io_uring_buf_ring_mask(NBUF);
+  for (int i = 0; i < NBUF; i++)
+    io_uring_buf_ring_add(br, pool + i * BUFSZ, BUFSZ, (unsigned short) i, mask, i);
+  io_uring_buf_ring_advance(br, NBUF);
+
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+  if (write(sp[1], "one", 3) != 3) return -1;
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_recv_multishot(sqe, sp[0], NULL, 0, 0);
+  sqe->flags |= IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 9;
+  io_uring_sqe_set_data64(sqe, 230);
+  io_uring_submit(ring);
+
+  struct io_uring_cqe *cqe = NULL;
+  int n = 0;
+  if (io_uring_wait_cqe(ring, &cqe) == 0) {
+    out[n].user_data = cqe->user_data;
+    out[n].res = cqe->res;
+    out[n].flags = cqe->flags & REC_FLAG_MASK;
+    n++;
+    io_uring_cqe_seen(ring, cqe);
+  }
+  close(sp[1]); /* EOF: the multishot's last word */
+  if (io_uring_wait_cqe(ring, &cqe) == 0) {
+    out[n].user_data = cqe->user_data;
+    out[n].res = cqe->res;
+    out[n].flags = cqe->flags & REC_FLAG_MASK;
+    n++;
+    io_uring_cqe_seen(ring, cqe);
+  }
+  close(sp[0]);
+  io_uring_free_buf_ring(ring, br, NBUF, 9);
+  return n;
+}
+
+/* SETSOCKOPT and GETSOCKOPT as ring commands. A kernel without
+ * SOCKET_URING_OP_* says so, and then there is nothing to compare. */
+static int sc_cmd_sockopt(struct io_uring *ring, struct rec *out) {
+  const int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  int on = 1;
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_cmd_sock(sqe, SOCKET_URING_OP_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, &on,
+                         sizeof(on));
+  io_uring_sqe_set_data64(sqe, 240);
+  int n = submit_one(ring, out);
+  if (n == 1 && out[0].res < 0 && !side_is_engine) {
+    close(fd);
+    return NO_ORACLE; /* this kernel does not carry the socket commands */
+  }
+
+  int back = 0;
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_cmd_sock(sqe, SOCKET_URING_OP_GETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, &back,
+                         sizeof(back));
+  io_uring_sqe_set_data64(sqe, 241);
+  n += submit_one(ring, out + 1);
+  const int read_back = back != 0;
+  close(fd);
+  return read_back ? n : -1;
 }
 
 struct scenario {
@@ -445,10 +630,16 @@ static const struct scenario scenarios[] = {
   { "openat reads, unlinkat removes, reopen says so", sc_unlink_and_open, 1 },
   { "shutdown SHUT_WR reads as EOF at the peer", sc_shutdown_means_eof, 1 },
   { "a wait with nothing coming times out", sc_wait_times_out, 1 },
+  { "socket_direct/bind/listen/close_direct on a slot", sc_direct_listener, 1 },
+  { "a fixed-file op on an empty slot is -EBADF", sc_empty_slot_is_ebadf, 0 },
+  { "a recv picks a provided buffer, and fills THAT one", sc_recv_buffer_select, 0 },
+  { "multishot recv: F_MORE per arrival, EOF ends it", sc_recv_multishot, 1 },
+  { "setsockopt and getsockopt as ring commands", sc_cmd_sockopt, 1 },
 };
 
 static int run_side(const struct scenario *sc, int engine, struct rec *out) {
   slipstream_syscall_set_engine(engine);
+  side_is_engine = engine;
   struct io_uring ring;
   if (io_uring_queue_init(8, &ring, 0) != 0) return -1;
   const int n = sc->run(&ring, out);
@@ -471,6 +662,13 @@ int main(void) {
   for (unsigned i = 0; i < count; i++) {
     struct rec kernel[REC_MAX], engine[REC_MAX];
     const int nk = run_side(&scenarios[i], 0, kernel);
+    if (nk == NO_ORACLE) {
+      /* The op is not in THIS kernel. Skipped with words: an engine
+       * answer with nothing to compare against proves nothing, and
+       * pretending otherwise is worse than saying so. */
+      printf("  %-48s skipped, this kernel has no such op\n", scenarios[i].what);
+      continue;
+    }
     const int ne = run_side(&scenarios[i], 1, engine);
     int same = nk >= 0 && nk == ne;
     if (same && !scenarios[i].ordered) {
@@ -478,17 +676,20 @@ int main(void) {
       qsort(engine, (size_t) ne, sizeof(struct rec), cmp_rec);
     }
     for (int j = 0; same && j < nk; j++) {
-      same = kernel[j].user_data == engine[j].user_data && kernel[j].res == engine[j].res;
+      same = kernel[j].user_data == engine[j].user_data && kernel[j].res == engine[j].res &&
+             kernel[j].flags == engine[j].flags;
     }
     printf("  %-48s %s\n", scenarios[i].what, same ? "same on both sides" : "DIVERGED");
     if (!same) {
       failed = 1;
       for (int j = 0; j < (nk > ne ? nk : ne); j++) {
         printf("    [%d] kernel", j);
-        if (j < nk) printf(" data=%llu res=%d", kernel[j].user_data, kernel[j].res);
+        if (j < nk) printf(" data=%llu res=%d flags=0x%x", kernel[j].user_data, kernel[j].res,
+                           kernel[j].flags);
         else printf(" (nothing)");
         printf("  engine");
-        if (j < ne) printf(" data=%llu res=%d", engine[j].user_data, engine[j].res);
+        if (j < ne) printf(" data=%llu res=%d flags=0x%x", engine[j].user_data, engine[j].res,
+                           engine[j].flags);
         else printf(" (nothing)");
         printf("\n");
       }
