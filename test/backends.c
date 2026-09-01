@@ -182,6 +182,36 @@ static void scenes(const char *name) {
    * true 200ms can measure as little as ~185. */
   check(waited >= 180, "and not before the deadline");
 
+  /* 4: what the ENGINE can and this host's io_uring may not. The
+   * socket commands are young, and a kernel that predates
+   * SOCKET_URING_OP_GETSOCKNAME answers nothing at all - while the
+   * engine reaches it with getsockname(), which every host has had for
+   * decades. So it is not measured against io_uring here; it is
+   * measured against the plain call on the same descriptor, which is
+   * the only answer that means anything either way. */
+#ifndef _WIN32
+  {
+    struct sockaddr_storage want;
+    socklen_t want_len = sizeof(want);
+    check(getsockname(sp[0], (struct sockaddr *) &want, &want_len) == 0,
+          "the plain getsockname answers on this socket");
+
+    struct sockaddr_storage got;
+    memset(&got, 0, sizeof(got));
+    int got_len = (int) sizeof(got);
+    struct io_uring_sqe *sq = push(&d, IORING_OP_URING_CMD, sp[0], NULL, 0, 0, 0x404);
+    sq->cmd_op = SOCKET_URING_OP_GETSOCKNAME;
+    sq->addr = (__u64) (uintptr_t) &got;
+    sq->optval = (__u64) (uintptr_t) &got_len;
+    sq->optlen = 0; /* this socket's own name; 1 would ask for the peer's */
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    struct io_uring_cqe *gc = cq_pop(&d);
+    check(e == 1 && gc != NULL && gc->res == 0, "getsockname through the ring answers 0");
+    check((socklen_t) got_len == want_len && memcmp(&got, &want, want_len) == 0,
+          "and hands back the same address the plain call does");
+  }
+#endif
+
   sock_close(sp[0]);
   sock_close(sp[1]);
   check(slipstream_engine_close(d.fd) == 0, "the ring goes when it is closed");

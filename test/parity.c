@@ -1,7 +1,8 @@
-/* The behavior, not only the API: the kernel is the oracle. Every
- * scenario here runs twice through the SAME liburing calls - once with
- * the kernel answering, once with the engine forced - and the two
- * completion streams must match field for field: user_data, res, count,
+/* The behavior, not only the API: the kernel answers first and the
+ * engine has to say the same thing. Every scenario here runs twice
+ * through the SAME liburing calls - once with the kernel answering,
+ * once with the engine forced - and the two completion streams must
+ * match field for field: user_data, res, flags, count,
  * and order where io_uring promises order (a link chain). Where it does
  * not, completions are compared as a set.
  *
@@ -9,8 +10,8 @@
  * read on fd -1 answered -EBADF by the kernel and never at all by the
  * engine. A scenario below holds that door shut.
  *
- * Needs a kernel that allows io_uring - the oracle - and says so and
- * skips when there is none. Built and run by test/with_liburing.sh. */
+ * Needs a kernel that allows io_uring to compare against, and says so
+ * and skips when there is none. Built and run by test/with_liburing.sh. */
 
 /* struct statx reaches glibc's sys/stat.h only under _GNU_SOURCE; a .c
  * of our own may say so on its first line. */
@@ -47,9 +48,9 @@ struct rec {
  * armed (F_MORE). */
 #define REC_FLAG_MASK (IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | 0xffff0000u)
 
-/* A scenario that finds this kernel cannot answer at all says so with
+/* A scenario that finds this kernel does not carry the op says so with
  * this, and the pair is skipped instead of counted as a difference. */
-#define NO_ORACLE (-2)
+#define NOT_IN_THIS_KERNEL (-2)
 
 /* Which side is running - a scenario needs it only to tell "this kernel
  * has no such op" from "the engine got it wrong". */
@@ -501,7 +502,7 @@ static int sc_recv_buffer_select(struct io_uring *ring, struct rec *out) {
   static char pool[NBUF * BUFSZ];
   int err = 0;
   struct io_uring_buf_ring *br = io_uring_setup_buf_ring(ring, NBUF, 7, 0, &err);
-  if (br == NULL) return NO_ORACLE;
+  if (br == NULL) return NOT_IN_THIS_KERNEL;
   const int mask = io_uring_buf_ring_mask(NBUF);
   for (int i = 0; i < NBUF; i++)
     io_uring_buf_ring_add(br, pool + i * BUFSZ, BUFSZ, (unsigned short) i, mask, i);
@@ -539,7 +540,7 @@ static int sc_recv_multishot(struct io_uring *ring, struct rec *out) {
   static char pool[NBUF * BUFSZ];
   int err = 0;
   struct io_uring_buf_ring *br = io_uring_setup_buf_ring(ring, NBUF, 9, 0, &err);
-  if (br == NULL) return NO_ORACLE;
+  if (br == NULL) return NOT_IN_THIS_KERNEL;
   const int mask = io_uring_buf_ring_mask(NBUF);
   for (int i = 0; i < NBUF; i++)
     io_uring_buf_ring_add(br, pool + i * BUFSZ, BUFSZ, (unsigned short) i, mask, i);
@@ -591,7 +592,7 @@ static int sc_cmd_sockopt(struct io_uring *ring, struct rec *out) {
   int n = submit_one(ring, out);
   if (n == 1 && out[0].res < 0 && !side_is_engine) {
     close(fd);
-    return NO_ORACLE; /* this kernel does not carry the socket commands */
+    return NOT_IN_THIS_KERNEL; /* this kernel does not carry the socket commands */
   }
 
   int back = 0;
@@ -648,12 +649,12 @@ static int run_side(const struct scenario *sc, int engine, struct rec *out) {
 }
 
 int main(void) {
-  /* The oracle first: without a kernel that answers, there is nothing
-   * to compare against. */
+  /* The kernel first: without one that answers, there is nothing to
+   * compare against. */
   slipstream_syscall_set_engine(0);
   struct io_uring probe;
   if (io_uring_queue_init(2, &probe, 0) != 0) {
-    printf("parity: this kernel refuses io_uring - no oracle, skipped\n");
+    printf("parity: this kernel refuses io_uring - nothing to compare against, skipped\n");
     return 0;
   }
   io_uring_queue_exit(&probe);
@@ -662,10 +663,11 @@ int main(void) {
   for (unsigned i = 0; i < count; i++) {
     struct rec kernel[REC_MAX], engine[REC_MAX];
     const int nk = run_side(&scenarios[i], 0, kernel);
-    if (nk == NO_ORACLE) {
-      /* The op is not in THIS kernel. Skipped with words: an engine
-       * answer with nothing to compare against proves nothing, and
-       * pretending otherwise is worse than saying so. */
+    if (nk == NOT_IN_THIS_KERNEL) {
+      /* The op is not in THIS kernel - which says nothing about the
+       * engine: it answers GETSOCKNAME on a host whose io_uring has no
+       * such command at all. There is simply no second answer to hold
+       * it against here, so it is skipped with words. */
       printf("  %-48s skipped, this kernel has no such op\n", scenarios[i].what);
       continue;
     }

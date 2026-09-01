@@ -298,6 +298,42 @@ static enum verdict run_recv_multishot(struct slip_ring *r, struct eng_op *op,
   }
 }
 
+/* SOCKET_URING_OP_*: the socket calls, as ring ops - plain syscalls, so
+ * both families answer them from here. The SQE unions carry them the way
+ * cmd_net.c reads them: level/optname share the word that GETSOCKNAME
+ * uses as its sockaddr pointer, so each command reads the member that is
+ * actually its own. */
+int slip_posix_cmd_sock(const struct io_uring_sqe *s) {
+  ssize_t n;
+  switch (s->cmd_op) {
+    case SOCKET_URING_OP_SETSOCKOPT:
+      n = setsockopt(s->fd, (int) s->level, (int) s->optname,
+                     (const void *) (uintptr_t) s->optval, (socklen_t) s->optlen);
+      return n < 0 ? -errno : 0;
+    case SOCKET_URING_OP_GETSOCKOPT: {
+      socklen_t len = (socklen_t) s->optlen;
+      n = getsockopt(s->fd, (int) s->level, (int) s->optname,
+                     (void *) (uintptr_t) s->optval, &len);
+      /* The kernel answers the LENGTH it wrote, not zero. */
+      return n < 0 ? -errno : (int) len;
+    }
+    case SOCKET_URING_OP_GETSOCKNAME: {
+      /* addr is the sockaddr, optval an int* holding its size, and
+       * optlen picks the side: 0 this socket's name, 1 the peer's. */
+      struct sockaddr *sa = (struct sockaddr *) (uintptr_t) s->addr;
+      int *slen = (int *) (uintptr_t) s->optval;
+      if (sa == NULL || slen == NULL) return -EFAULT;
+      socklen_t len = (socklen_t) *slen;
+      n = s->optlen != 0 ? getpeername(s->fd, sa, &len) : getsockname(s->fd, sa, &len);
+      if (n < 0) return -errno;
+      *slen = (int) len;
+      return 0;
+    }
+    default:
+      return -EOPNOTSUPP;
+  }
+}
+
 static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   void *buf = (void *) (uintptr_t) s->addr;
@@ -520,47 +556,8 @@ static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out
       *res_out = n < 0 ? -errno : 0;
       return RAN;
     case IORING_OP_URING_CMD:
-      /* SOCKET_URING_OP_*: the socket calls, as ring ops. The SQE unions
-       * carry them the way cmd_net.c reads them - level/optname share the
-       * word that GETSOCKNAME uses as its sockaddr pointer, so each cmd
-       * reads the member that is actually its own. */
-      switch (s->cmd_op) {
-        case SOCKET_URING_OP_SETSOCKOPT:
-          n = setsockopt(s->fd, (int) s->level, (int) s->optname,
-                         (const void *) (uintptr_t) s->optval, (socklen_t) s->optlen);
-          *res_out = n < 0 ? -errno : 0;
-          return RAN;
-        case SOCKET_URING_OP_GETSOCKOPT: {
-          socklen_t len = (socklen_t) s->optlen;
-          n = getsockopt(s->fd, (int) s->level, (int) s->optname,
-                         (void *) (uintptr_t) s->optval, &len);
-          /* The kernel answers the LENGTH it wrote, not zero. */
-          *res_out = n < 0 ? -errno : (int) len;
-          return RAN;
-        }
-        case SOCKET_URING_OP_GETSOCKNAME: {
-          /* addr is the sockaddr, optval an int* holding its size, and
-           * optlen picks the side: 0 this socket's name, 1 the peer's. */
-          struct sockaddr *sa = (struct sockaddr *) (uintptr_t) s->addr;
-          int *slen = (int *) (uintptr_t) s->optval;
-          if (sa == NULL || slen == NULL) {
-            *res_out = -EFAULT;
-            return RAN;
-          }
-          socklen_t len = (socklen_t) *slen;
-          n = s->optlen != 0 ? getpeername(s->fd, sa, &len) : getsockname(s->fd, sa, &len);
-          if (n < 0) {
-            *res_out = -errno;
-            return RAN;
-          }
-          *slen = (int) len;
-          *res_out = 0;
-          return RAN;
-        }
-        default:
-          *res_out = -EOPNOTSUPP;
-          return RAN;
-      }
+      *res_out = slip_posix_cmd_sock(s);
+      return RAN;
     case IORING_OP_CONNECT:
     case IORING_OP_OPENAT:
     case IORING_OP_OPENAT2:

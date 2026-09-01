@@ -205,6 +205,9 @@ int slip_posix_finish_ready(struct slip_ring *r, struct eng_op **ready, unsigned
  * flags) but whose platform can still run it correctly off the engine
  * thread. */
 void slip_posix_hand_to_worker(struct slip_ring *r, struct eng_op *op);
+/* The socket commands (IORING_OP_URING_CMD, SOCKET_URING_OP_*): plain
+ * syscalls, so the completion family answers them from here too. */
+int slip_posix_cmd_sock(const struct io_uring_sqe *s);
 /* One list for the whole readiness family - they all run the same
  * run_one. */
 extern const unsigned char slip_posix_carried_ops[];

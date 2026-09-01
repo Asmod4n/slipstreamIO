@@ -132,7 +132,7 @@ cc -O2 -I"$work/out/include" -I"$here/src" -I"$here/test" -o "$work/blocked" \
 
 # The behavior, not only the API: the same scenarios against the kernel
 # and against the engine, compared field for field - test/parity.c, the
-# kernel as the oracle.
+# the kernel's own answers to compare against.
 cc -O2 -I"$work/out/include" -I"$here/src" -o "$work/parity" \
    "$here/test/parity.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here"/src/slipstream_engine.c "$here"/src/engine_*.c
 "$work/parity"

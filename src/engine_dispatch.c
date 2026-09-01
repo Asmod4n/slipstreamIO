@@ -151,6 +151,11 @@ static int dsp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
     case IORING_OP_CLOSE:
       *res = close(s->fd) == 0 ? 0 : -errno;
       return EXEC_DONE;
+    case IORING_OP_URING_CMD:
+      /* A socket command is a syscall that answers at once - dispatch
+       * has no channel to open for it. */
+      *res = slip_posix_cmd_sock(s);
+      return EXEC_DONE;
     case IORING_OP_RECV:
     case IORING_OP_SEND:
       if (s->msg_flags != 0) {
@@ -255,7 +260,7 @@ static int dsp_wait_done(struct slip_ring *r, struct eng_done *out, unsigned max
 
 static const unsigned char dsp_carried_ops[] = {
   IORING_OP_NOP, IORING_OP_READ, IORING_OP_WRITE, IORING_OP_RECV,
-  IORING_OP_SEND, IORING_OP_CLOSE, 255,
+  IORING_OP_SEND, IORING_OP_CLOSE, IORING_OP_URING_CMD, 255,
 };
 
 const struct eng_backend slip_backend_dispatch = {

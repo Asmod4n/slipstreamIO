@@ -25,7 +25,7 @@ trap 'rm -rf "$work"' EXIT
 if kq_flags=$(pkg-config --cflags --libs libkqueue 2>/dev/null); then
   cc -std=c11 -Wall -Wextra -O2 -I"$here/src" -I"$src/src/include" -DSLIPSTREAM_HAVE_LIBKQUEUE $kq_flags \
     -o "$work/backends-kq" "$here/test/backends.c" $eng $kq_flags
-  "$work/backends-kq" | grep -A13 '^  kqueue:'
+  "$work/backends-kq" | grep -A20 '^  kqueue:'
   "$work/backends-kq" > /dev/null
   echo "backends_adapters: kqueue proven through libkqueue"
 else
@@ -41,7 +41,7 @@ if command -v clang >/dev/null 2>&1 && [ -f "$ld/build/src/libdispatch.a" ]; the
     -I"$ld" -I"$ld/build" -o "$work/backends-dsp" "$here/test/backends.c" $eng \
     "$ld/build/src/libdispatch.a" "$ld/build/src/BlocksRuntime/libBlocksRuntime.a" \
     -lpthread -lstdc++
-  "$work/backends-dsp" | grep -A13 '^  dispatch:'
+  "$work/backends-dsp" | grep -A20 '^  dispatch:'
   "$work/backends-dsp" > /dev/null
   echo "backends_adapters: dispatch proven through swift-corelibs-libdispatch"
 else
