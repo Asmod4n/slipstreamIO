@@ -301,13 +301,16 @@ static enum verdict run_recv_multishot(struct slip_ring *r, struct eng_op *op,
 /* SOCKET_URING_OP_*: the socket calls, as ring ops - plain syscalls, so
  * both families answer them from here.
  *
- * WHERE THE FIELD LAYOUT COMES FROM, and where it does not: struct
- * io_uring_sqe as the carried liburing declares it (MIT), and what
- * liburing's own io_uring_prep_cmd_sock writes into it. level and
- * optname share the union member that GETSOCKNAME uses as its sockaddr
- * pointer, so each command reads the member that is actually its own.
- * Anything the header does not spell out was settled by ASKING a
- * running kernel and comparing answers - test/parity.c - never by
+ * EVERY FIELD BELOW IS READ WHERE LIBURING WRITES IT, and liburing is
+ * MIT: io_uring_prep_cmd_sock fills level, optname, optval and optlen;
+ * io_uring_prep_cmd_getsockname fills addr with the sockaddr, addr3
+ * with its socklen_t*, and optlen with 0 for this socket or 1 for the
+ * peer. The unions overlap - addr carries level and optname for the
+ * sockopt commands, addr3 and optval are the same word - so each
+ * command reads the member ITS OWN prep function wrote.
+ *
+ * What the header and those functions leave open was settled by asking
+ * a running kernel and comparing answers (test/parity.c), never by
  * reading kernel sources. */
 int slip_posix_cmd_sock(const struct io_uring_sqe *s) {
   ssize_t n;
@@ -324,16 +327,11 @@ int slip_posix_cmd_sock(const struct io_uring_sqe *s) {
       return n < 0 ? -errno : (int) len;
     }
     case SOCKET_URING_OP_GETSOCKNAME: {
-      /* addr is the sockaddr, optval an int* holding its size, and
-       * optlen picks the side: 0 this socket's name, 1 the peer's. */
       struct sockaddr *sa = (struct sockaddr *) (uintptr_t) s->addr;
-      int *slen = (int *) (uintptr_t) s->optval;
-      if (sa == NULL || slen == NULL) return -EFAULT;
-      socklen_t len = (socklen_t) *slen;
-      n = s->optlen != 0 ? getpeername(s->fd, sa, &len) : getsockname(s->fd, sa, &len);
-      if (n < 0) return -errno;
-      *slen = (int) len;
-      return 0;
+      socklen_t *len = (socklen_t *) (uintptr_t) s->addr3;
+      if (sa == NULL || len == NULL) return -EFAULT;
+      n = s->optlen != 0 ? getpeername(s->fd, sa, len) : getsockname(s->fd, sa, len);
+      return n < 0 ? -errno : 0;
     }
     default:
       return -EOPNOTSUPP;

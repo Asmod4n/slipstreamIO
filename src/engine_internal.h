@@ -64,14 +64,11 @@ struct slip_ring {
   int in_use;
   unsigned sq_entries, cq_entries;
 
-  /* Ops come from HERE, not from the heap: one block carved at setup
-   * and handed out through a free list, which is what io_uring does
-   * with its own request objects (a slab cache) while the three ring
-   * blocks are the part the caller maps. A malloc per submitted SQE and
-   * a free per completion is a per-request allocation on the one path
-   * that must not have one. The list threads through eng_op::next; a
-   * pointer inside the block is a pool op, anything else came from the
-   * fallback and goes back to the heap. */
+  /* Ops come from HERE, not from the heap: one block carved at setup,
+   * sized by what the caller asked the ring to be, and handed out
+   * through a free list threaded on eng_op::next. A malloc per
+   * submitted SQE and a free per completion is a per-request
+   * allocation on the one path that must not have one. */
   struct eng_op *op_pool;
   unsigned op_pool_n;
   struct eng_op *op_free;

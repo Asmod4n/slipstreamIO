@@ -198,16 +198,18 @@ static void scenes(const char *name) {
 
     struct sockaddr_storage got;
     memset(&got, 0, sizeof(got));
-    int got_len = (int) sizeof(got);
+    socklen_t got_len = sizeof(got);
+    /* The fields io_uring_prep_cmd_getsockname writes, written by hand
+     * because this test drives the engine without liburing. */
     struct io_uring_sqe *sq = push(&d, IORING_OP_URING_CMD, sp[0], NULL, 0, 0, 0x404);
     sq->cmd_op = SOCKET_URING_OP_GETSOCKNAME;
     sq->addr = (__u64) (uintptr_t) &got;
-    sq->optval = (__u64) (uintptr_t) &got_len;
+    sq->addr3 = (__u64) (uintptr_t) &got_len;
     sq->optlen = 0; /* this socket's own name; 1 would ask for the peer's */
     e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
     struct io_uring_cqe *gc = cq_pop(&d);
     check(e == 1 && gc != NULL && gc->res == 0, "getsockname through the ring answers 0");
-    check((socklen_t) got_len == want_len && memcmp(&got, &want, want_len) == 0,
+    check(got_len == want_len && memcmp(&got, &want, want_len) == 0,
           "and hands back the same address the plain call does");
   }
 #endif
