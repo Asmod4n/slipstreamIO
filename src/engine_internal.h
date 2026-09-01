@@ -199,7 +199,7 @@ struct slip_bufring *slip_bufring_of(struct slip_ring *r, unsigned short bgid);
 void slip_native_fd_close(int fd);
 
 /* ---- the two families -------------------------------------------------
- * READINESS (poll, epoll, kqueue): the OS says "that descriptor came
+ * READINESS (select, epoll, kqueue): the OS says "that descriptor came
  * ready" and the shared machinery in engine_posix.c does everything
  * else - the poke pipe, the DONTWAIT-guarded try, parking mirrored via
  * arm/disarm, the retry, the worker for regular files. A backend of

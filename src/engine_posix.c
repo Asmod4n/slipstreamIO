@@ -1,6 +1,6 @@
-/* The one implementation behind every readiness backend. poll, epoll,
- * kqueue and dispatch differ only in how they learn that a parked
- * descriptor came ready; how an op is TRIED, parked, retried, or sent
+/* The one implementation behind every readiness backend. select,
+ * epoll, kqueue and dispatch differ only in how they learn that a
+ * parked descriptor came ready; how an op is TRIED, parked, retried, or sent
  * to the worker - and how the engine is poked - is the same machine,
  * and it lives here once.
  *
@@ -131,8 +131,9 @@ static int off_is_current(__u64 off) { return off == (__u64) -1; }
 
 /* 1 readiness, 0 regular file, -1 the descriptor itself is broken - and
  * then the REAL call runs right away and reports it, because parking a
- * bad descriptor waits forever: poll ignores negative fds, so a parked
- * read on fd -1 would never fire, where the kernel answers -EBADF. */
+ * bad descriptor waits forever: a negative fd is in no readiness set,
+ * so a parked read on fd -1 would never fire, where the kernel answers
+ * -EBADF. */
 static int fd_is_pollable(int fd) {
   struct stat st;
   if (fstat(fd, &st) != 0) return -1;
