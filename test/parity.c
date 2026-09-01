@@ -606,6 +606,61 @@ static int sc_cmd_sockopt(struct io_uring *ring, struct rec *out) {
   return read_back ? n : -1;
 }
 
+
+/* Multishot accept into the fixed table: one CQE per connection, each
+ * carrying F_MORE and the SLOT the new descriptor landed in - which is
+ * how webmachine learns about every connection it serves. The peers
+ * connect BEFORE the accept is submitted, so both sides have the same
+ * two waiting and neither has to be timed. */
+static int sc_accept_multishot(struct io_uring *ring, struct rec *out) {
+  if (io_uring_register_files_sparse(ring, 4) != 0) return -1;
+  if (io_uring_register_file_alloc_range(ring, 0, 4) != 0) return -1;
+
+  const int lis = socket(AF_INET, SOCK_STREAM, 0);
+  if (lis < 0) return -1;
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t alen = sizeof(addr);
+  if (bind(lis, (struct sockaddr *) &addr, sizeof(addr)) != 0 || listen(lis, 8) != 0 ||
+      getsockname(lis, (struct sockaddr *) &addr, &alen) != 0) {
+    close(lis);
+    return -1;
+  }
+
+  int cli[2] = { -1, -1 };
+  for (int i = 0; i < 2; i++) {
+    cli[i] = socket(AF_INET, SOCK_STREAM, 0);
+    if (cli[i] < 0 || connect(cli[i], (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+      for (int j = 0; j <= i; j++)
+        if (cli[j] >= 0) close(cli[j]);
+      close(lis);
+      return -1;
+    }
+  }
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_multishot_accept_direct(sqe, lis, NULL, NULL, 0);
+  io_uring_sqe_set_data64(sqe, 250);
+  io_uring_submit(ring);
+
+  int n = 0;
+  for (int i = 0; i < 2; i++) {
+    struct io_uring_cqe *cqe = NULL;
+    if (io_uring_wait_cqe(ring, &cqe) != 0) break;
+    out[n].user_data = cqe->user_data;
+    out[n].res = cqe->res;
+    out[n].flags = cqe->flags & REC_FLAG_MASK;
+    n++;
+    io_uring_cqe_seen(ring, cqe);
+  }
+  close(cli[0]);
+  close(cli[1]);
+  close(lis);
+  return n;
+}
+
 struct scenario {
   const char *what;
   scenario_fn run;
@@ -636,6 +691,7 @@ static const struct scenario scenarios[] = {
   { "a recv picks a provided buffer, and fills THAT one", sc_recv_buffer_select, 0 },
   { "multishot recv: F_MORE per arrival, EOF ends it", sc_recv_multishot, 1 },
   { "setsockopt and getsockopt as ring commands", sc_cmd_sockopt, 1 },
+  { "multishot accept fills slots, one F_MORE CQE each", sc_accept_multishot, 1 },
 };
 
 static int run_side(const struct scenario *sc, int engine, struct rec *out) {
