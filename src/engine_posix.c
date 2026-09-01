@@ -299,10 +299,16 @@ static enum verdict run_recv_multishot(struct slip_ring *r, struct eng_op *op,
 }
 
 /* SOCKET_URING_OP_*: the socket calls, as ring ops - plain syscalls, so
- * both families answer them from here. The SQE unions carry them the way
- * cmd_net.c reads them: level/optname share the word that GETSOCKNAME
- * uses as its sockaddr pointer, so each command reads the member that is
- * actually its own. */
+ * both families answer them from here.
+ *
+ * WHERE THE FIELD LAYOUT COMES FROM, and where it does not: struct
+ * io_uring_sqe as the carried liburing declares it (MIT), and what
+ * liburing's own io_uring_prep_cmd_sock writes into it. level and
+ * optname share the union member that GETSOCKNAME uses as its sockaddr
+ * pointer, so each command reads the member that is actually its own.
+ * Anything the header does not spell out was settled by ASKING a
+ * running kernel and comparing answers - test/parity.c - never by
+ * reading kernel sources. */
 int slip_posix_cmd_sock(const struct io_uring_sqe *s) {
   ssize_t n;
   switch (s->cmd_op) {

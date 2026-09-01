@@ -120,6 +120,43 @@ static unsigned round_up_pow2(unsigned v) {
   return n;
 }
 
+/* ---- where ops come from -----------------------------------------------
+ * The pool first, the heap only when it is empty - a ring sized for its
+ * own traffic never reaches the fallback, and one that is briefly
+ * oversubscribed keeps working instead of refusing.
+ *
+ * The free list is SHARED: the submitter takes from it, and the worker
+ * gives back through slip_engine_post, which already holds mtx. malloc
+ * did that locking itself; a bare list does not, so the two entry
+ * points differ only in who holds the lock when they are called. */
+
+static struct eng_op *op_alloc_locked(struct slip_ring *r) {
+  struct eng_op *op = r->op_free;
+  if (op != NULL) {
+    r->op_free = op->next;
+    memset(op, 0, sizeof(*op));
+    return op;
+  }
+  return calloc(1, sizeof(struct eng_op));
+}
+
+static struct eng_op *op_alloc(struct slip_ring *r) {
+  mtx_lock(&r->mtx);
+  struct eng_op *op = op_alloc_locked(r);
+  mtx_unlock(&r->mtx);
+  return op;
+}
+
+/* Callers hold mtx: every release runs where a completion is posted. */
+static void op_release(struct slip_ring *r, struct eng_op *op) {
+  if (r->op_pool != NULL && op >= r->op_pool && op < r->op_pool + r->op_pool_n) {
+    op->next = r->op_free;
+    r->op_free = op;
+    return;
+  }
+  free(op);
+}
+
 /* ---- completions ------------------------------------------------------
  * Whoever finishes an op posts - the engine thread, the worker, iocp's
  * drain - all under mtx. The caller's side is liburing's inlines: they
@@ -152,7 +189,7 @@ static void drain_backlog_locked(struct slip_ring *r) {
     r->backlog_head = op->next;
     if (r->backlog_head == NULL) r->backlog_tail = NULL;
     post_locked(r, op->sqe.user_data, (int) op->sqe.__pad2[0], op->cqe_flags);
-    free(op);
+    op_release(r, op);
   }
 }
 
@@ -172,7 +209,7 @@ void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res) {
   drain_backlog_locked(r);
   if (cq_room(r)) {
     post_locked(r, op->sqe.user_data, res, op->cqe_flags);
-    free(op);
+    op_release(r, op);
   } else {
     backlog_locked(r, op, res);
   }
@@ -188,7 +225,7 @@ void slip_engine_emit(struct slip_ring *r, __u64 user_data, int res, unsigned fl
   if (cq_room(r)) {
     post_locked(r, user_data, res, flags);
   } else {
-    struct eng_op *carrier = calloc(1, sizeof(*carrier));
+    struct eng_op *carrier = op_alloc_locked(r);
     if (carrier != NULL) {
       carrier->sqe.user_data = user_data;
       carrier->cqe_flags = flags;
@@ -365,10 +402,21 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   r->sq_block = calloc(1, r->sq_size);
   r->cq_block = calloc(1, r->cq_size);
   r->sqes = calloc(r->sq_entries, sizeof(struct io_uring_sqe));
-  if (!r->sq_block || !r->cq_block || !r->sqes ||
+  /* One op per SQE slot: what a full submission can hand over at once,
+   * which is the most this ring can owe answers for before the caller
+   * has to read some back. */
+  r->op_pool_n = r->sq_entries;
+  r->op_pool = calloc(r->op_pool_n, sizeof(struct eng_op));
+  if (r->op_pool != NULL) {
+    for (unsigned i = r->op_pool_n; i-- > 0;) {
+      r->op_pool[i].next = r->op_free;
+      r->op_free = &r->op_pool[i];
+    }
+  }
+  if (!r->sq_block || !r->cq_block || !r->sqes || !r->op_pool ||
       mtx_init(&r->mtx, mtx_plain) != thrd_success ||
       cnd_init(&r->wq_cv) != thrd_success) {
-    free(r->sq_block); free(r->cq_block); free(r->sqes);
+    free(r->sq_block); free(r->cq_block); free(r->sqes); free(r->op_pool);
     memset(r, 0, sizeof(*r));
     return -ENOMEM;
   }
@@ -376,7 +424,7 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   if (r->be->open_ring(r) != 0) {
     mtx_destroy(&r->mtx);
     cnd_destroy(&r->wq_cv);
-    free(r->sq_block); free(r->cq_block); free(r->sqes);
+    free(r->sq_block); free(r->cq_block); free(r->sqes); free(r->op_pool);
     memset(r, 0, sizeof(*r));
     return -ENOMEM;
   }
@@ -568,10 +616,10 @@ int slipstream_engine_munmap(void *addr, size_t length) {
   return -ENOENT;
 }
 
-static void free_op_list(struct eng_op *op) {
+static void free_op_list(struct slip_ring *r, struct eng_op *op) {
   while (op != NULL) {
     struct eng_op *next = op->next;
-    free(op);
+    op_release(r, op);
     op = next;
   }
 }
@@ -587,10 +635,10 @@ int slipstream_engine_close(int fd) {
   if (r->worker_live) thrd_join(r->worker, NULL);
   r->be->close_ring(r);
 
-  free_op_list(r->backlog_head);
-  free_op_list(r->wq_head);
-  free_op_list(r->queue_head);
-  for (unsigned i = 0; i < r->waiting_n; i++) free(r->waiting[i]);
+  free_op_list(r, r->backlog_head);
+  free_op_list(r, r->wq_head);
+  free_op_list(r, r->queue_head);
+  for (unsigned i = 0; i < r->waiting_n; i++) op_release(r, r->waiting[i]);
   if (r->fixed != NULL) {
     /* The ring held these descriptors the way the kernel holds
      * registered files - the ring's exit is their close. */
@@ -604,6 +652,7 @@ int slipstream_engine_close(int fd) {
   free(r->sq_block);
   free(r->cq_block);
   free(r->sqes);
+  free(r->op_pool);
   memset(r, 0, sizeof(*r));
   return 0;
 }
@@ -649,7 +698,7 @@ int slipstream_engine_enter(int fd, unsigned int to_submit, unsigned int min_com
   while (sq->head != tail && submitted < to_submit) {
     const unsigned i = sq_array(r)[sq->head & sq->ring_mask];
     if (i < r->sq_entries) {
-      struct eng_op *op = calloc(1, sizeof(*op));
+      struct eng_op *op = op_alloc(r);
       if (op == NULL) break;
       op->sqe = r->sqes[i];
       if (batch_tail) batch_tail->next = op;
