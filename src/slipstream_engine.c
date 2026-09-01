@@ -50,13 +50,13 @@ static const struct eng_backend *backend_default(void) {
     defined(__OpenBSD__)
   return &slip_backend_kqueue;
 #else
-  return &slip_backend_poll;
+  return &slip_backend_select;
 #endif
 }
 
 static const struct eng_backend *backend_by_name(const char *name) {
 #ifndef _WIN32
-  if (strcmp(name, slip_backend_poll.name) == 0) return &slip_backend_poll;
+  if (strcmp(name, slip_backend_select.name) == 0) return &slip_backend_select;
 #endif
 #ifdef __linux__
   if (strcmp(name, slip_backend_epoll.name) == 0) return &slip_backend_epoll;

@@ -17,7 +17,7 @@ if [ ! -f "$src/src/include/liburing/io_uring.h" ]; then
   echo "  (the engine reads liburing's io_uring.h; set LIBURING_SRC)"
   exit 0
 fi
-eng="$here/src/slipstream_engine.c $here/src/engine_posix.c $here/src/engine_poll.c $here/src/engine_epoll.c \
+eng="$here/src/slipstream_engine.c $here/src/engine_posix.c $here/src/engine_select.c $here/src/engine_epoll.c \
      $here/src/engine_kqueue.c $here/src/engine_dispatch.c"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

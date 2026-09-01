@@ -115,7 +115,7 @@ struct slip_ring {
   struct slip_bufring bufrings[SLIP_BUFRINGS_MAX];
 
   const struct eng_backend *be;
-  int be_fd;      /* epoll/kqueue descriptor; poll keeps none */
+  int be_fd;      /* epoll/kqueue descriptor; select keeps none */
   void *be_state; /* dispatch: queue+semaphore+done; iocp: the port */
 
   /* The poke: the WORKER's door to a submitter blocked in the backend's
@@ -230,7 +230,8 @@ int slip_posix_cmd_sock(const struct io_uring_sqe *s);
 extern const unsigned char slip_posix_carried_ops[];
 #endif
 
-extern const struct eng_backend slip_backend_poll;
+/* The floor: every platform has select, so this one always exists. */
+extern const struct eng_backend slip_backend_select;
 #ifdef __linux__
 extern const struct eng_backend slip_backend_epoll;
 #endif

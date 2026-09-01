@@ -20,7 +20,7 @@ LIBURING_SRC ?= deps/liburing
 
 # The engine core and every backend the platform guards let through -
 # absent ones compile to empty translation units.
-ENGINE = src/slipstream_engine.c src/engine_posix.c src/engine_poll.c src/engine_epoll.c src/engine_kqueue.c src/engine_dispatch.c src/engine_iocp.c
+ENGINE = src/slipstream_engine.c src/engine_posix.c src/engine_select.c src/engine_epoll.c src/engine_kqueue.c src/engine_dispatch.c src/engine_iocp.c
 
 BINS = test/available test/syscall test/shim test/blocked test/backends
 

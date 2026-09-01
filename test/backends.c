@@ -224,7 +224,7 @@ int main(void) {
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
 #endif
-  scenes("poll");
+  scenes("select");
   scenes("epoll");
   scenes("kqueue");
   scenes("dispatch");

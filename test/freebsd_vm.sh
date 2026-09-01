@@ -97,7 +97,7 @@ cd /tmp/slip/slipstreamio
 ok=yes
 LIBURING_SRC=/tmp/slip/liburing sh test/liburing_h_shims.sh || ok=no
 cc -std=c11 -Wall -Wextra -O2 -Isrc -Ishim/common -I/tmp/slip/liburing/src/include \
-   -o /tmp/backends test/backends.c src/slipstream_engine.c src/engine_posix.c src/engine_poll.c \
+   -o /tmp/backends test/backends.c src/slipstream_engine.c src/engine_posix.c src/engine_select.c \
    src/engine_epoll.c src/engine_kqueue.c -lstdthreads || ok=no
 [ "$ok" = yes ] && /tmp/backends || ok=no
 if [ "$ok" = yes ]; then
