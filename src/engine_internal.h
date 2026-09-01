@@ -42,6 +42,10 @@ struct eng_op {
   struct io_uring_sqe sqe;
   struct eng_op *next;
   short wait_events; /* POLLIN/POLLOUT while parked (readiness backends) */
+  /* Where this op sits in waiting[], so leaving the set is a swap and
+   * not a search. Meaningful only while parked; waiting[slot] == op is
+   * what says so, since a fresh op starts at zero. */
+  unsigned wait_slot;
   int stalls_queue;  /* a linked op left the queue unfinished: it waits */
   unsigned cqe_flags; /* rides into the completion CQE (F_BUFFER and its bid) */
   void *be_source;   /* dispatch: the channel wrapper; iocp: the overlapped one */
