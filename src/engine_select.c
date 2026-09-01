@@ -40,16 +40,21 @@ static void select_disarm(struct slip_ring *r, struct eng_op *op) {
 
 static int select_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
                        int timeout_ms) {
-  fd_set rd, wr;
+  fd_set rd, wr, ex;
   FD_ZERO(&rd);
   FD_ZERO(&wr);
+  FD_ZERO(&ex);
   int top = r->ctl_r;
   FD_SET(r->ctl_r, &rd);
   for (unsigned i = 0; i < r->waiting_n; i++) {
+    const short want = r->waiting[i]->wait_events;
     const int fd = r->waiting[i]->sqe.fd;
     if (fd < 0 || fd >= FD_SETSIZE) continue; /* refused at arm; never here */
-    if (r->waiting[i]->wait_events & POLLOUT) FD_SET(fd, &wr);
-    else FD_SET(fd, &rd);
+    if (want & (POLLIN | POLLPRI)) FD_SET(fd, &rd);
+    if (want & POLLOUT) FD_SET(fd, &wr);
+    /* The exception set is where out-of-band shows up, which is what
+     * POLLPRI asks for - and an errored descriptor lands there too. */
+    FD_SET(fd, &ex);
     if (fd > top) top = fd;
   }
 
@@ -58,7 +63,7 @@ static int select_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
   }
-  if (select(top + 1, &rd, &wr, NULL, timeout_ms >= 0 ? &tv : NULL) < 0)
+  if (select(top + 1, &rd, &wr, &ex, timeout_ms >= 0 ? &tv : NULL) < 0)
     return 0; /* EINTR: a harmless drain */
   if (FD_ISSET(r->ctl_r, &rd)) slip_posix_ctl_drain(r);
 
@@ -71,7 +76,10 @@ static int select_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
     struct eng_op *op = r->waiting[i];
     const int fd = op->sqe.fd;
     if (fd < 0 || fd >= FD_SETSIZE) continue;
-    if (FD_ISSET(fd, (op->wait_events & POLLOUT) ? &wr : &rd)) ready[n++] = op;
+    const short want = op->wait_events;
+    const int woke = ((want & (POLLIN | POLLPRI)) && FD_ISSET(fd, &rd)) ||
+                     ((want & POLLOUT) && FD_ISSET(fd, &wr)) || FD_ISSET(fd, &ex);
+    if (woke) ready[n++] = op;
   }
   return slip_posix_finish_ready(r, ready, n, out, max);
 }

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/uio.h> /* preadv2/pwritev2 and their iovec */
 #include <unistd.h>
@@ -339,6 +340,57 @@ int slip_posix_cmd_sock(const struct io_uring_sqe *s) {
   }
 }
 
+/* WHAT IS READY ON THIS DESCRIPTOR, RIGHT NOW - the one question
+ * IORING_OP_POLL_ADD answers, and it answers it in poll's own words:
+ * revents, with POLLPRI and POLLERR and POLLHUP in them.
+ *
+ * poll(2) says that in one call and is on every platform this engine
+ * has met. select(2) can say it too - readable, writable, and the
+ * exception set for out-of-band - but the error and hangup bits are
+ * not in those three, so they have to be asked of the socket
+ * afterwards. That is the expensive way, and it is here so that a
+ * platform with select and nothing else is still served rather than
+ * refused. SLIPSTREAM_NO_POLL picks it. */
+#ifdef SLIPSTREAM_NO_POLL
+static short revents_now(int fd, short events) {
+  fd_set rd, wr, ex;
+  FD_ZERO(&rd);
+  FD_ZERO(&wr);
+  FD_ZERO(&ex);
+  if (fd < 0 || fd >= FD_SETSIZE) return POLLNVAL;
+  if (events & (POLLIN | POLLPRI)) FD_SET(fd, &rd);
+  if (events & POLLOUT) FD_SET(fd, &wr);
+  FD_SET(fd, &ex); /* out-of-band, which is what POLLPRI means here */
+  struct timeval zero = { 0, 0 };
+  if (select(fd + 1, &rd, &wr, &ex, &zero) < 0) return POLLNVAL;
+
+  short re = 0;
+  if (FD_ISSET(fd, &rd)) re |= POLLIN;
+  if (FD_ISSET(fd, &wr)) re |= POLLOUT;
+  if (FD_ISSET(fd, &ex)) re |= POLLPRI;
+  if (re & POLLIN) {
+    /* Readable covers three different things here, and only the
+     * socket knows which: a pending error, a peer that closed, or
+     * actual bytes. This is the cost the comment above names. */
+    int err = 0;
+    socklen_t elen = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err != 0) {
+      re |= POLLERR;
+    } else {
+      char peek;
+      if (recv(fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0) re |= POLLHUP;
+    }
+  }
+  return (short) (re & (events | POLLERR | POLLHUP | POLLNVAL));
+}
+#else
+static short revents_now(int fd, short events) {
+  struct pollfd p = { .fd = fd, .events = events, .revents = 0 };
+  if (poll(&p, 1, 0) < 0) return POLLNVAL;
+  return p.revents;
+}
+#endif
+
 static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   void *buf = (void *) (uintptr_t) s->addr;
@@ -529,21 +581,18 @@ static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out
         return RAN;
       }
       /* The readiness IS the answer: ready now completes with revents,
-       * not ready parks on the asked directions - the backends deliver
-       * ERR/HUP regardless, the way poll itself does. poll32_events is
+       * not ready parks on WHAT WAS ASKED FOR - all of it, not the two
+       * bits a backend happens to find easy, or an op that wants only
+       * POLLPRI parks on nothing and waits forever. poll32_events is
        * host order on little endian (liburing swaps only on BE). */
-      struct pollfd p = { .fd = s->fd, .events = (short) s->poll32_events };
-      n = poll(&p, 1, 0);
-      if (n < 0) {
-        *res_out = -errno;
+      const short asked = (short) s->poll32_events;
+      const short re = revents_now(s->fd, asked);
+      if (re != 0) {
+        *res_out = (int) (unsigned short) re;
         return RAN;
       }
-      if (n == 0) {
-        op->wait_events = (short) (s->poll32_events & (POLLIN | POLLOUT));
-        return PARK;
-      }
-      *res_out = (int) (unsigned short) p.revents;
-      return RAN;
+      op->wait_events = asked;
+      return PARK;
     }
     case IORING_OP_STATX: {
       const char *path = (const char *) buf;

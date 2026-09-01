@@ -704,6 +704,31 @@ static int run_side(const struct scenario *sc, int engine, struct rec *out) {
   return n;
 }
 
+/* EVERY backend is measured, not the platform's favourite. What the
+ * engine answers has to be what the kernel answers no matter which
+ * readiness or completion machinery is underneath - a backend that is
+ * only ever exercised by hand-written expectations is a backend whose
+ * divergence nobody would notice. The ones this build does not carry
+ * refuse the name and are passed over. */
+static const char *const backends[] = { "select", "epoll", "kqueue", "dispatch", "iocp" };
+
+static int same_stream(const struct scenario *sc, const struct rec *a, int na,
+                       const struct rec *b, int nb) {
+  if (na < 0 || na != nb) return 0;
+  struct rec x[REC_MAX], y[REC_MAX];
+  memcpy(x, a, (size_t) na * sizeof(*a));
+  memcpy(y, b, (size_t) nb * sizeof(*b));
+  if (!sc->ordered) {
+    qsort(x, (size_t) na, sizeof(*x), cmp_rec);
+    qsort(y, (size_t) nb, sizeof(*y), cmp_rec);
+  }
+  for (int i = 0; i < na; i++) {
+    if (x[i].user_data != y[i].user_data || x[i].res != y[i].res || x[i].flags != y[i].flags)
+      return 0;
+  }
+  return 1;
+}
+
 int main(void) {
   /* The kernel first: without one that answers, there is nothing to
    * compare against. */
@@ -716,40 +741,43 @@ int main(void) {
   io_uring_queue_exit(&probe);
 
   const unsigned count = sizeof(scenarios) / sizeof(scenarios[0]);
-  for (unsigned i = 0; i < count; i++) {
-    struct rec kernel[REC_MAX], engine[REC_MAX];
-    const int nk = run_side(&scenarios[i], 0, kernel);
-    if (nk == NOT_IN_THIS_KERNEL) {
-      /* The op is not in THIS kernel - which says nothing about the
-       * engine: it answers GETSOCKNAME on a host whose io_uring has no
-       * such command at all. There is simply no second answer to hold
-       * it against here, so it is skipped with words. */
-      printf("  %-48s skipped, this kernel has no such op\n", scenarios[i].what);
+
+  /* The kernel's answers first, once - they do not depend on which
+   * backend the engine would have used. */
+  static struct rec kernel[64][REC_MAX];
+  int nk[64];
+  for (unsigned i = 0; i < count; i++) nk[i] = run_side(&scenarios[i], 0, kernel[i]);
+
+  for (unsigned b = 0; b < sizeof(backends) / sizeof(backends[0]); b++) {
+    if (slipstream_engine_backend_set(backends[b]) != 0) {
+      printf("  %-8s not carried in this build - skipped\n", backends[b]);
       continue;
     }
-    const int ne = run_side(&scenarios[i], 1, engine);
-    int same = nk >= 0 && nk == ne;
-    if (same && !scenarios[i].ordered) {
-      qsort(kernel, (size_t) nk, sizeof(struct rec), cmp_rec);
-      qsort(engine, (size_t) ne, sizeof(struct rec), cmp_rec);
-    }
-    for (int j = 0; same && j < nk; j++) {
-      same = kernel[j].user_data == engine[j].user_data && kernel[j].res == engine[j].res &&
-             kernel[j].flags == engine[j].flags;
-    }
-    printf("  %-48s %s\n", scenarios[i].what, same ? "same on both sides" : "DIVERGED");
-    if (!same) {
-      failed = 1;
-      for (int j = 0; j < (nk > ne ? nk : ne); j++) {
-        printf("    [%d] kernel", j);
-        if (j < nk) printf(" data=%llu res=%d flags=0x%x", kernel[j].user_data, kernel[j].res,
-                           kernel[j].flags);
-        else printf(" (nothing)");
-        printf("  engine");
-        if (j < ne) printf(" data=%llu res=%d flags=0x%x", engine[j].user_data, engine[j].res,
-                           engine[j].flags);
-        else printf(" (nothing)");
-        printf("\n");
+    printf("  %s:\n", backends[b]);
+    for (unsigned i = 0; i < count; i++) {
+      if (nk[i] == NOT_IN_THIS_KERNEL) {
+        printf("    %-46s skipped, this kernel has no such op\n", scenarios[i].what);
+        continue;
+      }
+      struct rec engine[REC_MAX];
+      const int ne = run_side(&scenarios[i], 1, engine);
+      const int same = same_stream(&scenarios[i], kernel[i], nk[i], engine, ne);
+      printf("    %-46s %s\n", scenarios[i].what, same ? "same as the kernel" : "DIVERGED");
+      if (!same) {
+        failed = 1;
+        for (int j = 0; j < (nk[i] > ne ? nk[i] : ne); j++) {
+          printf("      [%d] kernel", j);
+          if (j < nk[i])
+            printf(" data=%llu res=%d flags=0x%x", kernel[i][j].user_data, kernel[i][j].res,
+                   kernel[i][j].flags);
+          else printf(" (nothing)");
+          printf("  engine");
+          if (j < ne)
+            printf(" data=%llu res=%d flags=0x%x", engine[j].user_data, engine[j].res,
+                   engine[j].flags);
+          else printf(" (nothing)");
+          printf("\n");
+        }
       }
     }
   }

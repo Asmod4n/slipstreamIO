@@ -28,6 +28,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/* POLLPRI has no filter of its own on every BSD, so it rides the read
+ * side: out-of-band arriving wakes EVFILT_READ, and the retry then
+ * reads what actually came. */
 static int kq_filter_of(short wait_events) {
   return (wait_events & POLLOUT) ? EVFILT_WRITE : EVFILT_READ;
 }

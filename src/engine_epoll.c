@@ -51,6 +51,7 @@ static uint32_t ep_events_of(short wait_events) {
   uint32_t e = 0;
   if (wait_events & POLLIN) e |= EPOLLIN;
   if (wait_events & POLLOUT) e |= EPOLLOUT;
+  if (wait_events & POLLPRI) e |= EPOLLPRI; /* out-of-band has its own bit here */
   return e;
 }
 
@@ -70,9 +71,26 @@ static struct ep_fd *ep_slot(struct slip_ring *r, int fd) {
 }
 
 /* Out of the set, and out of the cache with it. */
-static void ep_drop(struct slip_ring *r, struct ep_fd *slot, int fd) {
-  epoll_ctl(r->be_fd, EPOLL_CTL_DEL, fd, NULL);
-  slot->interest = 0;
+/* Stop asking about a direction nobody is waiting for. LEVEL TRIGGERED
+ * means a descriptor with bytes still in it is reported on EVERY wait,
+ * so a registration that outlives its ops does not go quiet - it
+ * spins. It stays quiet only while it is drained, and the caller is
+ * under no obligation to drain it: a recv that took half the bytes and
+ * completed leaves the rest sitting there.
+ *
+ * So the side that fired with nobody behind it loses its bit, and a
+ * descriptor that has no bits left leaves the set. Both cost one call,
+ * in the case that would otherwise burn the core, and the next park
+ * pays one to come back. */
+static void ep_quiet(struct slip_ring *r, struct ep_fd *slot, int fd, uint32_t unwanted) {
+  const uint32_t left = slot->interest & ~unwanted;
+  if (left == 0) {
+    epoll_ctl(r->be_fd, EPOLL_CTL_DEL, fd, NULL);
+    slot->interest = 0;
+    return;
+  }
+  struct epoll_event ev = { .events = left, .data.fd = fd };
+  if (epoll_ctl(r->be_fd, EPOLL_CTL_MOD, fd, &ev) == 0) slot->interest = left;
 }
 
 static int epoll_open_ring(struct slip_ring *r) {
@@ -185,7 +203,6 @@ static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned 
      * An error or a hangup wakes both sides - what it means is what
      * the retry finds out, the way poll reports them regardless. */
     const int broken = (evs[e].events & (EPOLLERR | EPOLLHUP)) != 0;
-    const unsigned before = n;
     if ((evs[e].events & EPOLLIN) || broken) {
       for (struct eng_op *op = slot->in; op != NULL && n < SLIP_WAITING_MAX; op = op->next)
         ready[n++] = op;
@@ -194,11 +211,15 @@ static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned 
       for (struct eng_op *op = slot->out; op != NULL && n < SLIP_WAITING_MAX; op = op->next)
         ready[n++] = op;
     }
-    /* Ready, with nobody waiting for it: a registration that outlived
-     * its ops. Left in place it would be reported on every wait and
-     * spin, so it goes now - and returns the moment something parks. */
-    if (n == before && slot->in == NULL && slot->out == NULL)
-      ep_drop(r, slot, evs[e].data.fd);
+    /* Whatever fired with nobody behind it is asked about no further -
+     * per SIDE, because one registration carries both and a writer
+     * waiting on a socket that still holds unread bytes would otherwise
+     * be woken about those bytes forever. */
+    uint32_t unwanted = 0;
+    if ((evs[e].events & EPOLLIN) && slot->in == NULL) unwanted |= EPOLLIN | EPOLLPRI;
+    if ((evs[e].events & EPOLLOUT) && slot->out == NULL) unwanted |= EPOLLOUT;
+    if (broken && slot->in == NULL && slot->out == NULL) unwanted = slot->interest;
+    if (unwanted != 0) ep_quiet(r, slot, evs[e].data.fd, unwanted);
   }
   return slip_posix_finish_ready(r, ready, n, out, max);
 }
