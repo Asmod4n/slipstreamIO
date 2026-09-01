@@ -101,18 +101,10 @@ drains wherever the lock is already held.
 
 ### macOS gets GCD, in the readiness family - because io_uring is
 
-macOS gets GCD because GCD is the API Apple supports. That is the whole
-reason, and it does not depend on what is underneath: a dispatch source
-on Darwin IS a kevent, so this is not a route around kqueue - it is a
-route around OUR OWN use of it, onto the surface Apple maintains, tests
-and runs everything else on. Whatever breaks under a supported API is
-Apple's to fix; whatever breaks under raw kqueue is ours to work
-around, and operational experience says there is a steady supply of
-that on macOS specifically. kqueue stays the native, maintained thing
-on the real BSDs, where it is what the platform supports.
-
-Readiness, not completion, and the reason is the only one that decides
-anything here: io_uring itself is a
+kqueue on macOS is unreliable in practice (operational experience); it
+is the native, maintained thing on the real BSDs and nowhere else. So
+macOS gets GCD - but as READINESS, not as a completion backend, and the
+reason is the only one that decides anything here: io_uring itself is a
 readiness engine wearing completions. It TRIES the op and only what
 answers EAGAIN waits for the descriptor. A dispatch source says exactly
 that, so the source's handler notes which descriptor woke and knocks;
