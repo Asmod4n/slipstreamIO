@@ -18,10 +18,8 @@ The decision between kernel and engine is made at runtime, by asking
 the kernel: attempt `io_uring_setup(2)` at first use. Version numbers
 cannot answer it — seccomp and `kernel.io_uring_disabled` say no on
 kernels whose version says yes, and a container builds where another
-machine runs. This reverses an earlier doctrine of this file ("the
-choice is made at build time, and never at runtime"), and the seam is
-what dissolved the old objections: both sides are the same symbols in
-the same binary — the wrappers — so nothing needs two linked
+machine runs. The seam is what makes it cheap: both sides are the same
+symbols in the same binary — the wrappers — so nothing needs two linked
 implementations of liburing's names, and nothing needs dlopen to be
 CORRECT. `slipstream_syscall_set_engine(int)` remains for a caller that
 wants to choose explicitly; a wrong flag is refused with words.
@@ -99,26 +97,14 @@ caller moves the head on its own, so free CQ room is recomputed, never
 tracked, and completions the CQ had no room for wait in a backlog that
 drains wherever the lock is already held.
 
-### macOS gets GCD, in the readiness family - because io_uring is
+### macOS gets GCD, in the readiness family
 
-kqueue on macOS is unreliable in practice (operational experience); it
-is the native, maintained thing on the real BSDs and nowhere else. So
-macOS gets GCD - but as READINESS, not as a completion backend, and the
-reason is the only one that decides anything here: io_uring itself is a
-readiness engine wearing completions. It TRIES the op and only what
-answers EAGAIN waits for the descriptor. A dispatch source says exactly
-that, so the source's handler notes which descriptor woke and knocks;
-the op runs on the submitter's thread through the SAME shared machinery
-every other backend uses, and macOS therefore answers the same opcodes,
-with the same results, as Linux.
-
-The completion-family version of this backend is what that replaced,
-and what was wrong with it is worth keeping written down: dispatch_io
-DOES run the IO and report the outcome, which is why it looked like the
-right shape - but a channel has no word for most of io_uring, so the
-backend carried seven opcodes and answered -EOPNOTSUPP to the rest.
-parity measured it: 17 of 24 scenarios, seven DIVERGED. A smaller
-io_uring on macOS is the one thing this project may not ship.
+io_uring is a readiness engine wearing completions: it TRIES the op and
+only what answers EAGAIN waits for the descriptor. A dispatch source
+says exactly that, so the source's handler notes which descriptor woke
+and knocks; the op runs on the submitter's thread through the SAME
+shared machinery every other backend uses, and macOS therefore answers
+the same opcodes, with the same results, as Linux.
 
 What has no readiness to wait for still goes to GCD, never to a thread
 of ours: a positioned read or write on a regular file becomes a
@@ -221,11 +207,6 @@ implementation - the factor-once rule, kept. Open remains:
   Mac.
 - OpenBSD/NetBSD/DragonFly: the kqueue backend compiles for them by
   guard; no VM run yet - test/freebsd_vm.sh is the template.
-- Two doctrines fell here, in order: "macOS gets select" became "macOS
-  gets dispatch_io in the completion family", and that became "macOS
-  gets dispatch sources in the readiness family" the moment parity
-  measured what the completion shape could not say - seven of 24
-  scenarios. All four backends now read 24/24 against the kernel.
 
 ### 5. The operations are still Linux syscalls
 

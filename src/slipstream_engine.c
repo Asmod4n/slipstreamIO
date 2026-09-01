@@ -43,7 +43,7 @@ static const struct eng_backend *backend_default(void) {
 #if defined(_WIN32)
   return &slip_backend_iocp;
 #elif defined(__APPLE__)
-  return &slip_backend_dispatch; /* kqueue is ruled out there - TASKS.md */
+  return &slip_backend_dispatch;
 #elif defined(__linux__)
   return &slip_backend_epoll;
 #elif defined(__FreeBSD__) || defined(__DragonFly__) || defined(__NetBSD__) || \

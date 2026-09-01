@@ -4,10 +4,7 @@
  * says exactly that, so the source's handler does NOT run anything - it
  * notes which descriptor woke and signals the semaphore, and the op
  * itself runs on the submitter's thread through the SAME shared
- * machinery every other backend uses. That is the whole point: one
- * behaviour, every platform. A backend that answered fewer opcodes
- * because its API had no word for them would be a different io_uring
- * on macOS, which is the one thing this project may not ship.
+ * machinery every other backend uses.
  *
  * What has no readiness to wait for - a positioned read on a regular
  * file, a connect, an openat - goes to GCD, never to a thread of ours:
