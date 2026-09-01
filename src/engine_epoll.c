@@ -136,6 +136,14 @@ static int epoll_arm(struct slip_ring *r, struct eng_op *op) {
   struct ep_fd *slot = ep_slot(r, op->sqe.fd);
   if (slot == NULL) return -1;
   const uint32_t want = ep_events_of(op->wait_events);
+  /* A registration is only as trustworthy as the parking behind it.
+   * While an op waits on this descriptor it cannot have been closed
+   * without that being the caller's own bug, so what the kernel was
+   * told still holds and re-telling it is waste. Once nothing waits,
+   * the descriptor may close and its NUMBER may come back as something
+   * else entirely - and nobody tells us. So an idle table entry is a
+   * hint, not a fact, and the next park registers again. */
+  const int idle = slot->in == NULL && slot->out == NULL;
 
   /* The op joins its side of this descriptor - that is what makes a
    * delivery answerable without searching for it later. */
@@ -143,7 +151,8 @@ static int epoll_arm(struct slip_ring *r, struct eng_op *op) {
   op->next = *side;
   *side = op;
 
-  if (slot->interest != 0 && (slot->interest & want) == want) return 0;
+  if (!idle && slot->interest != 0 && (slot->interest & want) == want) return 0;
+  if (idle) slot->interest = 0; /* whatever it said, it said it about another file */
 
   const uint32_t merged = slot->interest | want;
   struct epoll_event ev = { .events = merged, .data.fd = op->sqe.fd };
@@ -224,6 +233,16 @@ static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned 
   return slip_posix_finish_ready(r, ready, n, out, max);
 }
 
+/* The descriptor is closing: the kernel drops it from the set on the
+ * last close, so only this table has to be told. */
+static void epoll_forget(struct slip_ring *r, int fd) {
+  struct ep_fd *slot = ep_slot(r, fd);
+  if (slot == NULL) return;
+  slot->interest = 0;
+  slot->in = NULL;
+  slot->out = NULL;
+}
+
 const struct eng_backend slip_backend_epoll = {
   .name = "epoll",
   .open_ring = epoll_open_ring,
@@ -234,6 +253,7 @@ const struct eng_backend slip_backend_epoll = {
   .carried_ops = slip_posix_carried_ops,
   .arm = epoll_arm,
   .disarm = epoll_disarm,
+  .forget = epoll_forget,
 };
 
 #else

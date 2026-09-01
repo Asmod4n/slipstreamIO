@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "slipstream_engine.h" /* the backend switch: every one of them is measured */
 #include "slipstream_syscall.h"
 
 static int failed;

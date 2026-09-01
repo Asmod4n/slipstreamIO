@@ -99,18 +99,49 @@ caller moves the head on its own, so free CQ room is recomputed, never
 tracked, and completions the CQ had no room for wait in a backlog that
 drains wherever the lock is already held.
 
-### macOS gets dispatch_io, in the completion family
+### macOS gets GCD, in the readiness family - because io_uring is
 
 kqueue on macOS is unreliable in practice (operational experience); it
-is the native, maintained thing on the real BSDs and nowhere else.
-select fell first, then dispatch_source too: dispatch_io DOES what
-io_uring does - it runs the IO and reports the outcome - so the macOS
-backend sits beside iocp in the completion family instead of
-interpreting readiness. The flags objection that briefly picked
-dispatch_source resolves cleanly: recv/send WITH flags have no dispatch
-spelling and run on the worker, blocking where blocking belongs;
-everything else rides real channels, cancellable at close via
-DISPATCH_IO_STOP, short reads kept via a low water mark of 1.
+is the native, maintained thing on the real BSDs and nowhere else. So
+macOS gets GCD - but as READINESS, not as a completion backend, and the
+reason is the only one that decides anything here: io_uring itself is a
+readiness engine wearing completions. It TRIES the op and only what
+answers EAGAIN waits for the descriptor. A dispatch source says exactly
+that, so the source's handler notes which descriptor woke and knocks;
+the op runs on the submitter's thread through the SAME shared machinery
+every other backend uses, and macOS therefore answers the same opcodes,
+with the same results, as Linux.
+
+The completion-family version of this backend is what that replaced,
+and what was wrong with it is worth keeping written down: dispatch_io
+DOES run the IO and report the outcome, which is why it looked like the
+right shape - but a channel has no word for most of io_uring, so the
+backend carried seven opcodes and answered -EOPNOTSUPP to the rest.
+parity measured it: 17 of 24 scenarios, seven DIVERGED. A smaller
+io_uring on macOS is the one thing this project may not ship.
+
+What has no readiness to wait for still goes to GCD, never to a thread
+of ours: a positioned read or write on a regular file becomes a
+dispatch_io channel - completing when the request is DONE, the way
+read(2) on a regular file does, not on a low water mark of 1 - and
+everything else (connect, openat, a read at the descriptor's own
+offset) runs the plain blocking call on the global concurrent queue,
+which is where io_uring puts the same ops too. Both come back through
+done[] and are handed out by wait on the submitter's thread, so the
+core settles chains the ordinary way.
+
+Two sharp edges, both measured:
+  - Sources are made when a descriptor's side gains its first waiter
+    and cancelled when it loses its last. A FRESH registration is the
+    one guaranteed to report readiness that is already there; a source
+    kept across an idle period is not.
+  - The wait's semaphore is signalled on the TRANSITION to "something
+    to collect", never per event. A counting semaphore hands out one
+    surplus wakeup per event already answered, and a wakeup with
+    nothing behind it is not free: enter has one pass, so it turns a
+    caller's deadline into -ETIME on the spot. The deadline scene in
+    test/backends.c answered -ETIME immediately instead of at the
+    deadline, which is how this was found.
 
 ### liburing.h's LP64 assumption stays visible
 
@@ -190,9 +221,11 @@ implementation - the factor-once rule, kept. Open remains:
   Mac.
 - OpenBSD/NetBSD/DragonFly: the kqueue backend compiles for them by
   guard; no VM run yet - test/freebsd_vm.sh is the template.
-- An earlier doctrine fell with this work: "macOS gets select" became
-  "macOS gets dispatch_source"; dispatch_io itself cannot carry
-  recv/send flags and was refused for that stated reason.
+- Two doctrines fell here, in order: "macOS gets select" became "macOS
+  gets dispatch_io in the completion family", and that became "macOS
+  gets dispatch sources in the readiness family" the moment parity
+  measured what the completion shape could not say - seven of 24
+  scenarios. All four backends now read 24/24 against the kernel.
 
 ### 5. The operations are still Linux syscalls
 

@@ -131,8 +131,29 @@ cc -O2 -I"$work/out/include" -I"$here/src" -I"$here/test" -o "$work/blocked" \
 "$work/blocked"
 
 # The behavior, not only the API: the same scenarios against the kernel
-# and against the engine, compared field for field - test/parity.c, the
+# and against the engine, compared field for field - test/parity.c, with
 # the kernel's own answers to compare against.
-cc -O2 -I"$work/out/include" -I"$here/src" -o "$work/parity" \
-   "$here/test/parity.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here"/src/slipstream_engine.c "$here"/src/engine_*.c
+#
+# EVERY BACKEND THIS HOST CAN CARRY goes into the one binary, so one run
+# holds all of them to the same kernel. libkqueue and
+# swift-corelibs-libdispatch are how kqueue and dispatch are reached off
+# their home platforms - the same adapters test/backends_adapters.sh
+# uses, and the backend sources are what a FreeBSD or a Mac compiles.
+# Without them parity says so per backend and measures the rest.
+par_cc=cc
+par_flags=""
+par_libs=""
+if kq_flags=$(pkg-config --cflags --libs libkqueue 2>/dev/null); then
+  par_flags="$par_flags -DSLIPSTREAM_HAVE_LIBKQUEUE $kq_flags"
+  par_libs="$par_libs $kq_flags"
+fi
+ld=${LIBDISPATCH_BUILD:-$HOME/swift-corelibs-libdispatch}
+if command -v clang >/dev/null 2>&1 && [ -f "$ld/build/src/libdispatch.a" ]; then
+  # dispatch_io speaks blocks, which only clang compiles.
+  par_cc=clang
+  par_flags="$par_flags -fblocks -DSLIPSTREAM_HAVE_LIBDISPATCH -I$ld -I$ld/build"
+  par_libs="$par_libs $ld/build/src/libdispatch.a $ld/build/src/BlocksRuntime/libBlocksRuntime.a -lpthread -lstdc++"
+fi
+$par_cc -O2 -I"$work/out/include" -I"$here/src" $par_flags -o "$work/parity" \
+   "$here/test/parity.c" src/liburing.a "$here/src/slipstream_syscall.c" "$here"/src/slipstream_engine.c "$here"/src/engine_*.c $par_libs
 "$work/parity"

@@ -162,6 +162,20 @@ struct eng_backend {
    * backend whose execute never parks leaves them NULL. */
   int (*arm)(struct slip_ring *r, struct eng_op *op);
   void (*disarm)(struct slip_ring *r, struct eng_op *op);
+  /* An op with no readiness to wait for - a regular file, a connect, an
+   * openat - and therefore one that has to run somewhere it may block.
+   * A backend that brings its own place for that (dispatch hands it to
+   * GCD, which is the platform's own work queue) says so here; the rest
+   * leave it NULL and the shared worker thread runs it. Whoever takes
+   * it owes the op a completion through the backend's own wait. */
+  void (*submit_blocking)(struct slip_ring *r, struct eng_op *op);
+  /* A descriptor is gone - closed by an op, or handed back by the fixed
+   * table. A backend that remembers descriptors between ops has to
+   * forget this one HERE: the number comes back, and a table that still
+   * claims it is registered would skip the registration the new one
+   * needs and park it forever. Backends that remember nothing leave
+   * this NULL. */
+  void (*forget)(struct slip_ring *r, int fd);
   /* The opcodes this backend actually runs, 255-terminated (every real
    * opcode is below IORING_OP_LAST) - what REGISTER_PROBE reports, so
    * the probe tells the truth per backend instead of a flattering
@@ -204,12 +218,24 @@ void slip_native_fd_close(int fd);
  * else - the poke pipe, the DONTWAIT-guarded try, parking mirrored via
  * arm/disarm, the retry, the worker for regular files. A backend of
  * this family is only its wakeup.
- * COMPLETION (iocp, dispatch_io): the OS RUNS the op and reports the
- * outcome - the same shape io_uring itself has. Nothing parks; execute
- * issues, wait translates results, arm/disarm stay NULL. The worker
- * still serves what the platform API cannot spell (recv flags under
- * dispatch). */
+ * COMPLETION (iocp): the OS RUNS the op and reports the outcome - the
+ * same shape io_uring itself has. Nothing parks; execute issues, wait
+ * translates results, arm/disarm stay NULL.
+ * dispatch is the readiness family wearing GCD: a dispatch source says
+ * "ready" and the SAME shared machinery runs the op, so macOS answers
+ * what every other backend answers. What has no readiness goes to GCD's
+ * own queues through submit_blocking - a dispatch_io channel for a
+ * positioned file read, the global concurrent queue for the rest - and
+ * never to a thread of this engine's. */
 #ifndef _WIN32
+/* What one attempt at an op answered: finished, would block (park it on
+ * wait_events), or has no readiness to wait for and needs running
+ * somewhere that may block. The completion family reaches for this
+ * wherever its own machinery has no spelling for an op - a socket() is
+ * a socket() whichever backend is underneath. */
+enum eng_verdict { ENG_RAN, ENG_PARK, ENG_FILE };
+enum eng_verdict slip_posix_try(struct slip_ring *r, struct eng_op *op, int *res_out);
+
 int slip_posix_ctl_open(struct slip_ring *r);
 void slip_posix_ctl_close(struct slip_ring *r);
 void slip_posix_ctl_drain(struct slip_ring *r);
@@ -222,6 +248,11 @@ int slip_posix_finish_ready(struct slip_ring *r, struct eng_op **ready, unsigned
  * flags) but whose platform can still run it correctly off the engine
  * thread. */
 void slip_posix_hand_to_worker(struct slip_ring *r, struct eng_op *op);
+/* The blocking spelling of one op - read/write on a regular file,
+ * connect, openat - run to the end, errno already turned into the
+ * negative the CQE carries. The shared worker calls it; so does a
+ * backend that brought its own place to block. */
+int slip_posix_run_blocking(const struct io_uring_sqe *s);
 /* The socket commands (IORING_OP_URING_CMD, SOCKET_URING_OP_*): plain
  * syscalls, so the completion family answers them from here too. */
 int slip_posix_cmd_sock(const struct io_uring_sqe *s);

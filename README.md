@@ -97,7 +97,13 @@ shared machine (`src/engine_posix.c`) does everything else:
   for on Linux at all: io_uring refused at runtime
 - `kqueue` — the BSDs; proven natively by `test/freebsd_vm.sh` and on
   Linux through libkqueue (`test/backends_adapters.sh`)
-- `poll` — the POSIX baseline, always compiled
+- `select` — the floor, always compiled: every platform has it
+- `dispatch` — macOS' default: a dispatch source per parked side says
+  "ready" and the same shared machine runs the op, so macOS answers
+  every opcode Linux does. What has no readiness goes to GCD and never
+  to a thread of ours - a positioned file read or write to a
+  `dispatch_io` channel, connect/openat to the global concurrent queue.
+  Proven against Apple's own swift-corelibs-libdispatch
 
 COMPLETION - the OS runs the op and reports the outcome, the same
 shape io_uring itself has; nothing parks:
@@ -105,17 +111,14 @@ shape io_uring itself has; nothing parks:
 - `iocp` — Windows: ops fly as overlapped and the port reports them
   done; proven as a MinGW binary under Wine (`test/backends_wine.sh`),
   with a thrd/mtx/cnd shim because MinGW ships no `<threads.h>`
-- `dispatch` — macOS' default: real `dispatch_io` channels, because GCD
-  then does what uring does - runs the IO and hands back results. Short
-  reads kept (low water 1, first delivery completes), channels stopped
-  cancellable at close; recv/send WITH flags have no dispatch spelling
-  and run on the worker instead. Proven against Apple's own
-  swift-corelibs-libdispatch
 
 `test/backends.c` drives every carried backend through the same scenes
 - inline NOP, a pending recv that enter must not wait for, `-ETIME`
-after a real deadline. Still named next: overlapped file IO on Windows
-(a CRT descriptor's handle is not `FILE_FLAG_OVERLAPPED`), and a native
+after a real deadline - and `test/parity.c` holds each of them to the
+KERNEL's own answers over 24 scenarios, field for field. select,
+epoll, kqueue and dispatch read 24/24. Still named next: overlapped
+file IO on Windows (a CRT descriptor's handle is not
+`FILE_FLAG_OVERLAPPED`), the socket commands under iocp, and a native
 macOS run, which needs a Mac.
 
 ## Tests

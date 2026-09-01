@@ -123,7 +123,11 @@ void slip_posix_poke(struct slip_ring *r) {
  * Three answers: done, would-block (park it with these events), or file
  * (a regular file has no readiness to poll for - the worker runs it). */
 
-enum verdict { RAN, PARK, FILE_OP };
+/* The names are the header's now - see enum eng_verdict there. */
+#define RAN ENG_RAN
+#define PARK ENG_PARK
+#define FILE_OP ENG_FILE
+#define verdict eng_verdict
 
 /* liburing spells "wherever the descriptor stands" as an offset of -1,
  * and that is the only spelling answered with read/write rather than
@@ -242,7 +246,7 @@ static int accept_one(const struct io_uring_sqe *s) {
  * completed here - it goes back to the parked set and the LAST word is
  * the one that returns RAN, without F_MORE, exactly as the kernel ends a
  * multishot. */
-static enum verdict run_accept_multishot(struct slip_ring *r, struct eng_op *op,
+static enum eng_verdict run_accept_multishot(struct slip_ring *r, struct eng_op *op,
                                          int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   for (;;) {
@@ -265,7 +269,7 @@ static enum verdict run_accept_multishot(struct slip_ring *r, struct eng_op *op,
   }
 }
 
-static enum verdict run_recv_multishot(struct slip_ring *r, struct eng_op *op,
+static enum eng_verdict run_recv_multishot(struct slip_ring *r, struct eng_op *op,
                                        int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   for (;;) {
@@ -391,7 +395,7 @@ static short revents_now(int fd, short events) {
 }
 #endif
 
-static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out) {
+enum eng_verdict slip_posix_try(struct slip_ring *r, struct eng_op *op, int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   void *buf = (void *) (uintptr_t) s->addr;
   ssize_t n;
@@ -411,9 +415,11 @@ static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out
           return RAN;
         }
         slip_fixed_clear(r, slot);
+        if (r->be->forget != NULL) r->be->forget(r, real);
         *res_out = close(real) < 0 ? -errno : 0;
         return RAN;
       }
+      if (r->be->forget != NULL) r->be->forget(r, s->fd);
       n = close(s->fd);
       *res_out = n < 0 ? -errno : 0;
       return RAN;
@@ -631,7 +637,7 @@ static enum verdict run_one(struct slip_ring *r, struct eng_op *op, int *res_out
  * Blocking is the point: this thread exists so that the engine's wait
  * loop never does. */
 
-static int run_file_op(const struct io_uring_sqe *s) {
+int slip_posix_run_blocking(const struct io_uring_sqe *s) {
   void *buf = (void *) (uintptr_t) s->addr;
   ssize_t n;
   switch (s->opcode) {
@@ -689,7 +695,7 @@ static int worker_main(void *arg) {
     if (r->wq_head == NULL) r->wq_tail = NULL;
     mtx_unlock(&r->mtx);
 
-    const int res = run_file_op(&op->sqe);
+    const int res = slip_posix_run_blocking(&op->sqe);
     const int stalls = op->stalls_queue;
     if (stalls) {
       /* The ticket goes up before post frees the op. The engine only
@@ -848,7 +854,7 @@ int slip_posix_execute(struct slip_ring *r, struct eng_op *op, int *res) {
     *res = cancel_matching(r, op);
     return EXEC_DONE;
   }
-  switch (run_one(r, op, res)) {
+  switch (slip_posix_try(r, op, res)) {
     case RAN:
       return EXEC_DONE;
     case PARK:
@@ -856,7 +862,11 @@ int slip_posix_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       *res = -EBUSY; /* a full waiting set is refused, not dropped */
       return EXEC_DONE;
     case FILE_OP:
-      slip_posix_hand_to_worker(r, op);
+      /* A backend that brought its own place to block uses it; the rest
+       * share the one worker thread. Either way the op is gone from
+       * here and comes back as a completion. */
+      if (r->be->submit_blocking != NULL) r->be->submit_blocking(r, op);
+      else slip_posix_hand_to_worker(r, op);
       return EXEC_PENDING;
   }
   *res = -EINVAL;
@@ -870,7 +880,7 @@ int slip_posix_finish_ready(struct slip_ring *r, struct eng_op **ready, unsigned
     struct eng_op *op = ready[i];
     unpark(r, op);
     int res = 0;
-    enum verdict v = run_one(r, op, &res);
+    enum eng_verdict v = slip_posix_try(r, op, &res);
     if (v == FILE_OP) { /* a parked op never becomes a file op */
       v = RAN;
       res = -EOPNOTSUPP;

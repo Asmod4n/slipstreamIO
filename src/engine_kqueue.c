@@ -107,9 +107,19 @@ static int kqueue_arm(struct slip_ring *r, struct eng_op *op) {
   const int writing = (op->wait_events & POLLOUT) != 0;
   struct eng_op **side = writing ? &slot->out : &slot->in;
   int *armed = writing ? &slot->armed_write : &slot->armed_read;
+  /* Only trustworthy while someone is parked on this descriptor - see
+   * the same rule in the epoll backend. An idle entry may be talking
+   * about a file that closed and a number that came back, and kqueue
+   * has no error to answer that with: a skipped EV_ADD is silent, and
+   * the op waits forever. parity hung on exactly that. */
+  const int idle = slot->in == NULL && slot->out == NULL;
+  if (idle) {
+    slot->armed_read = 0;
+    slot->armed_write = 0;
+  }
   op->next = *side;
   *side = op;
-  if (*armed) return 0; /* the knote is already there */
+  if (*armed) return 0; /* the knote is there, and vouched for */
 
   struct kevent ev;
   EV_SET(&ev, (uintptr_t) op->sqe.fd, kq_filter_of(op->wait_events), EV_ADD, 0, 0, NULL);
@@ -178,6 +188,21 @@ static int kqueue_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
   return slip_posix_finish_ready(r, ready, n, out, max);
 }
 
+/* The descriptor is closing: kqueue drops its knotes on the last close,
+ * so only this table has to be told - and it MUST be, because nothing
+ * else would notice. epoll survives a stale entry because EPOLL_CTL_MOD
+ * answers -ENOENT; a skipped EV_ADD answers nothing at all, and the op
+ * that needed it waits forever. Found exactly that way, by parity
+ * hanging on the tenth scenario. */
+static void kqueue_forget(struct slip_ring *r, int fd) {
+  struct kq_fd *slot = kq_slot(r, fd);
+  if (slot == NULL) return;
+  slot->armed_read = 0;
+  slot->armed_write = 0;
+  slot->in = NULL;
+  slot->out = NULL;
+}
+
 const struct eng_backend slip_backend_kqueue = {
   .name = "kqueue",
   .open_ring = kqueue_open_ring,
@@ -188,6 +213,7 @@ const struct eng_backend slip_backend_kqueue = {
   .carried_ops = slip_posix_carried_ops,
   .arm = kqueue_arm,
   .disarm = kqueue_disarm,
+  .forget = kqueue_forget,
 };
 
 #else
