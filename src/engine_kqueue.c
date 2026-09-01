@@ -159,7 +159,7 @@ static int kqueue_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
   const int got = kevent(r->be_fd, NULL, 0, evs, 64, timeout_ms >= 0 ? &ts : NULL);
   if (got < 0) return 0; /* EINTR: a harmless drain */
 
-  struct eng_op *ready[SLIP_WAITING_MAX];
+  struct eng_op **ready = r->ready;
   unsigned n = 0;
   for (int e = 0; e < got; e++) {
     if ((int) evs[e].ident == r->ctl_r && evs[e].filter == EVFILT_READ) {
@@ -174,7 +174,7 @@ static int kqueue_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
     const int writing = evs[e].filter == EVFILT_WRITE;
     struct eng_op **side = writing ? &slot->out : &slot->in;
     const unsigned before = n;
-    for (struct eng_op *op = *side; op != NULL && n < SLIP_WAITING_MAX; op = op->next)
+    for (struct eng_op *op = *side; op != NULL && n < r->op_pool_n; op = op->next)
       ready[n++] = op;
     /* Woken with nobody behind it: a knote that outlived its ops. */
     if (n == before) {

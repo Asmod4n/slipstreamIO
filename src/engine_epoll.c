@@ -199,7 +199,7 @@ static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned 
   const int got = epoll_wait(r->be_fd, evs, 64, timeout_ms);
   if (got < 0) return 0; /* EINTR: a harmless drain */
 
-  struct eng_op *ready[SLIP_WAITING_MAX];
+  struct eng_op **ready = r->ready;
   unsigned n = 0;
   for (int e = 0; e < got; e++) {
     if (evs[e].data.fd == r->ctl_r) {
@@ -213,11 +213,11 @@ static int epoll_wait_ready(struct slip_ring *r, struct eng_done *out, unsigned 
      * the retry finds out, the way poll reports them regardless. */
     const int broken = (evs[e].events & (EPOLLERR | EPOLLHUP)) != 0;
     if ((evs[e].events & EPOLLIN) || broken) {
-      for (struct eng_op *op = slot->in; op != NULL && n < SLIP_WAITING_MAX; op = op->next)
+      for (struct eng_op *op = slot->in; op != NULL && n < r->op_pool_n; op = op->next)
         ready[n++] = op;
     }
     if ((evs[e].events & EPOLLOUT) || broken) {
-      for (struct eng_op *op = slot->out; op != NULL && n < SLIP_WAITING_MAX; op = op->next)
+      for (struct eng_op *op = slot->out; op != NULL && n < r->op_pool_n; op = op->next)
         ready[n++] = op;
     }
     /* Whatever fired with nobody behind it is asked about no further -

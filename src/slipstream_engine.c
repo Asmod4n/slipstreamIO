@@ -412,7 +412,9 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   const size_t cq_part = block_align(r->cq_size);
   const size_t sqes_part = block_align(r->sqes_size);
   const size_t ops_part = block_align((size_t) r->op_pool_n * sizeof(struct eng_op));
-  r->block_size = sq_part + cq_part + sqes_part + ops_part;
+  const size_t ptrs_part = block_align((size_t) r->op_pool_n * sizeof(struct eng_op *));
+  const size_t done_part = block_align((size_t) r->op_pool_n * sizeof(struct eng_done));
+  r->block_size = sq_part + cq_part + sqes_part + ops_part + 2 * ptrs_part + done_part;
   r->block = calloc(1, r->block_size);
   if (r->block != NULL) {
     char *at = r->block;
@@ -423,6 +425,12 @@ int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
     r->sqes = (struct io_uring_sqe *) at;
     at += sqes_part;
     r->op_pool = (struct eng_op *) at;
+    at += ops_part;
+    r->waiting = (struct eng_op **) at;
+    at += ptrs_part;
+    r->ready = (struct eng_op **) at;
+    at += ptrs_part;
+    r->done = (struct eng_done *) at;
     for (unsigned i = r->op_pool_n; i-- > 0;) {
       r->op_pool[i].next = r->op_free;
       r->op_free = &r->op_pool[i];
@@ -753,10 +761,9 @@ int slipstream_engine_enter(int fd, unsigned int to_submit, unsigned int min_com
         if (left <= 0) return -ETIME;
         timeout_ms = left > 0x7fffffff ? 0x7fffffff : (int) left;
       }
-      struct eng_done done[SLIP_WAITING_MAX];
-      const int n = r->be->wait(r, done, SLIP_WAITING_MAX, timeout_ms);
+      const int n = r->be->wait(r, r->done, r->op_pool_n, timeout_ms);
       if (n < 0) return -EBADF;
-      for (int i = 0; i < n; i++) complete(r, done[i].op, done[i].res);
+      for (int i = 0; i < n; i++) complete(r, r->done[i].op, r->done[i].res);
       process_queue(r); /* a settled chain may have more to run now */
       settle_worker_ticket(r);
       avail = __atomic_load_n(&cq->tail, __ATOMIC_ACQUIRE) -

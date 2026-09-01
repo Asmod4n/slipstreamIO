@@ -70,9 +70,9 @@ static int select_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
   /* select answers in the sets it was given, so the parked ops are
    * walked once to read the answer off. There is nowhere else to put
    * it - an fd_set has no room for who was waiting. */
-  struct eng_op *ready[SLIP_WAITING_MAX];
+  struct eng_op **ready = r->ready;
   unsigned n = 0;
-  for (unsigned i = 0; i < r->waiting_n && n < SLIP_WAITING_MAX; i++) {
+  for (unsigned i = 0; i < r->waiting_n; i++) {
     struct eng_op *op = r->waiting[i];
     const int fd = op->sqe.fd;
     if (fd < 0 || fd >= FD_SETSIZE) continue;

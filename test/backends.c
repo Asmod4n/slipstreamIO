@@ -80,9 +80,9 @@ struct drv {
   struct io_uring_sqe *sqes;
 };
 
-static int ring_open(struct drv *d) {
+static int ring_open_n(struct drv *d, unsigned entries) {
   memset(d, 0, sizeof(*d));
-  d->fd = slipstream_engine_setup(4, &d->p);
+  d->fd = slipstream_engine_setup(entries, &d->p);
   if (d->fd < 0) return d->fd;
   d->sqr = slipstream_engine_mmap(d->p.sq_off.array + d->p.sq_entries * sizeof(unsigned),
                                   d->fd, IORING_OFF_SQ_RING);
@@ -92,6 +92,8 @@ static int ring_open(struct drv *d) {
                                    d->fd, IORING_OFF_SQES);
   return (d->sqr && d->cqr && d->sqes) ? 0 : -1;
 }
+
+static int ring_open(struct drv *d) { return ring_open_n(d, 4); }
 
 static struct io_uring_sqe *push(struct drv *d, __u8 opcode, int fd, void *addr,
                                  unsigned len, __u64 off, __u64 user_data) {
@@ -213,6 +215,37 @@ static void scenes(const char *name) {
           "and hands back the same address the plain call does");
   }
 #endif
+
+  /* 5: the parked set is bounded by the OP POOL, which is what the
+   * caller sized the ring to - not by a constant. A ring asked for more
+   * holds more, and nothing is ever refused with -EBUSY, which no
+   * io_uring answers to anything. They park on ONE descriptor on
+   * purpose: it is the parked SET being measured, not how many files
+   * the platform can watch. */
+  {
+    struct drv big;
+    static char sink[1500][4];
+    const unsigned many = (unsigned) (sizeof(sink) / sizeof(sink[0]));
+    if (ring_open_n(&big, 2048) == 0) {
+      int bp[2] = { -1, -1 };
+      check(pair_of_streams(bp) == 0, "a socketpair for the parked set");
+      for (unsigned i = 0; i < many; i++)
+        push(&big, IORING_OP_RECV, bp[0], sink[i], sizeof(sink[0]), 0, 0x500 + i);
+      e = slipstream_engine_enter(big.fd, many, 0, 0, NULL, 0);
+      check(e == (int) many, "1500 recvs on one socket are all submitted");
+      int refused = 0;
+      while (cq_ready(&big) > 0)
+        if (cq_pop(&big)->res == -EBUSY) refused = 1;
+      check(!refused, "and none of them is refused - the 1024 ceiling is gone");
+      check(peer_write(bp[1], "x", 1) == 1, "the peer writes one byte");
+      e = slipstream_engine_enter(big.fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+      struct io_uring_cqe *bc = cq_pop(&big);
+      check(e == 0 && bc != NULL && bc->res == 1, "which completes one of them");
+      sock_close(bp[0]);
+      sock_close(bp[1]);
+      check(slipstream_engine_close(big.fd) == 0, "and that ring goes too");
+    }
+  }
 
   sock_close(sp[0]);
   sock_close(sp[1]);

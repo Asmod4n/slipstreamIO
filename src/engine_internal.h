@@ -33,7 +33,6 @@
 #endif
 
 #define SLIP_RINGS_MAX 64
-#define SLIP_WAITING_MAX 1024
 #define SLIP_BUFRINGS_MAX 16
 
 /* One submitted op, copied out of the caller's SQE slot so the slot is
@@ -98,8 +97,16 @@ struct slip_ring {
    * own thread, so these need no lock: io_uring's own single-issuer
    * shape, and the one this engine is used in. */
   struct eng_op *queue_head, *queue_tail; /* submitted, in order */
-  struct eng_op *waiting[SLIP_WAITING_MAX]; /* parked (readiness backends) */
+  /* Parked (readiness backends), and the two scratch arrays one wait
+   * fills: the ops a backend found ready, and the completions it hands
+   * back. All three are carved from the ring's own block and all three
+   * are op_pool_n long, because THAT is the bound - an op that exists
+   * came from the pool, so no more of them can be parked, ready or done
+   * at once than the pool holds. */
+  struct eng_op **waiting;
   unsigned waiting_n;
+  struct eng_op **ready;
+  struct eng_done *done;
   int chain_failed; /* a linked op failed: cancel the rest of its chain */
   struct eng_op *blocking; /* a linked op is pending somewhere; the queue waits */
 

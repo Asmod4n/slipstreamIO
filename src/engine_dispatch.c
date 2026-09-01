@@ -73,8 +73,10 @@ struct dsp_state {
   unsigned fds_n;
   int ready_head;
 
-  struct eng_done done[SLIP_WAITING_MAX];
-  unsigned done_n;
+  /* op_pool_n long, like the ring's own arrays: no more ops can be out
+   * on a GCD queue at once than the pool holds. */
+  struct eng_done *done;
+  unsigned done_n, done_max;
 
   /* Sources not yet finished cancelling, plus ops still out on a queue.
    * close_ring waits for this to reach zero: a handler that ran after
@@ -176,8 +178,15 @@ static int dsp_open_ring(struct slip_ring *r) {
     free(st);
     return -1;
   }
+  st->done = calloc(r->op_pool_n, sizeof(*st->done));
+  if (st->done == NULL) {
+    mtx_destroy(&st->mtx);
+    free(st);
+    return -1;
+  }
   st->q = dispatch_queue_create("slipstreamio.engine", DISPATCH_QUEUE_SERIAL);
   st->blocking = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+  st->done_max = r->op_pool_n;
   st->sem = dispatch_semaphore_create(0);
   st->gate = dispatch_semaphore_create(0);
   st->ready_head = -1;
@@ -214,6 +223,7 @@ static void dsp_close_ring(struct slip_ring *r) {
   dispatch_release(st->gate);
   mtx_destroy(&st->mtx);
   free(st->fds);
+  free(st->done);
   free(st);
   r->be_state = NULL;
 }
@@ -291,7 +301,7 @@ static void dsp_forget(struct slip_ring *r, int fd) {
 static void dsp_done(struct slip_ring *r, struct eng_op *op, int res) {
   struct dsp_state *st = r->be_state;
   mtx_lock(&st->mtx);
-  if (st->done_n < SLIP_WAITING_MAX) {
+  if (st->done_n < st->done_max) {
     st->done[st->done_n].op = op;
     st->done[st->done_n].res = res;
     st->done_n++;
@@ -400,7 +410,7 @@ static int dsp_wait(struct slip_ring *r, struct eng_done *out, unsigned max, int
                      : dispatch_time(DISPATCH_TIME_NOW, (int64_t) timeout_ms * NSEC_PER_MSEC);
   if (dispatch_semaphore_wait(st->sem, until) != 0) return 0; /* the deadline, not an event */
 
-  struct eng_op *ready[SLIP_WAITING_MAX];
+  struct eng_op **ready = r->ready;
   unsigned n = 0, rn = 0;
 
   mtx_lock(&st->mtx);
@@ -423,7 +433,7 @@ static int dsp_wait(struct slip_ring *r, struct eng_done *out, unsigned max, int
       for (struct eng_op *op = slot->in; op != NULL; op = op->next) want++;
     if (slot->wr_hit)
       for (struct eng_op *op = slot->out; op != NULL; op = op->next) want++;
-    if (rn + want > SLIP_WAITING_MAX) break; /* this one waits its turn */
+    if (rn + want > r->op_pool_n) break; /* this one waits its turn */
     if (slot->rd_hit) {
       slot->rd_hit = 0;
       for (struct eng_op *op = slot->in; op != NULL; op = op->next) ready[rn++] = op;

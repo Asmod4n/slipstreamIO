@@ -729,7 +729,12 @@ static void worker_start_once(struct slip_ring *r) {
 /* 1 if the op now waits with the backend armed; 0 if the set is full or
  * the backend refused. */
 static int park(struct slip_ring *r, struct eng_op *op) {
-  if (r->waiting_n >= SLIP_WAITING_MAX) return 0;
+  /* The pool is the bound, and it is already enforced where ops are
+   * born: submit stops when the free list is empty, the way the kernel
+   * stops at a full ring. So this cannot trip - it is the invariant
+   * written down where waiting[] is indexed, not a capacity of its
+   * own. */
+  if (r->waiting_n >= r->op_pool_n) return 0;
   if (r->be->arm(r, op) != 0) return 0;
   op->wait_slot = r->waiting_n;
   r->waiting[r->waiting_n++] = op;
@@ -859,7 +864,7 @@ int slip_posix_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       return EXEC_DONE;
     case PARK:
       if (park(r, op)) return EXEC_PENDING;
-      *res = -EBUSY; /* a full waiting set is refused, not dropped */
+      *res = -EBUSY; /* unreachable: see park() */
       return EXEC_DONE;
     case FILE_OP:
       /* A backend that brought its own place to block uses it; the rest
