@@ -57,15 +57,22 @@ static int pair_of_streams(int sp[2]) {
 static int peer_write(int fd, const void *buf, unsigned len) {
   return send((SOCKET) fd, buf, (int) len, 0);
 }
+static int peer_read(int fd, void *buf, unsigned len) {
+  return recv((SOCKET) fd, buf, (int) len, 0);
+}
 static void sock_close(int fd) { closesocket((SOCKET) fd); }
 #else
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 typedef int SOCKET_T;
 static int pair_of_streams(int sp[2]) { return socketpair(AF_UNIX, SOCK_STREAM, 0, sp); }
 static int peer_write(int fd, const void *buf, unsigned len) {
   return (int) write(fd, buf, len);
+}
+static int peer_read(int fd, void *buf, unsigned len) {
+  return (int) read(fd, buf, len);
 }
 static void sock_close(int fd) { close(fd); }
 #endif
@@ -202,8 +209,8 @@ static void scenes(const char *name) {
 
     /* accept and connect, against each other on the same ring. Both are
      * issued, so the ring holds two ops and both come back. */
-    int alen = (int) sizeof(a);
-    check(getsockname((SOCKET_T) lfd, (struct sockaddr *) &a, &alen) == 0,
+    socklen_t alen = (socklen_t) sizeof(a);
+    check(getsockname((SOCKET_T) lfd, (struct sockaddr *) &a, (void *) &alen) == 0,
           "the listener says which port it took");
 
     push(&d, IORING_OP_ACCEPT, lfd, NULL, 0, 0, 0x305);
@@ -232,9 +239,9 @@ static void scenes(const char *name) {
 
     /* And the accepted socket is a socket: it carries the peer. */
     struct sockaddr_in peer;
-    int plen = (int) sizeof(peer);
+    socklen_t plen = (socklen_t) sizeof(peer);
     check(got_accept >= 0 &&
-              getpeername((SOCKET_T) got_accept, (struct sockaddr *) &peer, &plen) == 0,
+              getpeername((SOCKET_T) got_accept, (struct sockaddr *) &peer, (void *) &plen) == 0,
           "and it knows its peer");
 
     if (got_accept >= 0) sock_close(got_accept);
@@ -244,6 +251,25 @@ static void scenes(const char *name) {
     e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
     sc = cq_pop(&d);
     check(e == 1 && sc != NULL && sc->res == 0, "and close gives it back");
+  }
+
+  /* 2c: poll_add says READABLE and takes nothing off the socket. */
+  {
+    int pp[2] = { -1, -1 };
+    check(pair_of_streams(pp) == 0, "a socketpair for the poll");
+    push(&d, IORING_OP_POLL_ADD, pp[0], NULL, 0, 0, 0x401)->poll32_events = POLLIN;
+    e = slipstream_engine_enter(d.fd, 1, 0, 0, NULL, 0);
+    check(cq_ready(&d) == 0, "poll waits while nothing is readable");
+    check(peer_write(pp[1], "p", 1) == 1, "the peer writes one byte");
+    e = slipstream_engine_enter(d.fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    struct io_uring_cqe *pc = cq_pop(&d);
+    check(pc != NULL && pc->user_data == 0x401 && (pc->res & POLLIN) != 0,
+          "and answers POLLIN when it is");
+    char peek[4] = { 0 };
+    check(peer_read(pp[0], peek, sizeof(peek)) == 1 && peek[0] == 'p',
+          "the byte is still there - poll took nothing");
+    sock_close(pp[0]);
+    sock_close(pp[1]);
   }
 
   /* 3: an idle wait with a deadline says -ETIME, after the deadline. */

@@ -239,11 +239,15 @@ implementation - the factor-once rule, kept. Open remains:
   shims (MinGW is the compiler of record today).
 - Windows sockets: iocp carries NOP, RECV, SEND, CLOSE, the socket
   lifecycle (SOCKET, BIND, LISTEN, SHUTDOWN) and ACCEPT and CONNECT
-  through AcceptEx and ConnectEx, all proven under Wine. What is left
-  there: POLL_ADD, which has no readiness to report on a completion
-  port and needs a decision before it needs code; the direct-descriptor
-  and multishot forms of accept; and STATX, OPENAT, UNLINKAT, which are
-  file calls and wait on the open path above.
+  through AcceptEx and ConnectEx, and POLL_ADD for POLLIN, all proven
+  under Wine. A completion port reports what finished and never what is
+  ready, so the readiness is a recv of ZERO bytes: it completes when
+  the socket becomes readable and takes nothing off it. POLLOUT is
+  refused by name - a zero-byte send completes whether the socket can
+  take bytes or not, so answering it would answer a different question.
+  What is left there: the direct-descriptor and multishot forms of
+  accept, multishot poll, and STATX, OPENAT, UNLINKAT, which are file
+  calls and wait on the open path above.
 - macOS natively: the dispatch backend and thrd_compat.h's pthreads arm
   have never met a real Mac - thrd_compat carries only the Win32 arm,
   macOS still takes <threads.h> it does not have. Needs forgecore or a

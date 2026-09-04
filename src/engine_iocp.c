@@ -34,7 +34,7 @@
 /* What a packet means when it comes home. A recv's answer is its byte
  * count and needs nothing more; an accept's is a SOCKET, and Winsock
  * asks for one more call before that socket behaves like any other. */
-enum iocp_kind { IOCP_KIND_IO, IOCP_KIND_ACCEPT, IOCP_KIND_CONNECT };
+enum iocp_kind { IOCP_KIND_IO, IOCP_KIND_ACCEPT, IOCP_KIND_CONNECT, IOCP_KIND_POLL };
 
 struct iocp_op {
   OVERLAPPED ov;
@@ -225,6 +225,53 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       *res = rc == 0 ? 0 : win_err_to_errno((DWORD) WSAGetLastError());
       return EXEC_DONE;
     }
+    /* POLL_ADD. A completion port reports what FINISHED, never what is
+     * READY, so there is nothing here to ask "is it readable" of. What
+     * there is: a recv of ZERO bytes completes when the socket becomes
+     * readable and takes nothing off it. That is the readiness, in the
+     * one shape this port understands.
+     *
+     * POLLIN only, and everything else refused by name. POLLOUT has no
+     * counterpart - a zero-byte send completes at once whether the
+     * socket can take bytes or not, so answering it would be answering
+     * a different question. */
+    case IORING_OP_POLL_ADD: {
+      struct iocp_op *w;
+      DWORD flags = 0;
+      if ((s->len & IORING_POLL_ADD_MULTI) != 0) {
+        *res = -EOPNOTSUPP;
+        return EXEC_DONE;
+      }
+      if ((s->poll32_events & (unsigned) POLLIN) == 0) {
+        *res = -EOPNOTSUPP;
+        return EXEC_DONE;
+      }
+      if (iocp_associate(st, (SOCKET) s->fd) != 0) {
+        *res = -ENOTSOCK;
+        return EXEC_DONE;
+      }
+      w = calloc(1, sizeof(*w));
+      if (w == NULL) {
+        *res = -ENOMEM;
+        return EXEC_DONE;
+      }
+      w->op = op;
+      w->sock = (SOCKET) s->fd;
+      w->kind = IOCP_KIND_POLL;
+      w->wb.buf = NULL;
+      w->wb.len = 0;
+      op->be_source = w;
+      if (WSARecv((SOCKET) s->fd, &w->wb, 1, NULL, &flags, &w->ov, NULL) != 0 &&
+          WSAGetLastError() != WSA_IO_PENDING) {
+        *res = win_err_to_errno((DWORD) WSAGetLastError());
+        op->be_source = NULL;
+        free(w);
+        return EXEC_DONE;
+      }
+      w->next = st->in_flight;
+      st->in_flight = w;
+      return EXEC_PENDING;
+    }
     /* ACCEPT: AcceptEx wants the new socket made BEFORE it is called, so
      * the wrapper carries it and hands it back as the completion's res.
      * liburing writes the address in addr and the pointer to its length
@@ -375,6 +422,11 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
           setsockopt(w->sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
           out[n].res = 0;
           break;
+        case IOCP_KIND_POLL:
+          /* The zero-byte recv finished, so the socket is readable, and
+           * poll answers in poll's own words. */
+          out[n].res = POLLIN;
+          break;
         default: out[n].res = (int) bytes; break;
       }
     }
@@ -388,7 +440,7 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
 static const unsigned char iocp_carried_ops[] = {
   IORING_OP_NOP, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_CLOSE,
   IORING_OP_SOCKET, IORING_OP_BIND, IORING_OP_LISTEN, IORING_OP_SHUTDOWN,
-  IORING_OP_ACCEPT, IORING_OP_CONNECT, 255,
+  IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD, 255,
 };
 
 const struct eng_backend slip_backend_iocp = {
