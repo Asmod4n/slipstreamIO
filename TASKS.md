@@ -4,6 +4,14 @@ This file exists so the reasoning does not have to be rediscovered:
 most of these decisions were reached by eliminating alternatives, and
 the eliminations are worth more than the conclusions.
 
+## The rule that comes before the shape
+
+The kernel is GPL. This engine may not be written from it - not by
+reading it, and not from memory of having read it. What may be read:
+the ABI header and liburing's own code, both MIT. What settles the
+rest: asking a running kernel, in test/parity.c. THIRD_PARTY.md says
+this in full, and src/engine_internal.h points at it.
+
 ## The shape
 
 There is exactly one `liburing.h`: liburing's own, from a liburing tree

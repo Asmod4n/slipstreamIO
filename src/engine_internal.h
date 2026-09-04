@@ -5,7 +5,14 @@
  * execute/wait only ever run ON the engine thread. poke is the one
  * cross-thread door - enter and the worker knock through it.
  *
- * Private to src/. No consumer includes this. */
+ * Private to src/. No consumer includes this.
+ *
+ * WHERE THE BEHAVIOUR COMES FROM, before anyone writes an op here:
+ * THIRD_PARTY.md, "Where this engine's behavior comes from". The short
+ * of it - the ABI header and liburing's own code are MIT and may be
+ * read; the kernel is GPL and may not, not even from memory of having
+ * read it. What those two leave open is settled by ASKING a running
+ * kernel (test/parity.c), never by remembering one. */
 #ifndef SLIPSTREAM_ENGINE_INTERNAL_H
 #define SLIPSTREAM_ENGINE_INTERNAL_H
 
