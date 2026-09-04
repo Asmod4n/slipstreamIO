@@ -22,7 +22,8 @@ LIBURING_SRC ?= deps/liburing
 # absent ones compile to empty translation units.
 ENGINE = src/slipstream_engine.c src/engine_posix.c src/engine_select.c src/engine_epoll.c src/engine_kqueue.c src/engine_dispatch.c src/engine_iocp.c
 
-BINS = test/available test/syscall test/shim test/blocked test/backends
+BINS = test/available test/syscall test/shim test/blocked test/backends \
+       test/signal test/signal_posix
 
 abi_header:
 	@test -f "$(LIBURING_SRC)/src/include/liburing/io_uring.h" || { \
@@ -30,7 +31,15 @@ abi_header:
 	  echo "  (set LIBURING_SRC to one, or add it under deps/liburing)"; exit 1; }
 
 test: abi_header $(BINS)
-	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/backends && ./test/backends_adapters.sh && ./test/backends_wine.sh && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
+	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/backends && ./test/signal && ./test/signal_posix && ./test/backends_adapters.sh && ./test/backends_wine.sh && ./test/signal_wine.sh && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
+
+# The stop signal, twice from one source: once on signalfd, once on the
+# generic POSIX arm. An arm nobody runs is an arm nobody has checked.
+test/signal: test/signal.c src/slipstream_signal.c src/slipstream_signal.h
+	$(CC) $(CFLAGS) -Isrc -o $@ test/signal.c src/slipstream_signal.c
+
+test/signal_posix: test/signal.c src/slipstream_signal.c src/slipstream_signal.h
+	$(CC) $(CFLAGS) -Isrc -DSLIPSTREAM_SIGNAL_NO_SIGNALFD -o $@ test/signal.c src/slipstream_signal.c
 
 # The question that runs before liburing exists, so it is built like any
 # other C consumer of a header here - and deliberately does not link or

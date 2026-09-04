@@ -73,6 +73,17 @@ wants to choose explicitly; a wrong flag is refused with words.
   know. `test/seccomp_block.h` is the filter; each seccomp scene is its
   own process, because the filter is irreversible.
 
+- **The stop signal, as a descriptor** — `src/slipstream_signal.c`. A
+  server has to hear TERM, and a handler is the wrong way: it runs on
+  whichever thread the kernel picks, it may call almost nothing, and it
+  needs a second path to wake the loop. Linux turns the signal into a
+  descriptor with signalfd; no other platform has one. Four arms give
+  every platform that descriptor - signalfd on Linux, a console handler
+  and a loopback pair on Windows, a dispatch source on macOS (never
+  EVFILT_SIGNAL), one thread in sigtimedwait everywhere else. Proven on
+  signalfd, on the generic POSIX arm (which a define selects on Linux),
+  and under Wine. The dispatch arm needs a Mac, like the backend does.
+
 ## Decided, with the reason
 
 These are settled. Reopening one means answering the reason.

@@ -133,6 +133,10 @@ macOS run, which needs a Mac.
 make test
 ```
 
+- `test/signal.c` — the stop signal as a descriptor, run twice on Linux
+  (signalfd, and the generic POSIX arm through
+  `SLIPSTREAM_SIGNAL_NO_SIGNALFD`) and once under Wine
+  (`test/signal_wine.sh`) for the console arm
 - `test/available.c` — the probe: asked twice, answered the same
 - `test/syscall.c` — the three exported calls and the switch behind them
 - `test/shim.c` — the wrappers, compiled exactly where liburing puts them
