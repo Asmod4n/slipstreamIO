@@ -8,10 +8,12 @@
  *
  * Carried today: NOP, RECV, SEND, CLOSE, and the socket lifecycle -
  * SOCKET, BIND, LISTEN, SHUTDOWN, which are plain Winsock calls that
- * answer at once. READ/WRITE answer -EOPNOTSUPP:
- * a CRT descriptor's HANDLE is not opened FILE_FLAG_OVERLAPPED, so
- * honest file IO here needs its own open path first - said, not
- * half-served. The SQE's fd field is 32 bits by liburing's own ABI;
+ * answer at once; ACCEPT and CONNECT through AcceptEx and ConnectEx;
+ * POLL_ADD for POLLIN; and file IO - OPENAT, READ, WRITE - which works
+ * only because the OPEN is the engine's own: a CRT descriptor's handle
+ * is not FILE_FLAG_OVERLAPPED, and without that flag ReadFile carries
+ * no offset and completes through no port.
+ * The SQE's fd field is 32 bits by liburing's own ABI;
  * Windows SOCKET values fit it in practice and Wine's always do.
  *
  * Ops in flight ride a wrapper that embeds the OVERLAPPED, so a packet
@@ -28,7 +30,13 @@
 /* AcceptEx, ConnectEx and their GUIDs live here, not in winsock2.h. */
 #include <mswsock.h>
 #include <windows.h>
-#include <io.h> /* _close: a CRT descriptor is not a SOCKET */
+#include <fcntl.h>
+/* Windows has no openat, so it has no AT_FDCWD either. The value is
+ * Linux's, and it is the only dfd this backend accepts - see OPENAT. */
+#ifndef AT_FDCWD
+#define AT_FDCWD (-100)
+#endif
+#include <io.h> /* _close, _open_osfhandle: a CRT descriptor is not a SOCKET */
 #include <stdlib.h>
 
 /* What a packet means when it comes home. A recv's answer is its byte
@@ -224,6 +232,95 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       const int rc = shutdown((SOCKET) s->fd, (int) s->len);
       *res = rc == 0 ? 0 : win_err_to_errno((DWORD) WSAGetLastError());
       return EXEC_DONE;
+    }
+    /* OPENAT, and the reason it is here at all: a CRT descriptor's
+     * handle is not opened FILE_FLAG_OVERLAPPED, and without that flag
+     * ReadFile cannot carry an offset or complete through the port. So
+     * the engine owns the open. CreateFile takes the flag, and
+     * _open_osfhandle wraps the handle as the int a ring speaks in -
+     * the handle underneath is still the overlapped one, and
+     * _get_osfhandle gives it back for the read.
+     *
+     * dfd is not honoured: Windows has no openat, and a relative walk
+     * from a descriptor is not something CreateFile does. AT_FDCWD is
+     * the only value accepted, and anything else is refused by name
+     * rather than silently resolved against the wrong directory. */
+    case IORING_OP_OPENAT: {
+      const char *path = (const char *) (uintptr_t) s->addr;
+      const int flags = (int) s->open_flags;
+      DWORD access = GENERIC_READ;
+      DWORD disposition = OPEN_EXISTING;
+      HANDLE h;
+      int fd;
+      if (path == NULL) {
+        *res = -EFAULT;
+        return EXEC_DONE;
+      }
+      if (s->fd != AT_FDCWD) {
+        *res = -EOPNOTSUPP;
+        return EXEC_DONE;
+      }
+      if ((flags & O_WRONLY) != 0) access = GENERIC_WRITE;
+      else if ((flags & O_RDWR) != 0) access = GENERIC_READ | GENERIC_WRITE;
+      if ((flags & O_CREAT) != 0) disposition = (flags & O_EXCL) != 0 ? CREATE_NEW : OPEN_ALWAYS;
+      if ((flags & O_TRUNC) != 0) disposition = CREATE_ALWAYS;
+      h = CreateFileA(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                      disposition, FILE_FLAG_OVERLAPPED, NULL);
+      if (h == INVALID_HANDLE_VALUE) {
+        *res = win_err_to_errno(GetLastError());
+        return EXEC_DONE;
+      }
+      fd = _open_osfhandle((intptr_t) h, (flags & O_WRONLY) != 0 ? 0 : _O_RDONLY);
+      if (fd < 0) {
+        CloseHandle(h);
+        *res = -EMFILE;
+        return EXEC_DONE;
+      }
+      *res = fd;
+      return EXEC_DONE;
+    }
+    /* READ and WRITE on what OPENAT above handed out. The offset rides
+     * in the OVERLAPPED, which is where a file's position lives on this
+     * platform - the descriptor has none of its own. */
+    case IORING_OP_READ:
+    case IORING_OP_WRITE: {
+      const HANDLE h = (HANDLE) _get_osfhandle(s->fd);
+      struct iocp_op *w;
+      BOOL started;
+      if (h == INVALID_HANDLE_VALUE) {
+        *res = -EBADF;
+        return EXEC_DONE;
+      }
+      if (CreateIoCompletionPort(h, st->port, IOCP_KEY_IO, 0) == NULL &&
+          GetLastError() != ERROR_INVALID_PARAMETER) {
+        /* Not an overlapped handle: this descriptor did not come from
+         * the open above, and a read on it cannot complete here. */
+        *res = -EOPNOTSUPP;
+        return EXEC_DONE;
+      }
+      w = calloc(1, sizeof(*w));
+      if (w == NULL) {
+        *res = -ENOMEM;
+        return EXEC_DONE;
+      }
+      w->op = op;
+      w->sock = (SOCKET) s->fd;
+      w->kind = IOCP_KIND_IO;
+      w->ov.Offset = (DWORD) (s->off & 0xffffffffu);
+      w->ov.OffsetHigh = (DWORD) (s->off >> 32);
+      op->be_source = w;
+      started = s->opcode == IORING_OP_READ
+                    ? ReadFile(h, (void *) (uintptr_t) s->addr, s->len, NULL, &w->ov)
+                    : WriteFile(h, (const void *) (uintptr_t) s->addr, s->len, NULL, &w->ov);
+      if (!started && GetLastError() != ERROR_IO_PENDING) {
+        *res = win_err_to_errno(GetLastError());
+        op->be_source = NULL;
+        free(w);
+        return EXEC_DONE;
+      }
+      w->next = st->in_flight;
+      st->in_flight = w;
+      return EXEC_PENDING;
     }
     /* POLL_ADD. A completion port reports what FINISHED, never what is
      * READY, so there is nothing here to ask "is it readable" of. What
@@ -440,7 +537,8 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
 static const unsigned char iocp_carried_ops[] = {
   IORING_OP_NOP, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_CLOSE,
   IORING_OP_SOCKET, IORING_OP_BIND, IORING_OP_LISTEN, IORING_OP_SHUTDOWN,
-  IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD, 255,
+  IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD,
+  IORING_OP_OPENAT, IORING_OP_READ, IORING_OP_WRITE, 255,
 };
 
 const struct eng_backend slip_backend_iocp = {

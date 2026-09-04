@@ -233,10 +233,16 @@ swift-corelibs-libdispatch, iocp as a MinGW binary under Wine. The
 engine core is OS-free and the readiness motors share one POSIX
 implementation - the factor-once rule, kept. Open remains:
 
-- Windows file IO: a CRT descriptor's HANDLE is not
-  FILE_FLAG_OVERLAPPED, so READ/WRITE answer -EOPNOTSUPP there until
-  the engine owns an open path; MSVC also needs #include_next-free
-  shims (MinGW is the compiler of record today).
+- Windows file IO is carried now, and only because the OPEN is the
+  engine's own: CreateFile with FILE_FLAG_OVERLAPPED, wrapped as an int
+  with _open_osfhandle, and READ/WRITE carry their offset in the
+  OVERLAPPED because the descriptor has no position of its own. A
+  descriptor from anywhere else is refused - the association tells the
+  engine it is not an overlapped handle. dfd is not honoured: Windows
+  has no openat, so AT_FDCWD is the only value accepted and anything
+  else is refused rather than resolved against the wrong directory.
+  MSVC still needs #include_next-free shims (MinGW is the compiler of
+  record today).
 - Windows sockets: iocp carries NOP, RECV, SEND, CLOSE, the socket
   lifecycle (SOCKET, BIND, LISTEN, SHUTDOWN) and ACCEPT and CONNECT
   through AcceptEx and ConnectEx, and POLL_ADD for POLLIN, all proven

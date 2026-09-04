@@ -34,6 +34,10 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <fcntl.h>
+#ifndef AT_FDCWD
+#define AT_FDCWD (-100)
+#endif
 typedef SOCKET SOCKET_T;
 static int pair_of_streams(int sp[2]) {
   SOCKET l = socket(AF_INET, SOCK_STREAM, 0);
@@ -62,6 +66,7 @@ static int peer_read(int fd, void *buf, unsigned len) {
 }
 static void sock_close(int fd) { closesocket((SOCKET) fd); }
 #else
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -270,6 +275,39 @@ static void scenes(const char *name) {
           "the byte is still there - poll took nothing");
     sock_close(pp[0]);
     sock_close(pp[1]);
+  }
+
+  /* 2d: a file, through the ring. openat, write at an offset, read it
+   * back, and the bytes have to be the ones written - a res that agrees
+   * over a file that does not would be no proof at all. */
+  {
+    static const char tmpname[] = "slip_backend_file.tmp";
+    static char wbuf[] = "engine";
+    static char rbuf[8];
+    push(&d, IORING_OP_OPENAT, AT_FDCWD, (void *) tmpname, 0666, 0, 0x501)->open_flags =
+        O_RDWR | O_CREAT | O_TRUNC;
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    struct io_uring_cqe *fc = cq_pop(&d);
+    const int ffd = fc != NULL ? fc->res : -1;
+    check(ffd >= 0, "openat makes a file");
+
+    push(&d, IORING_OP_WRITE, ffd, wbuf, 6, 0, 0x502);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    fc = cq_pop(&d);
+    check(fc != NULL && fc->res == 6, "write puts six bytes at offset 0");
+
+    memset(rbuf, 0, sizeof(rbuf));
+    push(&d, IORING_OP_READ, ffd, rbuf, 6, 0, 0x503);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    fc = cq_pop(&d);
+    check(fc != NULL && fc->res == 6, "read takes them back");
+    check(memcmp(rbuf, "engine", 6) == 0, "and they are the bytes that went in");
+
+    push(&d, IORING_OP_CLOSE, ffd, NULL, 0, 0, 0x504);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    fc = cq_pop(&d);
+    check(fc != NULL && fc->res == 0, "and the file closes");
+    remove(tmpname);
   }
 
   /* 3: an idle wait with a deadline says -ETIME, after the deadline. */
