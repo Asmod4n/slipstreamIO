@@ -251,9 +251,11 @@ implementation - the factor-once rule, kept. Open remains:
   the socket becomes readable and takes nothing off it. POLLOUT is
   refused by name - a zero-byte send completes whether the socket can
   take bytes or not, so answering it would answer a different question.
-  What is left there: the direct-descriptor and multishot forms of
-  accept, multishot poll, and STATX, OPENAT, UNLINKAT, which are file
-  calls and wait on the open path above.
+  STATX and UNLINKAT are carried too - statx from _stat64, with
+  stx_mask saying which fields that filled, because Windows has no
+  blocks, no blksize, no uid and no gid to report and an invented number
+  is worse than a clear bit. What is left there: the direct-descriptor
+  and multishot forms of accept, and multishot poll.
 - macOS natively: the dispatch backend and thrd_compat.h's pthreads arm
   have never met a real Mac - thrd_compat carries only the Win32 arm,
   macOS still takes <threads.h> it does not have. Needs forgecore or a

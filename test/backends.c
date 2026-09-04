@@ -35,6 +35,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <fcntl.h>
+#include <linux/stat.h>
 #ifndef AT_FDCWD
 #define AT_FDCWD (-100)
 #endif
@@ -67,6 +68,7 @@ static int peer_read(int fd, void *buf, unsigned len) {
 static void sock_close(int fd) { closesocket((SOCKET) fd); }
 #else
 #include <fcntl.h>
+#include <linux/stat.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -307,6 +309,29 @@ static void scenes(const char *name) {
     e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
     fc = cq_pop(&d);
     check(fc != NULL && fc->res == 0, "and the file closes");
+
+    /* statx sees the six bytes, and unlinkat takes the file away. */
+    static struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+    struct io_uring_sqe *xs =
+        push(&d, IORING_OP_STATX, AT_FDCWD, (void *) tmpname, 0, 0, 0x505);
+    xs->off = (__u64) (uintptr_t) &stx;
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    fc = cq_pop(&d);
+    check(fc != NULL && fc->res == 0, "statx answers 0");
+    check(stx.stx_size == 6, "and reports the size that was written");
+
+    push(&d, IORING_OP_UNLINKAT, AT_FDCWD, (void *) tmpname, 0, 0, 0x506);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    fc = cq_pop(&d);
+    check(fc != NULL && fc->res == 0, "unlinkat removes it");
+
+    memset(&stx, 0, sizeof(stx));
+    xs = push(&d, IORING_OP_STATX, AT_FDCWD, (void *) tmpname, 0, 0, 0x507);
+    xs->off = (__u64) (uintptr_t) &stx;
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    fc = cq_pop(&d);
+    check(fc != NULL && fc->res < 0, "and statx says it is gone");
     remove(tmpname);
   }
 

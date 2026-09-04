@@ -36,6 +36,13 @@
 #ifndef AT_FDCWD
 #define AT_FDCWD (-100)
 #endif
+#ifndef AT_REMOVEDIR
+#define AT_REMOVEDIR 0x200
+#endif
+#include <sys/stat.h>
+/* The shim's struct statx: Windows has none, and STATX answers in the
+ * shape the ABI names. */
+#include <linux/stat.h>
 #include <io.h> /* _close, _open_osfhandle: a CRT descriptor is not a SOCKET */
 #include <stdlib.h>
 
@@ -322,6 +329,53 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       st->in_flight = w;
       return EXEC_PENDING;
     }
+    /* STATX from _stat64, and stx_mask says which fields that filled.
+     * Windows has no blocks, no blksize, no uid and no gid to report,
+     * so those bits stay clear rather than carrying an invented number
+     * - the shim header says stx_mask is exactly this promise. */
+    case IORING_OP_STATX: {
+      const char *path = (const char *) (uintptr_t) s->addr;
+      struct statx *x = (struct statx *) (uintptr_t) s->off;
+      struct _stat64 st;
+      if (path == NULL || x == NULL) {
+        *res = -EFAULT;
+        return EXEC_DONE;
+      }
+      if (s->fd != AT_FDCWD) {
+        *res = -EOPNOTSUPP;
+        return EXEC_DONE;
+      }
+      if (_stat64(path, &st) != 0) {
+        *res = -ENOENT;
+        return EXEC_DONE;
+      }
+      memset(x, 0, sizeof(*x));
+      x->stx_mask = STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_SIZE | STATX_ATIME |
+                    STATX_MTIME | STATX_CTIME;
+      x->stx_nlink = (__u32) st.st_nlink;
+      x->stx_mode = (__u16) st.st_mode;
+      x->stx_size = (__u64) st.st_size;
+      x->stx_atime.tv_sec = (__s64) st.st_atime;
+      x->stx_mtime.tv_sec = (__s64) st.st_mtime;
+      x->stx_ctime.tv_sec = (__s64) st.st_ctime;
+      *res = 0;
+      return EXEC_DONE;
+    }
+    case IORING_OP_UNLINKAT: {
+      const char *path = (const char *) (uintptr_t) s->addr;
+      BOOL gone;
+      if (path == NULL) {
+        *res = -EFAULT;
+        return EXEC_DONE;
+      }
+      if (s->fd != AT_FDCWD) {
+        *res = -EOPNOTSUPP;
+        return EXEC_DONE;
+      }
+      gone = (s->unlink_flags & AT_REMOVEDIR) != 0 ? RemoveDirectoryA(path) : DeleteFileA(path);
+      *res = gone ? 0 : -ENOENT;
+      return EXEC_DONE;
+    }
     /* POLL_ADD. A completion port reports what FINISHED, never what is
      * READY, so there is nothing here to ask "is it readable" of. What
      * there is: a recv of ZERO bytes completes when the socket becomes
@@ -538,7 +592,8 @@ static const unsigned char iocp_carried_ops[] = {
   IORING_OP_NOP, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_CLOSE,
   IORING_OP_SOCKET, IORING_OP_BIND, IORING_OP_LISTEN, IORING_OP_SHUTDOWN,
   IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD,
-  IORING_OP_OPENAT, IORING_OP_READ, IORING_OP_WRITE, 255,
+  IORING_OP_OPENAT, IORING_OP_READ, IORING_OP_WRITE,
+  IORING_OP_STATX, IORING_OP_UNLINKAT, 255,
 };
 
 const struct eng_backend slip_backend_iocp = {

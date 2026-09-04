@@ -10,7 +10,7 @@
 #
 # -std=c11 with NO feature macro on purpose: the exported headers have to
 # stand up for a C consumer on their own terms.
-CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc -I$(LIBURING_SRC)/src/include
+CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Isrc -Ishim/common -I$(LIBURING_SRC)/src/include
 
 # The engine speaks the ABI of the liburing this project carries - its
 # liburing/io_uring.h, never the host's /usr/include/linux, which can be
