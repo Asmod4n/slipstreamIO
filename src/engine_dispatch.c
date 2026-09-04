@@ -413,6 +413,15 @@ static int dsp_wait(struct slip_ring *r, struct eng_done *out, unsigned max, int
                      : dispatch_time(DISPATCH_TIME_NOW, (int64_t) timeout_ms * NSEC_PER_MSEC);
   if (dispatch_semaphore_wait(st->sem, until) != 0) return 0; /* the deadline, not an event */
 
+  /* One knock is not one event. A readiness backend answers with
+   * EVERYTHING that is ready, not with the first descriptor whose
+   * handler happened to run - measured against the kernel: three recvs,
+   * three peers writing, one wait. The kernel hands back three. The
+   * handlers run on st->q, a SERIAL queue, so a barrier there means
+   * every handler GCD has already scheduled has finished. Sync on it
+   * once, and the chain holds them all before it is walked. */
+  dispatch_sync_f(st->q, NULL, dsp_noop);
+
   struct eng_op **ready = r->ready;
   unsigned n = 0, rn = 0;
 

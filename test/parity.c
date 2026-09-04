@@ -837,6 +837,43 @@ static int sc_poll_multishot(struct io_uring *ring, struct rec *out) {
  * and the one shape that needs no second ring. TWO completions land
  * here - the message and the send's own - and what each carries is the
  * kernel's answer, not ours. */
+/* wait_nr 1 is a FLOOR, not a quota: enter returns as soon as one
+ * completion stands, and the CQ then holds everything else that is
+ * ready too. Three recvs park on three socketpairs, all three peers
+ * write, one submit_and_wait(1) - and the scene counts what
+ * io_uring_for_each_cqe walks. */
+static int sc_wait_one_hands_all(struct io_uring *ring, struct rec *out) {
+  int sp[3][2];
+  for (int i = 0; i < 3; i++) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp[i]) != 0) return -1;
+    static char buf[3][8];
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_recv(sqe, sp[i][0], buf[i], sizeof(buf[i]), 0);
+    io_uring_sqe_set_data64(sqe, (__u64) (95 + i));
+  }
+  io_uring_submit(ring);
+  for (int i = 0; i < 3; i++) {
+    if (write(sp[i][1], "x", 1) != 1) return -1;
+  }
+  io_uring_submit_and_wait(ring, 1);
+
+  unsigned ready = 0, head;
+  struct io_uring_cqe *cqe;
+  io_uring_for_each_cqe(ring, head, cqe) {
+    (void) cqe;
+    ready++;
+  }
+  io_uring_cq_advance(ring, ready);
+  out[0].user_data = 98;
+  out[0].res = (int) ready;
+  out[0].flags = 0;
+  for (int i = 0; i < 3; i++) {
+    close(sp[i][0]);
+    close(sp[i][1]);
+  }
+  return 1;
+}
+
 /* min_complete counts, and one enter answers it. Two ops that become
  * ready at different moments: an accept parked on a listener, and a
  * connect that both completes itself and makes the accept ready. One
@@ -935,6 +972,7 @@ static const struct scenario scenarios[] = {
   { "multishot recvmsg: the out header, then the payload", sc_recvmsg_multishot, 1 },
   { "the four fields of io_uring_recvmsg_out", sc_recvmsg_out_header, 1 },
   { "multishot poll: a CQE per readiness, then a cancel", sc_poll_multishot, 0 },
+  { "wait_nr 1 leaves every ready CQE in the CQ", sc_wait_one_hands_all, 0 },
   { "one enter with min_complete 2 answers with two", sc_two_in_one_enter, 0 },
   { "msg_ring at its own ring: the message and the send", sc_msg_ring_self, 0 },
   { "msg_ring at a target that is not a ring", sc_msg_ring_bad_fd, 0 },
