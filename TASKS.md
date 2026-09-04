@@ -143,10 +143,18 @@ Two sharp edges, both measured:
   - The wait's semaphore is signalled on the TRANSITION to "something
     to collect", never per event. A counting semaphore hands out one
     surplus wakeup per event already answered, and a wakeup with
-    nothing behind it is not free: enter has one pass, so it turns a
-    caller's deadline into -ETIME on the spot. The deadline scene in
-    test/backends.c answered -ETIME immediately instead of at the
-    deadline, which is how this was found.
+    nothing behind it is not free: it turns a caller's deadline into
+    -ETIME on the spot. The deadline scene in test/backends.c answered
+    -ETIME immediately instead of at the deadline, which is how this
+    was found.
+  - One knock is not one event, and one wait pass is not one enter.
+    The handlers run on a SERIAL queue, and the wait syncs on it before
+    it walks the ready chain, so a knock from the first descriptor does
+    not answer for the other two. A concurrent queue was measured here
+    and lost: its barrier waits for the handlers GCD has scheduled,
+    which is a narrower promise, and the scene reported two of three.
+    The handlers only note a side and knock under a mutex, so there is
+    nothing to win by running them at once.
 
 ### liburing.h's LP64 assumption stays visible
 
