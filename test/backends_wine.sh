@@ -32,6 +32,6 @@ trap 'rm -rf "$work"' EXIT
   -I"$src/src/include" -o "$work/backends.exe" "$here/test/backends.c" \
   "$here"/src/slipstream_engine.c "$here"/src/engine_*.c -lws2_32
 
-WINEDEBUG=-all wine "$work/backends.exe" | grep -A14 '^  iocp:'
+WINEDEBUG=-all wine "$work/backends.exe" | grep -A22 '^  iocp:'
 WINEDEBUG=-all wine "$work/backends.exe" > /dev/null
 echo "backends_wine: iocp proven under Wine"

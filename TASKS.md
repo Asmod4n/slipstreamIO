@@ -237,12 +237,13 @@ implementation - the factor-once rule, kept. Open remains:
   FILE_FLAG_OVERLAPPED, so READ/WRITE answer -EOPNOTSUPP there until
   the engine owns an open path; MSVC also needs #include_next-free
   shims (MinGW is the compiler of record today).
-- Windows sockets, the rest of them: iocp now carries NOP, RECV, SEND,
-  CLOSE and the socket lifecycle (SOCKET, BIND, LISTEN, SHUTDOWN),
-  proven under Wine. ACCEPT and CONNECT need AcceptEx and ConnectEx,
-  which are overlapped and want their own scenes. POLL_ADD has no
-  readiness to report on a completion port and needs a decision of its
-  own before it needs code.
+- Windows sockets: iocp carries NOP, RECV, SEND, CLOSE, the socket
+  lifecycle (SOCKET, BIND, LISTEN, SHUTDOWN) and ACCEPT and CONNECT
+  through AcceptEx and ConnectEx, all proven under Wine. What is left
+  there: POLL_ADD, which has no readiness to report on a completion
+  port and needs a decision before it needs code; the direct-descriptor
+  and multishot forms of accept; and STATX, OPENAT, UNLINKAT, which are
+  file calls and wait on the open path above.
 - macOS natively: the dispatch backend and thrd_compat.h's pthreads arm
   have never met a real Mac - thrd_compat carries only the Win32 arm,
   macOS still takes <threads.h> it does not have. Needs forgecore or a

@@ -24,9 +24,17 @@
 #include "engine_internal.h"
 
 #include <winsock2.h>
+#include <ws2tcpip.h>
+/* AcceptEx, ConnectEx and their GUIDs live here, not in winsock2.h. */
+#include <mswsock.h>
 #include <windows.h>
 #include <io.h> /* _close: a CRT descriptor is not a SOCKET */
 #include <stdlib.h>
+
+/* What a packet means when it comes home. A recv's answer is its byte
+ * count and needs nothing more; an accept's is a SOCKET, and Winsock
+ * asks for one more call before that socket behaves like any other. */
+enum iocp_kind { IOCP_KIND_IO, IOCP_KIND_ACCEPT, IOCP_KIND_CONNECT };
 
 struct iocp_op {
   OVERLAPPED ov;
@@ -34,6 +42,11 @@ struct iocp_op {
   struct iocp_op *next; /* the in-flight list, engine thread only */
   SOCKET sock;
   WSABUF wb;
+  unsigned char kind;
+  SOCKET accepted; /* ACCEPT: the socket AcceptEx was given */
+  /* AcceptEx writes both addresses here and wants 16 bytes of slack
+   * after each - Microsoft's documented requirement, not a guess. */
+  char addrs[2 * (sizeof(struct sockaddr_storage) + 16)];
 };
 
 struct iocp_state {
@@ -118,6 +131,50 @@ static void iocp_poke(struct slip_ring *r) {
   PostQueuedCompletionStatus(st->port, 0, IOCP_KEY_POKE, NULL);
 }
 
+/* AcceptEx and ConnectEx are not exported by name: Winsock hands out
+ * their addresses per socket, through WSAIoctl. Asked once and kept. */
+static LPFN_ACCEPTEX iocp_acceptex(SOCKET s) {
+  static LPFN_ACCEPTEX fn;
+  GUID id = WSAID_ACCEPTEX;
+  DWORD got = 0;
+  if (fn != NULL) return fn;
+  if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof(id), &fn, sizeof(fn), &got,
+               NULL, NULL) != 0) {
+    fn = NULL;
+  }
+  return fn;
+}
+
+static LPFN_CONNECTEX iocp_connectex(SOCKET s) {
+  static LPFN_CONNECTEX fn;
+  GUID id = WSAID_CONNECTEX;
+  DWORD got = 0;
+  if (fn != NULL) return fn;
+  if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof(id), &fn, sizeof(fn), &got,
+               NULL, NULL) != 0) {
+    fn = NULL;
+  }
+  return fn;
+}
+
+/* ConnectEx refuses a socket that was never bound. The POSIX connect
+ * does not, so the shape is kept by binding to the wildcard of the
+ * socket's own family first - what a caller would otherwise have to
+ * write to get the same behaviour. */
+static int iocp_bind_wildcard(SOCKET s) {
+  struct sockaddr_storage ss;
+  int len = 0;
+  WSAPROTOCOL_INFOW info;
+  int ilen = (int) sizeof(info);
+  if (getsockname(s, (struct sockaddr *) &ss, &(int){(int) sizeof(ss)}) == 0) return 0;
+  if (getsockopt(s, SOL_SOCKET, SO_PROTOCOL_INFOW, (char *) &info, &ilen) != 0) return -1;
+  memset(&ss, 0, sizeof(ss));
+  ss.ss_family = (ADDRESS_FAMILY) info.iAddressFamily;
+  len = info.iAddressFamily == AF_INET6 ? (int) sizeof(struct sockaddr_in6)
+                                        : (int) sizeof(struct sockaddr_in);
+  return bind(s, (struct sockaddr *) &ss, len) == 0 ? 0 : -1;
+}
+
 /* Association is per handle and forever; a second call for a handle
  * already on this port fails with ERROR_INVALID_PARAMETER, which is
  * then the association already standing. */
@@ -167,6 +224,82 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       const int rc = shutdown((SOCKET) s->fd, (int) s->len);
       *res = rc == 0 ? 0 : win_err_to_errno((DWORD) WSAGetLastError());
       return EXEC_DONE;
+    }
+    /* ACCEPT: AcceptEx wants the new socket made BEFORE it is called, so
+     * the wrapper carries it and hands it back as the completion's res.
+     * liburing writes the address in addr and the pointer to its length
+     * in off - both optional. */
+    case IORING_OP_ACCEPT: {
+      LPFN_ACCEPTEX acceptex = iocp_acceptex((SOCKET) s->fd);
+      struct iocp_op *w;
+      SOCKET child;
+      DWORD got = 0;
+      if (acceptex == NULL || iocp_associate(st, (SOCKET) s->fd) != 0) {
+        *res = -ENOTSOCK;
+        return EXEC_DONE;
+      }
+      child = socket(AF_INET, SOCK_STREAM, 0);
+      if (child == INVALID_SOCKET) {
+        *res = win_err_to_errno((DWORD) WSAGetLastError());
+        return EXEC_DONE;
+      }
+      w = calloc(1, sizeof(*w));
+      if (w == NULL) {
+        closesocket(child);
+        *res = -ENOMEM;
+        return EXEC_DONE;
+      }
+      w->op = op;
+      w->sock = (SOCKET) s->fd;
+      w->accepted = child;
+      w->kind = IOCP_KIND_ACCEPT;
+      op->be_source = w;
+      if (!acceptex((SOCKET) s->fd, child, w->addrs, 0,
+                    sizeof(struct sockaddr_storage) + 16,
+                    sizeof(struct sockaddr_storage) + 16, &got, &w->ov) &&
+          WSAGetLastError() != WSA_IO_PENDING) {
+        *res = win_err_to_errno((DWORD) WSAGetLastError());
+        closesocket(child);
+        op->be_source = NULL;
+        free(w);
+        return EXEC_DONE;
+      }
+      w->next = st->in_flight;
+      st->in_flight = w;
+      return EXEC_PENDING;
+    }
+    /* CONNECT: ConnectEx, and a bind first because it insists on one. */
+    case IORING_OP_CONNECT: {
+      LPFN_CONNECTEX connectex = iocp_connectex((SOCKET) s->fd);
+      const struct sockaddr *sa = (const struct sockaddr *) (uintptr_t) s->addr;
+      struct iocp_op *w;
+      if (connectex == NULL || iocp_associate(st, (SOCKET) s->fd) != 0) {
+        *res = -ENOTSOCK;
+        return EXEC_DONE;
+      }
+      if (iocp_bind_wildcard((SOCKET) s->fd) != 0) {
+        *res = -EINVAL;
+        return EXEC_DONE;
+      }
+      w = calloc(1, sizeof(*w));
+      if (w == NULL) {
+        *res = -ENOMEM;
+        return EXEC_DONE;
+      }
+      w->op = op;
+      w->sock = (SOCKET) s->fd;
+      w->kind = IOCP_KIND_CONNECT;
+      op->be_source = w;
+      if (!connectex((SOCKET) s->fd, sa, (int) s->off, NULL, 0, NULL, &w->ov) &&
+          WSAGetLastError() != WSA_IO_PENDING) {
+        *res = win_err_to_errno((DWORD) WSAGetLastError());
+        op->be_source = NULL;
+        free(w);
+        return EXEC_DONE;
+      }
+      w->next = st->in_flight;
+      st->in_flight = w;
+      return EXEC_PENDING;
     }
     case IORING_OP_RECV:
     case IORING_OP_SEND: {
@@ -225,7 +358,26 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
     while (*p != NULL && *p != w) p = &(*p)->next;
     if (*p == w) *p = w->next;
     out[n].op = w->op;
-    out[n].res = ok ? (int) bytes : win_err_to_errno(GetLastError());
+    if (!ok) {
+      out[n].res = win_err_to_errno(GetLastError());
+      if (w->kind == IOCP_KIND_ACCEPT) closesocket(w->accepted);
+    } else {
+      switch (w->kind) {
+        case IOCP_KIND_ACCEPT:
+          /* Until this call the accepted socket has none of the
+           * listener's properties - Microsoft says so, and getpeername
+           * fails without it. The answer is the socket, not a count. */
+          setsockopt(w->accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (const char *) &w->sock,
+                     sizeof(w->sock));
+          out[n].res = (int) w->accepted;
+          break;
+        case IOCP_KIND_CONNECT:
+          setsockopt(w->sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+          out[n].res = 0;
+          break;
+        default: out[n].res = (int) bytes; break;
+      }
+    }
     w->op->be_source = NULL;
     free(w);
     n++;
@@ -235,7 +387,8 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
 
 static const unsigned char iocp_carried_ops[] = {
   IORING_OP_NOP, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_CLOSE,
-  IORING_OP_SOCKET, IORING_OP_BIND, IORING_OP_LISTEN, IORING_OP_SHUTDOWN, 255,
+  IORING_OP_SOCKET, IORING_OP_BIND, IORING_OP_LISTEN, IORING_OP_SHUTDOWN,
+  IORING_OP_ACCEPT, IORING_OP_CONNECT, 255,
 };
 
 const struct eng_backend slip_backend_iocp = {

@@ -34,6 +34,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+typedef SOCKET SOCKET_T;
 static int pair_of_streams(int sp[2]) {
   SOCKET l = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in a;
@@ -61,6 +62,7 @@ static void sock_close(int fd) { closesocket((SOCKET) fd); }
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+typedef int SOCKET_T;
 static int pair_of_streams(int sp[2]) { return socketpair(AF_UNIX, SOCK_STREAM, 0, sp); }
 static int peer_write(int fd, const void *buf, unsigned len) {
   return (int) write(fd, buf, len);
@@ -197,6 +199,46 @@ static void scenes(const char *name) {
     e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
     sc = cq_pop(&d);
     check(e == 1 && sc != NULL && sc->res == 0, "listen answers 0");
+
+    /* accept and connect, against each other on the same ring. Both are
+     * issued, so the ring holds two ops and both come back. */
+    int alen = (int) sizeof(a);
+    check(getsockname((SOCKET_T) lfd, (struct sockaddr *) &a, &alen) == 0,
+          "the listener says which port it took");
+
+    push(&d, IORING_OP_ACCEPT, lfd, NULL, 0, 0, 0x305);
+    e = slipstream_engine_enter(d.fd, 1, 0, 0, NULL, 0);
+    check(e == 1 && cq_ready(&d) == 0, "accept is issued and waits");
+
+    push(&d, IORING_OP_SOCKET, AF_INET, NULL, IPPROTO_TCP, SOCK_STREAM, 0x306);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    sc = cq_pop(&d);
+    const int cfd = sc != NULL ? sc->res : -1;
+    check(cfd >= 0, "a client socket");
+
+    struct io_uring_sqe *cs = push(&d, IORING_OP_CONNECT, cfd, &a, 0, 0, 0x307);
+    cs->off = sizeof(a);
+    e = slipstream_engine_enter(d.fd, 1, 2, IORING_ENTER_GETEVENTS, NULL, 0);
+    int got_accept = -1;
+    int got_connect = 1;
+    for (int k = 0; k < 2; k++) {
+      struct io_uring_cqe *q = cq_pop(&d);
+      if (q == NULL) break;
+      if (q->user_data == 0x305) got_accept = q->res;
+      if (q->user_data == 0x307) got_connect = q->res;
+    }
+    check(got_connect == 0, "connect answers 0");
+    check(got_accept >= 0, "accept answers the new socket");
+
+    /* And the accepted socket is a socket: it carries the peer. */
+    struct sockaddr_in peer;
+    int plen = (int) sizeof(peer);
+    check(got_accept >= 0 &&
+              getpeername((SOCKET_T) got_accept, (struct sockaddr *) &peer, &plen) == 0,
+          "and it knows its peer");
+
+    if (got_accept >= 0) sock_close(got_accept);
+    sock_close(cfd);
 
     push(&d, IORING_OP_CLOSE, lfd, NULL, 0, 0, 0x304);
     e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
