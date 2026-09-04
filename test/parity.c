@@ -837,6 +837,53 @@ static int sc_poll_multishot(struct io_uring *ring, struct rec *out) {
  * and the one shape that needs no second ring. TWO completions land
  * here - the message and the send's own - and what each carries is the
  * kernel's answer, not ours. */
+/* min_complete counts, and one enter answers it. Two ops that become
+ * ready at different moments: an accept parked on a listener, and a
+ * connect that both completes itself and makes the accept ready. One
+ * submit_and_wait(2) must hand back BOTH - the kernel waits until the
+ * count is met, it does not return with one. The scene records how many
+ * were ready right after that single call. */
+static int sc_two_in_one_enter(struct io_uring *ring, struct rec *out) {
+  struct sockaddr_in a;
+  socklen_t alen = sizeof(a);
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (lfd < 0 || bind(lfd, (struct sockaddr *) &a, sizeof(a)) != 0 || listen(lfd, 1) != 0 ||
+      getsockname(lfd, (struct sockaddr *) &a, &alen) != 0)
+    return -1;
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_accept(sqe, lfd, NULL, NULL, 0);
+  io_uring_sqe_set_data64(sqe, 90);
+  io_uring_submit(ring);
+
+  const int cfd = socket(AF_INET, SOCK_STREAM, 0);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, cfd, (struct sockaddr *) &a, sizeof(a));
+  io_uring_sqe_set_data64(sqe, 91);
+  io_uring_submit_and_wait(ring, 2);
+
+  /* No further wait: only what THIS enter left behind is counted. */
+  unsigned ready = 0;
+  int afd = -1;
+  for (;;) {
+    struct io_uring_cqe *cqe = NULL;
+    if (io_uring_peek_cqe(ring, &cqe) != 0 || cqe == NULL) break;
+    if (cqe->user_data == 90) afd = cqe->res;
+    io_uring_cqe_seen(ring, cqe);
+    ready++;
+  }
+  out[0].user_data = 92;
+  out[0].res = (int) ready;
+  out[0].flags = 0;
+  if (afd >= 0) close(afd);
+  close(cfd);
+  close(lfd);
+  return 1;
+}
+
 static int sc_msg_ring_self(struct io_uring *ring, struct rec *out) {
   struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
   io_uring_prep_msg_ring(sqe, ring->ring_fd, 7, 0x515, 0);
@@ -888,6 +935,7 @@ static const struct scenario scenarios[] = {
   { "multishot recvmsg: the out header, then the payload", sc_recvmsg_multishot, 1 },
   { "the four fields of io_uring_recvmsg_out", sc_recvmsg_out_header, 1 },
   { "multishot poll: a CQE per readiness, then a cancel", sc_poll_multishot, 0 },
+  { "one enter with min_complete 2 answers with two", sc_two_in_one_enter, 0 },
   { "msg_ring at its own ring: the message and the send", sc_msg_ring_self, 0 },
   { "msg_ring at a target that is not a ring", sc_msg_ring_bad_fd, 0 },
 };

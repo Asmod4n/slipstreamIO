@@ -782,17 +782,21 @@ int slipstream_engine_enter(int fd, unsigned int to_submit, unsigned int min_com
     process_queue(r);
   }
 
-  /* ONE PASS, never a loop. The kernel's enter does not spin either -
-   * it fills what it can and returns, and the repeating is the caller's:
-   * liburing's own __io_uring_get_cqe peeks the CQ and calls enter again
-   * while it comes up short. So this waits AT MOST once, and every call
-   * makes progress or blocks. */
+  /* min_complete is a COUNT, and enter answers it. The kernel waits
+   * until that many completions stand in the CQ - one wait pass that
+   * comes up short is not an answer, it is a wakeup. Measured against
+   * the kernel: two ops that become ready at different moments, one
+   * enter asking for two. The kernel hands back two. A single pass
+   * handed back one on the dispatch backend, because a backend may
+   * report the two events one wakeup apart. So this repeats the wait
+   * while the count is short, exactly as io_uring does, and blocks in
+   * the same place the kernel blocks. */
   if ((flags & IORING_ENTER_GETEVENTS) && min_complete > 0) {
     struct cq_ring *cq = cq_of(r);
     settle_worker_ticket(r); /* the worker's results, and the backlog */
     unsigned avail = __atomic_load_n(&cq->tail, __ATOMIC_ACQUIRE) -
                      __atomic_load_n(&cq->head, __ATOMIC_ACQUIRE);
-    if (avail < min_complete) {
+    while (avail < min_complete) {
       int timeout_ms = -1;
       if (has_deadline) {
         struct timespec now;

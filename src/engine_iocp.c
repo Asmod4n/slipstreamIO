@@ -142,7 +142,9 @@ static void iocp_close_ring(struct slip_ring *r) {
       struct iocp_op **p = &st->in_flight;
       while (*p != NULL && *p != w) p = &(*p)->next;
       if (*p == w) *p = w->next;
-      free(w->op);
+      /* The wrapper is ours and goes; the OP is a slot in the ring's
+       * op_pool, one allocation carved up at setup, and freeing a
+       * pointer into the middle of it aborts. */
       free(w);
     }
   }

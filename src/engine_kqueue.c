@@ -122,7 +122,25 @@ static int kqueue_arm(struct slip_ring *r, struct eng_op *op) {
   if (*armed) return 0; /* the knote is there, and vouched for */
 
   struct kevent ev;
-  EV_SET(&ev, (uintptr_t) op->sqe.fd, kq_filter_of(op->wait_events), EV_ADD, 0, 0, NULL);
+  const short filter = kq_filter_of(op->wait_events);
+  EV_SET(&ev, (uintptr_t) op->sqe.fd, filter, EV_ADD, 0, 0, NULL);
+  if (kevent(r->be_fd, &ev, 1, NULL, 0, NULL) == 0) {
+    *armed = 1;
+    return 0;
+  }
+  /* A knote for this ident and filter may already be there: disarm
+   * leaves it deliberately, and the idle branch above then forgets that
+   * it did. BSD kqueue takes a second EV_ADD as a modify and says yes;
+   * libkqueue answers -1 and sets no errno, so the two cannot be told
+   * apart by asking. Deleting first makes the add apply to a knote that
+   * certainly is not there - which also clears a stale one left by a
+   * descriptor number that came back as something else.
+   *
+   * Only on the failure path, which is the RE-ARM: a multishot poll
+   * parks again on the descriptor it just answered for. */
+  EV_SET(&ev, (uintptr_t) op->sqe.fd, filter, EV_DELETE, 0, 0, NULL);
+  (void) kevent(r->be_fd, &ev, 1, NULL, 0, NULL);
+  EV_SET(&ev, (uintptr_t) op->sqe.fd, filter, EV_ADD, 0, 0, NULL);
   if (kevent(r->be_fd, &ev, 1, NULL, 0, NULL) == 0) {
     *armed = 1;
     return 0;

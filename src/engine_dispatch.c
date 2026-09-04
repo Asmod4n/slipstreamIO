@@ -208,9 +208,12 @@ static void dsp_close_ring(struct slip_ring *r) {
   }
   for (;;) {
     mtx_lock(&st->mtx);
-    /* The ops are ours to free - the ring is going, nobody collects
-     * them. */
-    for (unsigned i = 0; i < st->done_n; i++) free(st->done[i].op);
+    /* The ops are DROPPED, not freed. An eng_op is a slot in the ring's
+     * op_pool, which is one allocation carved up at setup and released
+     * whole with r->block - free() on a pointer into the middle of it
+     * is what glibc calls an invalid pointer, and it aborts. Nothing
+     * collects these because the ring is going; letting go is the whole
+     * of it. */
     st->done_n = 0;
     const unsigned live = st->live;
     mtx_unlock(&st->mtx);
