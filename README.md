@@ -105,6 +105,12 @@ shared machine (`src/engine_posix.c`) does everything else:
   `dispatch_io` channel, connect/openat to the global concurrent queue.
   Proven against Apple's own swift-corelibs-libdispatch
 
+**macOS takes dispatch, and nothing else.** Apple does not support
+kqueue, poll or select as vendor APIs. `backend_default()` answers
+`dispatch` there, and `backend_by_name` offers kqueue on the BSDs only.
+`engine_kqueue.c` still compiles under `__APPLE__`, for libkqueue, but
+nothing on Apple selects it.
+
 COMPLETION - the OS runs the op and reports the outcome, the same
 shape io_uring itself has; nothing parks:
 

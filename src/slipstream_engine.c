@@ -39,6 +39,9 @@ static struct slip_ring g_rings[SLIP_RINGS_MAX];
  * running rings would strand their pending ops. */
 static const struct eng_backend *g_backend;
 
+/* macOS takes dispatch, and nothing else: Apple does not support kqueue,
+   poll or select as vendor APIs. backend_by_name offers kqueue on the
+   BSDs only, for the same reason. */
 static const struct eng_backend *backend_default(void) {
 #if defined(_WIN32)
   return &slip_backend_iocp;
