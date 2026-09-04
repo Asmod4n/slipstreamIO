@@ -23,7 +23,7 @@ trap 'rm -rf "$work"' EXIT
 cp -r "$src" "$work/liburing"
 cd "$work/liburing"
 
-# The seam: the file that CHOOSES an arch header, and the twelve
+# The hook-in point: the file that CHOOSES an arch header, and the twelve
 # wrappers it now chooses. Not arch/generic/syscall.h - configure turns
 # CONFIG_NOLIBC on by itself on x86_64, and then that file is never
 # compiled.

@@ -26,7 +26,7 @@ The decision between kernel and engine is made at runtime, by asking
 the kernel: attempt `io_uring_setup(2)` at first use. Version numbers
 cannot answer it — seccomp and `kernel.io_uring_disabled` say no on
 kernels whose version says yes, and a container builds where another
-machine runs. The seam is what makes it cheap: both sides are the same
+machine runs. The wrappers are what make it cheap: both sides are the same
 symbols in the same binary — the wrappers — so nothing needs two linked
 implementations of liburing's names, and nothing needs dlopen to be
 CORRECT. `slipstream_syscall_set_engine(int)` remains for a caller that
@@ -34,7 +34,7 @@ wants to choose explicitly; a wrong flag is refused with words.
 
 ## Done
 
-- **The seam** — `src/liburing_syscall.h` replaces liburing's
+- **The twelve wrappers** — `src/liburing_syscall.h` replaces liburing's
   `src/syscall.h` (the file that *chooses* an arch header; substituting
   `arch/generic/syscall.h` is a false green, configure turns
   `CONFIG_NOLIBC` on by itself on x86_64 and never compiles it).
@@ -72,7 +72,7 @@ wants to choose explicitly; a wrong flag is refused with words.
   inside `shim/` (asked with `-H`), and a MinGW cross compile takes the
   Windows set.
 - **The proofs** — `test/with_liburing.sh` builds a real liburing WITH
-  the seam (hard-fails unless `liburing.a` references `slipstream_*`
+  the wrappers (hard-fails unless `liburing.a` references `slipstream_*`
   and the consumer compiled against our installed header, not
   `/usr/include`), then one ordinary liburing program completes the
   same NOP on the kernel side, with the engine forced, and under a
@@ -109,7 +109,7 @@ descriptor (token 0 is stdin, measured as an mmap on stdin).
 ### The engine posts under one mutex, engine and worker both
 
 The old header-only engine kept the CQ strictly single-producer by
-handing worker results back to the engine thread. Behind the seam the
+handing worker results back to the engine thread. Behind the wrappers the
 CQ is our own calloc'd block and both threads post under `mtx`, with a
 release-store on the tail the caller's liburing inlines acquire. The
 caller moves the head on its own, so free CQ room is recomputed, never
@@ -208,7 +208,7 @@ descriptor in two tables.
 
 ### 2. Carrying liburing, and the packaging step
 
-The build step that copies the two seam files into the carried liburing
+The build step that copies the two wrapper files into the carried liburing
 tree and installs its headers at the place we define, per consumer gem
 (`mruby-io-uring`'s mrbgem.rake is the template). The dlopen of our
 built `liburing.so` on the allowed path belongs here too: correctness
