@@ -797,6 +797,42 @@ static int sc_recvmsg_out_header(struct io_uring *ring, struct rec *out) {
   return n;
 }
 
+/* Multishot poll: one submission, a CQE per readiness. The scene makes
+ * the socket readable, drains it, makes it readable again, then cancels
+ * - so what is measured is the arming, the re-arming, and how it ends. */
+static int sc_poll_multishot(struct io_uring *ring, struct rec *out) {
+  int sp[2];
+  char sink[8];
+  int n = 0;
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_poll_multishot(sqe, sp[0], POLLIN);
+  io_uring_sqe_set_data64(sqe, 280);
+  io_uring_submit(ring);
+
+  if (write(sp[1], "a", 1) != 1) return -1;
+  n += take_within(ring, &out[n], 500);
+  if (read(sp[0], sink, sizeof(sink)) != 1) return -1;
+
+  if (write(sp[1], "b", 1) != 1) return -1;
+  n += take_within(ring, &out[n], 500);
+  if (read(sp[0], sink, sizeof(sink)) != 1) return -1;
+
+  /* And how it ends: cancel by user_data. Two more completions may come
+   * - the cancel's own answer and the poll's last word. */
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_cancel64(sqe, 280, 0);
+  io_uring_sqe_set_data64(sqe, 281);
+  io_uring_submit(ring);
+  n += take_within(ring, &out[n], 500);
+  n += take_within(ring, &out[n], 500);
+
+  close(sp[0]);
+  close(sp[1]);
+  return n;
+}
+
 /* MSG_RING at its own ring: what a worker pool does to stop a worker,
  * and the one shape that needs no second ring. TWO completions land
  * here - the message and the send's own - and what each carries is the
@@ -851,6 +887,7 @@ static const struct scenario scenarios[] = {
   { "multishot accept fills slots, one F_MORE CQE each", sc_accept_multishot, 1 },
   { "multishot recvmsg: the out header, then the payload", sc_recvmsg_multishot, 1 },
   { "the four fields of io_uring_recvmsg_out", sc_recvmsg_out_header, 1 },
+  { "multishot poll: a CQE per readiness, then a cancel", sc_poll_multishot, 0 },
   { "msg_ring at its own ring: the message and the send", sc_msg_ring_self, 0 },
   { "msg_ring at a target that is not a ring", sc_msg_ring_bad_fd, 0 },
 };

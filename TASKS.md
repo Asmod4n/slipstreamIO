@@ -186,12 +186,17 @@ accessors read and two measured facts in it: res counts the header and
 the RESERVED name and control room, not what was written; and EOF keeps
 its buffer, where a plain recv gives one back.
 
-Still open: multishot poll, -EOPNOTSUPP today and named that way rather
-than answered wrongly. Multishot recvmsg without a provided buffer is
-refused for the same reason - nothing has measured it. MSG_RING's
-fd-passing form (IORING_MSG_SEND_FD) is refused for the same reason -
-nothing has measured it, and a wrong answer there is one descriptor in
-two tables.
+Multishot poll is delivered as well: each readiness is a CQE with
+F_MORE and the op stays armed, and a cancel ends it with -ECANCELED and
+no F_MORE. Emitting and parking again is the whole of it - the ready
+loop re-arms anything that parks.
+
+Every opcode webmachine preps is now carried.
+
+Still refused BY NAME, because nothing has measured them: multishot
+recvmsg without a provided buffer, and MSG_RING's
+fd-passing form (IORING_MSG_SEND_FD), where a wrong answer is one
+descriptor in two tables.
 
 ### 2. Carrying liburing, and the packaging step
 

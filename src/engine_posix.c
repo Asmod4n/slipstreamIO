@@ -679,9 +679,25 @@ enum eng_verdict slip_posix_try(struct slip_ring *r, struct eng_op *op, int *res
       *res_out = n < 0 ? -errno : (int) n;
       return RAN;
     case IORING_OP_POLL_ADD: {
+      /* MULTISHOT: one submission, a CQE per readiness, each with
+       * F_MORE, and the op stays armed. Only a cancel ends it, and it
+       * ends with -ECANCELED and no F_MORE - which falls out of the
+       * cancel path posting the op's own completion.
+       *
+       * Measured (test/parity.c, "multishot poll"): two readinesses
+       * answered res=POLLIN with F_MORE, the cancel answered 0, and the
+       * poll's last word was -ECANCELED.
+       *
+       * Emitting and returning PARK is the whole of it: the ready loop
+       * re-arms anything that parks again. */
       if (s->len & IORING_POLL_ADD_MULTI) {
-        *res_out = -EOPNOTSUPP;
-        return RAN;
+        const short want = (short) s->poll32_events;
+        const short have = revents_now(s->fd, want);
+        if (have != 0) {
+          slip_engine_emit(r, s->user_data, (int) (unsigned short) have, IORING_CQE_F_MORE);
+        }
+        op->wait_events = want;
+        return PARK;
       }
       /* The readiness IS the answer: ready now completes with revents,
        * not ready parks on WHAT WAS ASKED FOR - all of it, not the two
