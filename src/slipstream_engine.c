@@ -91,6 +91,8 @@ const char *slipstream_engine_backend_name(void) {
   return (g_backend ? g_backend : backend_default())->name;
 }
 
+static int msg_ring(struct slip_ring *from, const struct io_uring_sqe *s);
+
 static struct slip_ring *ring_of(int fd) {
   if ((fd & SLIP_RING_TOKEN) == 0) return NULL;
   const int i = fd & ~SLIP_RING_TOKEN;
@@ -339,6 +341,14 @@ static void process_queue(struct slip_ring *r) {
       op->sqe.flags &= (__u8) ~IOSQE_FIXED_FILE;
     }
 
+    /* MSG_RING is not IO. It posts a CQE on ANOTHER ring, so no backend
+     * has anything of its own to do with it and all five would do the
+     * same thing - the factor-once rule, so it is here. */
+    if (op->sqe.opcode == IORING_OP_MSG_RING) {
+      slip_engine_post(r, op, msg_ring(r, &op->sqe));
+      continue;
+    }
+
     int res = 0;
     if (r->be->execute(r, op, &res) == EXEC_DONE) {
       if (res < 0 && linked) r->chain_failed = 1;
@@ -347,6 +357,34 @@ static void process_queue(struct slip_ring *r) {
       r->blocking = op; /* the chain waits wherever the op is */
     }
   }
+}
+
+/* A CQE for somebody else's ring.
+ *
+ * The command is in sqe->addr, which the ABI header says in as many
+ * words. The rest is measured, not remembered (THIRD_PARTY.md): a
+ * scenario in test/parity.c submits this to a running kernel and reads
+ * what comes back. It answered - target CQE first, carrying sqe->off as
+ * user_data and sqe->len as res; then the sender's own, res 0; and
+ * -EBADF when the target is not a ring.
+ *
+ * The order falls out of doing it in that sequence: emit, then post.
+ *
+ * IORING_MSG_SEND_FD hands a registered descriptor to another ring's
+ * fixed table. It is refused BY NAME rather than ignored - nothing here
+ * has measured it, and a wrong answer to a descriptor hand-off is a
+ * descriptor in two tables. */
+static int msg_ring(struct slip_ring *from, const struct io_uring_sqe *s) {
+  struct slip_ring *to;
+  if (s->addr != IORING_MSG_DATA) return -EOPNOTSUPP;
+  to = ring_of(s->fd);
+  if (to == NULL) return -EBADF;
+  slip_engine_emit(to, s->off, (int) s->len, 0);
+  /* A ring may message itself, and then there is nobody to wake: the
+   * caller is the thread that will read it. Another ring may have a
+   * thread asleep in its backend's wait, and poke is the door. */
+  if (to != from && to->be != NULL && to->be->poke != NULL) to->be->poke(to);
+  return 0;
 }
 
 /* A chain whose head went to the worker: the ticket says it finished.

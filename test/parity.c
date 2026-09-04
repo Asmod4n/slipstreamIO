@@ -85,6 +85,27 @@ static int collect(struct io_uring *ring, struct rec *out, int want) {
   return n;
 }
 
+/* collect(), but it gives up. A scenario for an op ONE side does not
+ * have yet would otherwise wait forever for a CQE that is not coming,
+ * and a hang says nothing. A short count is an answer: it is printed
+ * beside the other side's. */
+static int collect_within(struct io_uring *ring, struct rec *out, int want, unsigned ms) {
+  struct __kernel_timespec ts;
+  int n = 0;
+  ts.tv_sec = ms / 1000;
+  ts.tv_nsec = (long long) (ms % 1000) * 1000000;
+  while (n < want) {
+    struct io_uring_cqe *cqe;
+    if (io_uring_wait_cqe_timeout(ring, &cqe, &ts) != 0) break;
+    out[n].user_data = cqe->user_data;
+    out[n].res = cqe->res;
+    out[n].flags = cqe->flags & REC_FLAG_MASK;
+    io_uring_cqe_seen(ring, cqe);
+    n++;
+  }
+  return n;
+}
+
 static int cmp_rec(const void *a, const void *b) {
   const struct rec *x = a, *y = b;
   if (x->user_data != y->user_data) return x->user_data < y->user_data ? -1 : 1;
@@ -662,6 +683,27 @@ static int sc_accept_multishot(struct io_uring *ring, struct rec *out) {
   return n;
 }
 
+/* MSG_RING at its own ring: what a worker pool does to stop a worker,
+ * and the one shape that needs no second ring. TWO completions land
+ * here - the message and the send's own - and what each carries is the
+ * kernel's answer, not ours. */
+static int sc_msg_ring_self(struct io_uring *ring, struct rec *out) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_msg_ring(sqe, ring->ring_fd, 7, 0x515, 0);
+  io_uring_sqe_set_data64(sqe, 40);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 2, 500);
+}
+
+/* A target that is not a ring. */
+static int sc_msg_ring_bad_fd(struct io_uring *ring, struct rec *out) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_msg_ring(sqe, -1, 1, 0x516, 0);
+  io_uring_sqe_set_data64(sqe, 41);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 1, 500);
+}
+
 struct scenario {
   const char *what;
   scenario_fn run;
@@ -693,6 +735,8 @@ static const struct scenario scenarios[] = {
   { "multishot recv: F_MORE per arrival, EOF ends it", sc_recv_multishot, 1 },
   { "setsockopt and getsockopt as ring commands", sc_cmd_sockopt, 1 },
   { "multishot accept fills slots, one F_MORE CQE each", sc_accept_multishot, 1 },
+  { "msg_ring at its own ring: the message and the send", sc_msg_ring_self, 0 },
+  { "msg_ring at a target that is not a ring", sc_msg_ring_bad_fd, 0 },
 };
 
 static int run_side(const struct scenario *sc, int engine, struct rec *out) {

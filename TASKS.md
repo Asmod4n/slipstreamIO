@@ -173,13 +173,19 @@ a FIFO blocks; off Linux a resolve constraint is refused, not dropped).
 The engine speaks the CARRIED liburing's io_uring.h on every platform,
 Linux included - this host's /usr/include/linux lacked IORING_OP_BIND.
 
-Still open: the multishot family (accept, recv, recvmsg, poll) with
-their CQE flags (F_MORE, buffer ids), cmd_sock
-(SOCKET_URING_OP_SETSOCKOPT and friends), the direct-descriptor
-variants, and the register family (files_sparse, file_alloc_range,
-ring_fd, buf_ring). The old header-only engine implemented most of
-these semantics once; they move behind the seam op by op, each with a
-parity scene.
+Since delivered as well, each with its own parity scene: multishot
+accept and multishot recv with F_MORE and the buffer id, cmd_sock
+(SETSOCKOPT, GETSOCKOPT, GETSOCKNAME), the direct-descriptor variants
+and the register family (files_sparse, file_alloc_range, ring_fd,
+buf_ring), and MSG_RING in its data form. MSG_RING sits in the CORE and
+not in a backend: it posts a CQE on another ring, so all five backends
+would do the same thing.
+
+Still open: multishot recvmsg and multishot poll, both -EOPNOTSUPP
+today and both named that way rather than answered wrongly. MSG_RING's
+fd-passing form (IORING_MSG_SEND_FD) is refused for the same reason -
+nothing has measured it, and a wrong answer there is one descriptor in
+two tables.
 
 ### 2. Carrying liburing, and the packaging step
 

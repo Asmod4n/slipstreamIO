@@ -4,6 +4,12 @@
  * what a caller can poll. Only Linux needs no producer of its own: the
  * kernel already turns the signal into a descriptor.
  */
+/* signalfd, sigtimedwait and the sigset calls sit behind these under a
+ * strict -std=c11, which is what this Makefile builds with. Declared on
+ * the first lines, as engine_posix.c does. */
+#define _GNU_SOURCE 1
+#define _DEFAULT_SOURCE 1
+
 #include "slipstream_signal.h"
 
 #include <errno.h>

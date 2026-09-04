@@ -8,6 +8,10 @@
  * (test/signal_wine.sh) and cannot be driven from here, because nothing
  * outside a console session can post CTRL_C_EVENT to it.
  */
+/* sigprocmask, kill and sigset_t sit behind these under -std=c11. */
+#define _GNU_SOURCE 1
+#define _DEFAULT_SOURCE 1
+
 #include "slipstream_signal.h"
 
 #include <errno.h>
