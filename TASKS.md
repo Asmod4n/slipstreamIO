@@ -254,8 +254,16 @@ implementation - the factor-once rule, kept. Open remains:
   STATX and UNLINKAT are carried too - statx from _stat64, with
   stx_mask saying which fields that filled, because Windows has no
   blocks, no blksize, no uid and no gid to report and an invented number
-  is worse than a clear bit. What is left there: the direct-descriptor
-  and multishot forms of accept, and multishot poll.
+  is worse than a clear bit. RECVMSG and SENDMSG go through WSARecvMsg
+  and WSASendMsg: a POSIX msghdr becomes a WSAMSG, which says the same
+  things in a different order - WSABUF is length-then-pointer where
+  iovec is pointer-then-length, and the control buffer is a WSABUF
+  rather than a pointer and a size beside it. Accept also carries its
+  direct and multishot forms.
+
+  What is left there: multishot poll, and multishot recvmsg, which
+  writes a layout into a provided buffer that nothing has measured on
+  this platform.
 - macOS natively: the dispatch backend and thrd_compat.h's pthreads arm
   have never met a real Mac - thrd_compat carries only the Win32 arm,
   macOS still takes <threads.h> it does not have. Needs forgecore or a

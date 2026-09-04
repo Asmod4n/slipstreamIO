@@ -28,7 +28,11 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-"$mingw" -std=gnu11 -Wall -Wextra -O2 -I"$here/src" -I"$here/shim/common" \
+# shim/windows carries the headers Windows has no counterpart for -
+# sys/socket.h with a POSIX-shaped msghdr among them, which the engine
+# and this test both read.
+"$mingw" -std=gnu11 -Wall -Wextra -O2 -I"$here/src" -I"$here/shim/windows" \
+  -I"$here/shim/common" \
   -I"$src/src/include" -o "$work/backends.exe" "$here/test/backends.c" \
   "$here"/src/slipstream_engine.c "$here"/src/engine_*.c -lws2_32
 

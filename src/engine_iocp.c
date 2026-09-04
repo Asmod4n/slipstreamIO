@@ -27,6 +27,10 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+/* The shim's POSIX-shaped struct msghdr, which liburing's recvmsg
+ * helpers are written against. Windows has WSAMSG instead, and
+ * iocp_msg_to_wsa is the translation. */
+#include <sys/socket.h>
 /* AcceptEx, ConnectEx and their GUIDs live here, not in winsock2.h. */
 #include <mswsock.h>
 #include <windows.h>
@@ -58,7 +62,14 @@ struct iocp_op {
   SOCKET sock;
   WSABUF wb;
   unsigned char kind;
-  SOCKET accepted; /* ACCEPT: the socket AcceptEx was given */
+  unsigned char multishot;
+  /* RECVMSG/SENDMSG: WSAMSG and the buffers it points at must outlive
+   * the call, so they ride here beside the OVERLAPPED. */
+  WSAMSG wsa_msg;
+  WSABUF wsa_iov[8];
+  struct msghdr *back; /* where namelen and flags are written back */ /* ACCEPT: re-arm after every completion */
+  __u32 file_index;        /* ACCEPT: install into the fixed table, not hand back an fd */
+  SOCKET accepted;         /* ACCEPT: the socket AcceptEx was given */
   /* AcceptEx writes both addresses here and wants 16 bytes of slack
    * after each - Microsoft's documented requirement, not a guess. */
   char addrs[2 * (sizeof(struct sockaddr_storage) + 16)];
@@ -196,6 +207,93 @@ static int iocp_bind_wildcard(SOCKET s) {
 static int iocp_associate(struct iocp_state *st, SOCKET s) {
   if (CreateIoCompletionPort((HANDLE) s, st->port, IOCP_KEY_IO, 0) != NULL) return 0;
   return GetLastError() == ERROR_INVALID_PARAMETER ? 0 : -1;
+}
+
+/* WSARecvMsg is an extension too, and WSASendMsg with it. */
+static LPFN_WSARECVMSG iocp_wsarecvmsg(SOCKET s) {
+  static LPFN_WSARECVMSG fn;
+  GUID id = WSAID_WSARECVMSG;
+  DWORD got = 0;
+  if (fn != NULL) return fn;
+  if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof(id), &fn, sizeof(fn), &got,
+               NULL, NULL) != 0) {
+    fn = NULL;
+  }
+  return fn;
+}
+
+static LPFN_WSASENDMSG iocp_wsasendmsg(SOCKET s) {
+  static LPFN_WSASENDMSG fn;
+  GUID id = WSAID_WSASENDMSG;
+  DWORD got = 0;
+  if (fn != NULL) return fn;
+  if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof(id), &fn, sizeof(fn), &got,
+               NULL, NULL) != 0) {
+    fn = NULL;
+  }
+  return fn;
+}
+
+/* A POSIX msghdr, as WSAMSG. The two say the same things in a different
+ * order: WSABUF is length-then-pointer where iovec is pointer-then-
+ * length, and the control buffer is a WSABUF of its own rather than a
+ * pointer and a size beside it. Answers 0, or a negated errno. */
+static int iocp_msg_to_wsa(struct iocp_op *w, const struct msghdr *m) {
+  size_t i;
+  if (m == NULL) return -EFAULT;
+  if (m->msg_iovlen > (sizeof(w->wsa_iov) / sizeof(w->wsa_iov[0]))) return -EMSGSIZE;
+  for (i = 0; i < m->msg_iovlen; i++) {
+    w->wsa_iov[i].len = (ULONG) m->msg_iov[i].iov_len;
+    w->wsa_iov[i].buf = (CHAR *) m->msg_iov[i].iov_base;
+  }
+  memset(&w->wsa_msg, 0, sizeof(w->wsa_msg));
+  w->wsa_msg.name = (LPSOCKADDR) m->msg_name;
+  w->wsa_msg.namelen = (INT) m->msg_namelen;
+  w->wsa_msg.lpBuffers = w->wsa_iov;
+  w->wsa_msg.dwBufferCount = (ULONG) m->msg_iovlen;
+  w->wsa_msg.Control.len = (ULONG) m->msg_controllen;
+  w->wsa_msg.Control.buf = (CHAR *) m->msg_control;
+  w->wsa_msg.dwFlags = (DWORD) m->msg_flags;
+  return 0;
+}
+
+/* One AcceptEx, issued. Answers 1 when it is in flight, or a negated
+ * errno. Its own function because a MULTISHOT accept issues the next
+ * one from inside the completion, with the same op. */
+static int iocp_arm_accept(struct slip_ring *r, struct iocp_state *st, struct eng_op *op) {
+  const struct io_uring_sqe *s = &op->sqe;
+  LPFN_ACCEPTEX acceptex = iocp_acceptex((SOCKET) s->fd);
+  struct iocp_op *w;
+  SOCKET child;
+  DWORD got = 0;
+  (void) r;
+  if (acceptex == NULL || iocp_associate(st, (SOCKET) s->fd) != 0) return -ENOTSOCK;
+  child = socket(AF_INET, SOCK_STREAM, 0);
+  if (child == INVALID_SOCKET) return win_err_to_errno((DWORD) WSAGetLastError());
+  w = calloc(1, sizeof(*w));
+  if (w == NULL) {
+    closesocket(child);
+    return -ENOMEM;
+  }
+  w->op = op;
+  w->sock = (SOCKET) s->fd;
+  w->accepted = child;
+  w->kind = IOCP_KIND_ACCEPT;
+  w->multishot = (s->ioprio & IORING_ACCEPT_MULTISHOT) != 0;
+  w->file_index = s->file_index;
+  op->be_source = w;
+  if (!acceptex((SOCKET) s->fd, child, w->addrs, 0, sizeof(struct sockaddr_storage) + 16,
+                sizeof(struct sockaddr_storage) + 16, &got, &w->ov) &&
+      WSAGetLastError() != WSA_IO_PENDING) {
+    const int err = win_err_to_errno((DWORD) WSAGetLastError());
+    closesocket(child);
+    op->be_source = NULL;
+    free(w);
+    return err;
+  }
+  w->next = st->in_flight;
+  st->in_flight = w;
+  return 1;
 }
 
 static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
@@ -428,42 +526,11 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
      * liburing writes the address in addr and the pointer to its length
      * in off - both optional. */
     case IORING_OP_ACCEPT: {
-      LPFN_ACCEPTEX acceptex = iocp_acceptex((SOCKET) s->fd);
-      struct iocp_op *w;
-      SOCKET child;
-      DWORD got = 0;
-      if (acceptex == NULL || iocp_associate(st, (SOCKET) s->fd) != 0) {
-        *res = -ENOTSOCK;
+      const int rc = iocp_arm_accept(r, st, op);
+      if (rc <= 0) {
+        *res = rc;
         return EXEC_DONE;
       }
-      child = socket(AF_INET, SOCK_STREAM, 0);
-      if (child == INVALID_SOCKET) {
-        *res = win_err_to_errno((DWORD) WSAGetLastError());
-        return EXEC_DONE;
-      }
-      w = calloc(1, sizeof(*w));
-      if (w == NULL) {
-        closesocket(child);
-        *res = -ENOMEM;
-        return EXEC_DONE;
-      }
-      w->op = op;
-      w->sock = (SOCKET) s->fd;
-      w->accepted = child;
-      w->kind = IOCP_KIND_ACCEPT;
-      op->be_source = w;
-      if (!acceptex((SOCKET) s->fd, child, w->addrs, 0,
-                    sizeof(struct sockaddr_storage) + 16,
-                    sizeof(struct sockaddr_storage) + 16, &got, &w->ov) &&
-          WSAGetLastError() != WSA_IO_PENDING) {
-        *res = win_err_to_errno((DWORD) WSAGetLastError());
-        closesocket(child);
-        op->be_source = NULL;
-        free(w);
-        return EXEC_DONE;
-      }
-      w->next = st->in_flight;
-      st->in_flight = w;
       return EXEC_PENDING;
     }
     /* CONNECT: ConnectEx, and a bind first because it insists on one. */
@@ -490,6 +557,68 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       op->be_source = w;
       if (!connectex((SOCKET) s->fd, sa, (int) s->off, NULL, 0, NULL, &w->ov) &&
           WSAGetLastError() != WSA_IO_PENDING) {
+        *res = win_err_to_errno((DWORD) WSAGetLastError());
+        op->be_source = NULL;
+        free(w);
+        return EXEC_DONE;
+      }
+      w->next = st->in_flight;
+      st->in_flight = w;
+      return EXEC_PENDING;
+    }
+    case IORING_OP_RECVMSG:
+    case IORING_OP_SENDMSG: {
+      struct msghdr *m = (struct msghdr *) (uintptr_t) s->addr;
+      const int recving = s->opcode == IORING_OP_RECVMSG;
+      struct iocp_op *w;
+      int rc;
+      if ((s->ioprio & IORING_RECV_MULTISHOT) != 0) {
+        /* The multishot form writes a LAYOUT into a provided buffer.
+         * Nothing here has measured what this platform's extension does
+         * with that, so it is refused by name. */
+        *res = -EOPNOTSUPP;
+        return EXEC_DONE;
+      }
+      if (iocp_associate(st, (SOCKET) s->fd) != 0) {
+        *res = -ENOTSOCK;
+        return EXEC_DONE;
+      }
+      w = calloc(1, sizeof(*w));
+      if (w == NULL) {
+        *res = -ENOMEM;
+        return EXEC_DONE;
+      }
+      rc = iocp_msg_to_wsa(w, m);
+      if (rc != 0) {
+        free(w);
+        *res = rc;
+        return EXEC_DONE;
+      }
+      w->op = op;
+      w->sock = (SOCKET) s->fd;
+      w->kind = IOCP_KIND_IO;
+      w->back = m;
+      op->be_source = w;
+      if (recving) {
+        LPFN_WSARECVMSG recvmsg_fn = iocp_wsarecvmsg((SOCKET) s->fd);
+        if (recvmsg_fn == NULL) {
+          op->be_source = NULL;
+          free(w);
+          *res = -EOPNOTSUPP;
+          return EXEC_DONE;
+        }
+        rc = recvmsg_fn((SOCKET) s->fd, &w->wsa_msg, NULL, &w->ov, NULL);
+      } else {
+        LPFN_WSASENDMSG sendmsg_fn = iocp_wsasendmsg((SOCKET) s->fd);
+        if (sendmsg_fn == NULL) {
+          op->be_source = NULL;
+          free(w);
+          *res = -EOPNOTSUPP;
+          return EXEC_DONE;
+        }
+        rc = sendmsg_fn((SOCKET) s->fd, &w->wsa_msg, (DWORD) s->msg_flags, NULL, &w->ov, NULL);
+      }
+      if (rc != 0 && WSAGetLastError() != WSA_IO_PENDING) {
         *res = win_err_to_errno((DWORD) WSAGetLastError());
         op->be_source = NULL;
         free(w);
@@ -561,14 +690,45 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
       if (w->kind == IOCP_KIND_ACCEPT) closesocket(w->accepted);
     } else {
       switch (w->kind) {
-        case IOCP_KIND_ACCEPT:
+        case IOCP_KIND_ACCEPT: {
           /* Until this call the accepted socket has none of the
            * listener's properties - Microsoft says so, and getpeername
            * fails without it. The answer is the socket, not a count. */
+          struct eng_op *acc = w->op;
           setsockopt(w->accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (const char *) &w->sock,
                      sizeof(w->sock));
-          out[n].res = (int) w->accepted;
+          /* A DIRECT accept never hands the number out: the socket goes
+           * into the fixed table and the answer is the slot, or 0 where
+           * the caller named the slot itself. */
+          if (w->file_index != 0) {
+            const int slot = slip_fixed_install(r, w->file_index, (int) w->accepted);
+            if (slot < 0) {
+              closesocket(w->accepted);
+              out[n].res = slot;
+            } else {
+              out[n].res = w->file_index == IORING_FILE_INDEX_ALLOC ? slot : 0;
+            }
+          } else {
+            out[n].res = (int) w->accepted;
+          }
+          /* MULTISHOT: this CQE says there is more, and the next
+           * AcceptEx is issued right here with the same op. The op is
+           * only finished when the re-arm fails. */
+          if (w->multishot && out[n].res >= 0) {
+            slip_engine_emit(r, acc->sqe.user_data, out[n].res,
+                             (unsigned) IORING_CQE_F_MORE);
+            w->op->be_source = NULL;
+            free(w);
+            if (iocp_arm_accept(r, st, acc) == 1) continue; /* no eng_done for this one */
+            /* The re-arm failed: the op ends, and the loop below is not
+             * reached for it - say so as its completion. */
+            out[n].op = acc;
+            out[n].res = -ECANCELED;
+            n++;
+            continue;
+          }
           break;
+        }
         case IOCP_KIND_CONNECT:
           setsockopt(w->sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
           out[n].res = 0;
@@ -578,7 +738,17 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
            * poll answers in poll's own words. */
           out[n].res = POLLIN;
           break;
-        default: out[n].res = (int) bytes; break;
+        default:
+          /* A recvmsg writes back how long the name really was and what
+           * flags the message carried; a caller reads both from its own
+           * msghdr, so they go back there. */
+          if (w->back != NULL) {
+            w->back->msg_namelen = (socklen_t) w->wsa_msg.namelen;
+            w->back->msg_controllen = w->wsa_msg.Control.len;
+            w->back->msg_flags = (int) w->wsa_msg.dwFlags;
+          }
+          out[n].res = (int) bytes;
+          break;
       }
     }
     w->op->be_source = NULL;
@@ -593,7 +763,7 @@ static const unsigned char iocp_carried_ops[] = {
   IORING_OP_SOCKET, IORING_OP_BIND, IORING_OP_LISTEN, IORING_OP_SHUTDOWN,
   IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD,
   IORING_OP_OPENAT, IORING_OP_READ, IORING_OP_WRITE,
-  IORING_OP_STATX, IORING_OP_UNLINKAT, 255,
+  IORING_OP_STATX, IORING_OP_UNLINKAT, IORING_OP_RECVMSG, IORING_OP_SENDMSG, 255,
 };
 
 const struct eng_backend slip_backend_iocp = {

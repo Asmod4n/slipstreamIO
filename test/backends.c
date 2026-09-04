@@ -36,6 +36,10 @@
 #include <ws2tcpip.h>
 #include <fcntl.h>
 #include <linux/stat.h>
+/* The shim's POSIX-shaped msghdr and iovec: sendmsg and recvmsg speak
+ * them on every platform here. */
+#include <sys/socket.h>
+#include <sys/uio.h>
 #ifndef AT_FDCWD
 #define AT_FDCWD (-100)
 #endif
@@ -72,6 +76,7 @@ static void sock_close(int fd) { closesocket((SOCKET) fd); }
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 typedef int SOCKET_T;
 static int pair_of_streams(int sp[2]) { return socketpair(AF_UNIX, SOCK_STREAM, 0, sp); }
@@ -333,6 +338,40 @@ static void scenes(const char *name) {
     fc = cq_pop(&d);
     check(fc != NULL && fc->res < 0, "and statx says it is gone");
     remove(tmpname);
+  }
+
+  /* 2e: sendmsg and recvmsg round a message through the ring. The bytes
+   * are compared, not only the counts. */
+  {
+    int mp[2] = { -1, -1 };
+    static char sbuf[] = "msg";
+    static char rbuf2[8];
+    static struct iovec siov, riov;
+    static struct msghdr smsg, rmsg;
+    check(pair_of_streams(mp) == 0, "a socketpair for the messages");
+    siov.iov_base = sbuf;
+    siov.iov_len = 3;
+    memset(&smsg, 0, sizeof(smsg));
+    smsg.msg_iov = &siov;
+    smsg.msg_iovlen = 1;
+    push(&d, IORING_OP_SENDMSG, mp[1], &smsg, 0, 0, 0x701);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    struct io_uring_cqe *mq = cq_pop(&d);
+    check(mq != NULL && mq->res == 3, "sendmsg puts three bytes");
+
+    memset(rbuf2, 0, sizeof(rbuf2));
+    riov.iov_base = rbuf2;
+    riov.iov_len = sizeof(rbuf2);
+    memset(&rmsg, 0, sizeof(rmsg));
+    rmsg.msg_iov = &riov;
+    rmsg.msg_iovlen = 1;
+    push(&d, IORING_OP_RECVMSG, mp[0], &rmsg, 0, 0, 0x702);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    mq = cq_pop(&d);
+    check(mq != NULL && mq->res == 3, "recvmsg takes three back");
+    check(memcmp(rbuf2, "msg", 3) == 0, "and they are the bytes that were sent");
+    sock_close(mp[0]);
+    sock_close(mp[1]);
   }
 
   /* 3: an idle wait with a deadline says -ETIME, after the deadline. */
