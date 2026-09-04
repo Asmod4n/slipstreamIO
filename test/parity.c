@@ -106,6 +106,21 @@ static int collect_within(struct io_uring *ring, struct rec *out, int want, unsi
   return n;
 }
 
+/* One completion, or none within ms. The bounded twin of the wait a
+ * scene does by hand. */
+static int take_within(struct io_uring *ring, struct rec *out, unsigned ms) {
+  struct __kernel_timespec ts;
+  struct io_uring_cqe *cqe = NULL;
+  ts.tv_sec = ms / 1000;
+  ts.tv_nsec = (long long) (ms % 1000) * 1000000;
+  if (io_uring_wait_cqe_timeout(ring, &cqe, &ts) != 0) return 0;
+  out->user_data = cqe->user_data;
+  out->res = cqe->res;
+  out->flags = cqe->flags & REC_FLAG_MASK;
+  io_uring_cqe_seen(ring, cqe);
+  return 1;
+}
+
 static int cmp_rec(const void *a, const void *b) {
   const struct rec *x = a, *y = b;
   if (x->user_data != y->user_data) return x->user_data < y->user_data ? -1 : 1;
@@ -683,6 +698,105 @@ static int sc_accept_multishot(struct io_uring *ring, struct rec *out) {
   return n;
 }
 
+/* Multishot recvmsg with a provided buffer. What the kernel writes into
+ * that buffer is a LAYOUT, and the layout is liburing's own: a
+ * struct io_uring_recvmsg_out, then the submitter's msg_namelen bytes,
+ * then its msg_controllen, then the payload. The scene reads it back
+ * with liburing's own accessors and fails when the payload is not the
+ * bytes the peer sent - a res that matches over a buffer that does not
+ * would be parity in name only. */
+static int sc_recvmsg_multishot(struct io_uring *ring, struct rec *out) {
+  enum { NBUF = 4, BUFSZ = 256 };
+  static char pool[NBUF * BUFSZ];
+  static struct msghdr mh;
+  int err = 0;
+  struct io_uring_buf_ring *br = io_uring_setup_buf_ring(ring, NBUF, 11, 0, &err);
+  int sp[2];
+  int n = 0;
+  int payload_ok = 0;
+  if (br == NULL) return NOT_IN_THIS_KERNEL;
+  const int mask = io_uring_buf_ring_mask(NBUF);
+  for (int i = 0; i < NBUF; i++)
+    io_uring_buf_ring_add(br, pool + i * BUFSZ, BUFSZ, (unsigned short) i, mask, i);
+  io_uring_buf_ring_advance(br, NBUF);
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+  if (write(sp[1], "four", 4) != 4) return -1;
+
+  memset(&mh, 0, sizeof(mh));
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_recvmsg_multishot(sqe, sp[0], &mh, 0);
+  sqe->flags |= IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 11;
+  io_uring_sqe_set_data64(sqe, 260);
+  io_uring_submit(ring);
+
+  if (take_within(ring, &out[n], 500)) {
+    if (out[n].res > 0 && (out[n].flags & IORING_CQE_F_BUFFER)) {
+      const unsigned short bid = (unsigned short) (out[n].flags >> IORING_CQE_BUFFER_SHIFT);
+      void *buf = pool + (size_t) bid * BUFSZ;
+      struct io_uring_recvmsg_out *o = io_uring_recvmsg_validate(buf, out[n].res, &mh);
+      if (o != NULL) {
+        const void *pay = io_uring_recvmsg_payload(o, &mh);
+        const unsigned len = io_uring_recvmsg_payload_length(o, out[n].res, &mh);
+        payload_ok = len == 4 && memcmp(pay, "four", 4) == 0;
+      }
+    }
+    n++;
+  }
+  close(sp[1]); /* EOF ends it */
+  n += take_within(ring, &out[n], 500);
+  close(sp[0]);
+  io_uring_free_buf_ring(ring, br, NBUF, 11);
+  return payload_ok ? n : -1;
+}
+
+/* The four fields of io_uring_recvmsg_out, as four completions, so the
+ * kernel's own values are printed rather than assumed. The scene sends
+ * "four" over a socketpair with msg_namelen and msg_controllen both 0. */
+static int sc_recvmsg_out_header(struct io_uring *ring, struct rec *out) {
+  enum { NBUF = 2, BUFSZ = 256 };
+  static char pool[NBUF * BUFSZ];
+  static struct msghdr mh;
+  int err = 0;
+  struct io_uring_buf_ring *br = io_uring_setup_buf_ring(ring, NBUF, 12, 0, &err);
+  int sp[2];
+  struct rec one;
+  int n = 0;
+  if (br == NULL) return NOT_IN_THIS_KERNEL;
+  const int mask = io_uring_buf_ring_mask(NBUF);
+  for (int i = 0; i < NBUF; i++)
+    io_uring_buf_ring_add(br, pool + i * BUFSZ, BUFSZ, (unsigned short) i, mask, i);
+  io_uring_buf_ring_advance(br, NBUF);
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+  if (write(sp[1], "four", 4) != 4) return -1;
+  memset(&mh, 0, sizeof(mh));
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_recvmsg_multishot(sqe, sp[0], &mh, 0);
+  sqe->flags |= IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 12;
+  io_uring_sqe_set_data64(sqe, 270);
+  io_uring_submit(ring);
+
+  if (take_within(ring, &one, 500) && one.res > 0 && (one.flags & IORING_CQE_F_BUFFER)) {
+    const unsigned short bid = (unsigned short) (one.flags >> IORING_CQE_BUFFER_SHIFT);
+    struct io_uring_recvmsg_out *o =
+        io_uring_recvmsg_validate(pool + (size_t) bid * BUFSZ, one.res, &mh);
+    if (o != NULL) {
+      out[n].user_data = 1; out[n].res = (int) o->namelen;    out[n].flags = 0; n++;
+      out[n].user_data = 2; out[n].res = (int) o->controllen; out[n].flags = 0; n++;
+      out[n].user_data = 3; out[n].res = (int) o->payloadlen; out[n].flags = 0; n++;
+      out[n].user_data = 4; out[n].res = (int) o->flags;      out[n].flags = 0; n++;
+    }
+  }
+  close(sp[1]);
+  (void) take_within(ring, &one, 500);
+  close(sp[0]);
+  io_uring_free_buf_ring(ring, br, NBUF, 12);
+  return n;
+}
+
 /* MSG_RING at its own ring: what a worker pool does to stop a worker,
  * and the one shape that needs no second ring. TWO completions land
  * here - the message and the send's own - and what each carries is the
@@ -735,6 +849,8 @@ static const struct scenario scenarios[] = {
   { "multishot recv: F_MORE per arrival, EOF ends it", sc_recv_multishot, 1 },
   { "setsockopt and getsockopt as ring commands", sc_cmd_sockopt, 1 },
   { "multishot accept fills slots, one F_MORE CQE each", sc_accept_multishot, 1 },
+  { "multishot recvmsg: the out header, then the payload", sc_recvmsg_multishot, 1 },
+  { "the four fields of io_uring_recvmsg_out", sc_recvmsg_out_header, 1 },
   { "msg_ring at its own ring: the message and the send", sc_msg_ring_self, 0 },
   { "msg_ring at a target that is not a ring", sc_msg_ring_bad_fd, 0 },
 };

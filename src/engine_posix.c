@@ -304,6 +304,106 @@ static enum eng_verdict run_recv_multishot(struct slip_ring *r, struct eng_op *o
   }
 }
 
+/* MULTISHOT RECVMSG. Same rhythm as the recv above, but what lands in
+ * the buffer is a LAYOUT, and the layout is liburing's own (MIT), read
+ * from its io_uring_recvmsg_validate / _name / _payload accessors:
+ *
+ *   struct io_uring_recvmsg_out   the lengths actually written
+ *   msg_namelen bytes             room the CALLER reserved for the name
+ *   msg_controllen bytes          room the CALLER reserved for control
+ *   the payload
+ *
+ * The accessors skip by the caller's reserved sizes, the header reports
+ * what was really written, and res is the whole of it -
+ * io_uring_recvmsg_payload_length computes the payload from res, so res
+ * is header + reserved + payload.
+ *
+ * Two things here were MEASURED against a running kernel, not assumed
+ * (test/parity.c, "multishot recvmsg" and "the four fields"):
+ *
+ *   - "four" over a socketpair with both reserved sizes 0 answers
+ *     res=20 with F_BUFFER|F_MORE - 16 of header and 4 of payload - and
+ *     the header reads namelen 0, controllen 0, payloadlen 4, flags 0.
+ *   - EOF answers res=16 and STILL CARRIES A BUFFER (F_BUFFER, the next
+ *     bid), without F_MORE. The plain recv gives its buffer back on EOF;
+ *     this one does not, and a caller that refilled on that assumption
+ *     would refill one too many. */
+static enum eng_verdict run_recvmsg_multishot(struct slip_ring *r, struct eng_op *op,
+                                              int *res_out) {
+  const struct io_uring_sqe *s = &op->sqe;
+  const struct msghdr *asked = (const struct msghdr *) (uintptr_t) s->addr;
+  size_t namelen;
+  size_t controllen;
+  size_t header;
+  if (asked == NULL) return (*res_out = -EFAULT), RAN;
+  /* Without a provided buffer there is nowhere to put a layout. What the
+   * kernel answers then is not measured here, so it is refused by name
+   * rather than guessed. */
+  if ((s->flags & IOSQE_BUFFER_SELECT) == 0) return (*res_out = -EOPNOTSUPP), RAN;
+  namelen = asked->msg_namelen;
+  controllen = asked->msg_controllen;
+  header = sizeof(struct io_uring_recvmsg_out) + namelen + controllen;
+  for (;;) {
+    void *rbuf = NULL;
+    unsigned rlen = 0;
+    unsigned short bid = 0;
+    unsigned cflags;
+    struct io_uring_recvmsg_out *out;
+    struct msghdr mh;
+    struct iovec iov;
+    ssize_t n;
+    const int rc = bufring_take(r, s->buf_group, &rbuf, &rlen, &bid);
+    if (rc != 0) {
+      *res_out = rc;
+      return RAN;
+    }
+    cflags = IORING_CQE_F_BUFFER | ((unsigned) bid << IORING_CQE_BUFFER_SHIFT);
+    if ((size_t) rlen < header) {
+      bufring_unget(r, s->buf_group);
+      *res_out = -EFAULT;
+      return RAN;
+    }
+    out = (struct io_uring_recvmsg_out *) rbuf;
+    memset(out, 0, sizeof(*out));
+    memset(&mh, 0, sizeof(mh));
+    iov.iov_base = (unsigned char *) rbuf + header;
+    iov.iov_len = (size_t) rlen - header;
+    mh.msg_name = namelen != 0 ? (unsigned char *) rbuf + sizeof(*out) : NULL;
+    mh.msg_namelen = (socklen_t) namelen;
+    mh.msg_control = controllen != 0 ? (unsigned char *) rbuf + sizeof(*out) + namelen : NULL;
+    mh.msg_controllen = controllen;
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    n = recvmsg(s->fd, &mh, (int) s->msg_flags | MSG_DONTWAIT);
+    if (n > 0) {
+      out->namelen = (__u32) mh.msg_namelen;
+      out->controllen = (__u32) mh.msg_controllen;
+      out->payloadlen = (__u32) n;
+      out->flags = (__u32) mh.msg_flags;
+      slip_engine_emit(r, s->user_data, (int) (header + (size_t) n),
+                       cflags | IORING_CQE_F_MORE);
+      continue;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      /* Nothing came, so the buffer was never filled: it goes back, and
+       * the op parks. */
+      bufring_unget(r, s->buf_group);
+      op->wait_events = POLLIN;
+      return PARK;
+    }
+    if (n == 0) {
+      /* EOF, and the buffer STAYS taken - measured. The header is there
+       * with nothing after it. */
+      op->cqe_flags = cflags;
+      *res_out = (int) header;
+      return RAN;
+    }
+    bufring_unget(r, s->buf_group);
+    *res_out = -errno;
+    return RAN;
+  }
+}
+
 /* SOCKET_URING_OP_*: the socket calls, as ring ops - plain syscalls, so
  * both families answer them from here.
  *
@@ -560,10 +660,7 @@ enum eng_verdict slip_posix_try(struct slip_ring *r, struct eng_op *op, int *res
       return RAN;
     }
     case IORING_OP_RECVMSG:
-      if (s->ioprio & IORING_RECV_MULTISHOT) {
-        *res_out = -EOPNOTSUPP;
-        return RAN;
-      }
+      if (s->ioprio & IORING_RECV_MULTISHOT) return run_recvmsg_multishot(r, op, res_out);
       n = recvmsg(s->fd, (struct msghdr *) buf, (int) s->msg_flags | MSG_DONTWAIT);
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
           !(s->msg_flags & MSG_DONTWAIT)) {

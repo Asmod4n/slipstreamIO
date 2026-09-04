@@ -181,8 +181,14 @@ buf_ring), and MSG_RING in its data form. MSG_RING sits in the CORE and
 not in a backend: it posts a CQE on another ring, so all five backends
 would do the same thing.
 
-Still open: multishot recvmsg and multishot poll, both -EOPNOTSUPP
-today and both named that way rather than answered wrongly. MSG_RING's
+Multishot recvmsg is delivered too, with the layout liburing's own
+accessors read and two measured facts in it: res counts the header and
+the RESERVED name and control room, not what was written; and EOF keeps
+its buffer, where a plain recv gives one back.
+
+Still open: multishot poll, -EOPNOTSUPP today and named that way rather
+than answered wrongly. Multishot recvmsg without a provided buffer is
+refused for the same reason - nothing has measured it. MSG_RING's
 fd-passing form (IORING_MSG_SEND_FD) is refused for the same reason -
 nothing has measured it, and a wrong answer there is one descriptor in
 two tables.
