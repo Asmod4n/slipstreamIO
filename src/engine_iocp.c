@@ -6,7 +6,9 @@
  * GetQueuedCompletionStatus, and the poke is a posted packet - no pipe
  * anywhere.
  *
- * Carried today: NOP, RECV, SEND, CLOSE. READ/WRITE answer -EOPNOTSUPP:
+ * Carried today: NOP, RECV, SEND, CLOSE, and the socket lifecycle -
+ * SOCKET, BIND, LISTEN, SHUTDOWN, which are plain Winsock calls that
+ * answer at once. READ/WRITE answer -EOPNOTSUPP:
  * a CRT descriptor's HANDLE is not opened FILE_FLAG_OVERLAPPED, so
  * honest file IO here needs its own open path first - said, not
  * half-served. The SQE's fd field is 32 bits by liburing's own ABI;
@@ -140,6 +142,32 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
         *res = -EBADF;
       }
       return EXEC_DONE;
+    /* The socket lifecycle: plain Winsock calls that answer at once, so
+     * they need no overlapped IO and no port packet. Every field is read
+     * where liburing writes it - SOCKET carries the domain in fd, the
+     * type in off and the protocol in len; bind and listen carry the
+     * address in addr and the backlog in len. */
+    case IORING_OP_SOCKET: {
+      const SOCKET fd = socket((int) s->fd, (int) s->off, (int) s->len);
+      *res = fd == INVALID_SOCKET ? win_err_to_errno((DWORD) WSAGetLastError()) : (int) fd;
+      return EXEC_DONE;
+    }
+    case IORING_OP_BIND: {
+      const struct sockaddr *sa = (const struct sockaddr *) (uintptr_t) s->addr;
+      const int rc = bind((SOCKET) s->fd, sa, (int) s->off);
+      *res = rc == 0 ? 0 : win_err_to_errno((DWORD) WSAGetLastError());
+      return EXEC_DONE;
+    }
+    case IORING_OP_LISTEN: {
+      const int rc = listen((SOCKET) s->fd, (int) s->len);
+      *res = rc == 0 ? 0 : win_err_to_errno((DWORD) WSAGetLastError());
+      return EXEC_DONE;
+    }
+    case IORING_OP_SHUTDOWN: {
+      const int rc = shutdown((SOCKET) s->fd, (int) s->len);
+      *res = rc == 0 ? 0 : win_err_to_errno((DWORD) WSAGetLastError());
+      return EXEC_DONE;
+    }
     case IORING_OP_RECV:
     case IORING_OP_SEND: {
       if (iocp_associate(st, (SOCKET) s->fd) != 0) {
@@ -206,7 +234,8 @@ static int iocp_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
 }
 
 static const unsigned char iocp_carried_ops[] = {
-  IORING_OP_NOP, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_CLOSE, 255,
+  IORING_OP_NOP, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_CLOSE,
+  IORING_OP_SOCKET, IORING_OP_BIND, IORING_OP_LISTEN, IORING_OP_SHUTDOWN, 255,
 };
 
 const struct eng_backend slip_backend_iocp = {

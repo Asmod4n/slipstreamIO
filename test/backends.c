@@ -58,6 +58,7 @@ static int peer_write(int fd, const void *buf, unsigned len) {
 }
 static void sock_close(int fd) { closesocket((SOCKET) fd); }
 #else
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 static int pair_of_streams(int sp[2]) { return socketpair(AF_UNIX, SOCK_STREAM, 0, sp); }
@@ -171,6 +172,37 @@ static void scenes(const char *name) {
   struct io_uring_cqe *c = cq_pop(&d);
   check(e == 0 && c->user_data == 0x202 && c->res == 4 && memcmp(buf, "wake", 4) == 0,
         "the write completes the parked recv");
+
+  /* 2b: the socket lifecycle through the ring. Plain calls that answer
+   * at once - what is proven here is that the backend carries them at
+   * all, on the platform where they are Winsock and not syscalls. */
+  {
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    push(&d, IORING_OP_SOCKET, AF_INET, NULL, IPPROTO_TCP, SOCK_STREAM, 0x301);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    struct io_uring_cqe *sc = cq_pop(&d);
+    const int lfd = sc != NULL ? sc->res : -1;
+    check(e == 1 && lfd >= 0, "socket answers a descriptor");
+
+    struct io_uring_sqe *bs = push(&d, IORING_OP_BIND, lfd, &a, 0, 0, 0x302);
+    bs->off = sizeof(a);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    sc = cq_pop(&d);
+    check(e == 1 && sc != NULL && sc->res == 0, "bind takes the address");
+
+    push(&d, IORING_OP_LISTEN, lfd, NULL, 1, 0, 0x303);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    sc = cq_pop(&d);
+    check(e == 1 && sc != NULL && sc->res == 0, "listen answers 0");
+
+    push(&d, IORING_OP_CLOSE, lfd, NULL, 0, 0, 0x304);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    sc = cq_pop(&d);
+    check(e == 1 && sc != NULL && sc->res == 0, "and close gives it back");
+  }
 
   /* 3: an idle wait with a deadline says -ETIME, after the deadline. */
   struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000000LL };
