@@ -127,12 +127,31 @@ file IO on Windows (a CRT descriptor's handle is not
 `FILE_FLAG_OVERLAPPED`), the socket commands under iocp, and a native
 macOS run, which needs a Mac.
 
+## Watching files
+
+`src/slipstream_inotify.h` carries inotify to every platform, the way
+`slipstream_signal.h` carries signalfd: the same three calls, the same
+mask bits, the same record on the wire, and a descriptor a loop polls.
+
+Linux hands the work to the kernel. Where there is no inotify the arm
+looks at the watched directory, looks again, and reports the difference
+- create, modify, delete, the two halves of a move with one cookie
+between them, attrib, delete-self, move-self, ignored, and `IN_ISDIR`
+where it belongs. What no arm can make the same is time: a record
+arrives late by up to one look, and two changes between two looks are
+one record. Windows is next; `ReadDirectoryChangesW` names what changed,
+so it needs no looking.
+
 ## Tests
 
 ```
 make test
 ```
 
+- `test/inotify.c` — watching files as a descriptor, run twice on Linux
+  (the kernel's inotify, and the arm that looks through
+  `SLIPSTREAM_INOTIFY_NO_INOTIFY`); inotify is the oracle and both arms
+  answer the same records for the same operations
 - `test/signal.c` — the stop signal as a descriptor, run twice on Linux
   (signalfd, and the generic POSIX arm through
   `SLIPSTREAM_SIGNAL_NO_SIGNALFD`) and once under Wine
