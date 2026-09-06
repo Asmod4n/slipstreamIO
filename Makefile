@@ -23,7 +23,7 @@ LIBURING_SRC ?= deps/liburing
 ENGINE = src/slipstream_engine.c src/engine_posix.c src/engine_select.c src/engine_epoll.c src/engine_kqueue.c src/engine_dispatch.c src/engine_iocp.c
 
 BINS = test/available test/syscall test/shim test/blocked test/backends \
-       test/signal test/signal_posix test/inotify test/inotify_posix
+       test/signal test/signal_posix test/inotify
 
 abi_header:
 	@test -f "$(LIBURING_SRC)/src/include/liburing/io_uring.h" || { \
@@ -31,7 +31,7 @@ abi_header:
 	  echo "  (set LIBURING_SRC to one, or add it under deps/liburing)"; exit 1; }
 
 test: abi_header $(BINS)
-	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/backends && ./test/signal && ./test/signal_posix && ./test/inotify && ./test/inotify_posix && ./test/backends_adapters.sh && ./test/backends_wine.sh && ./test/signal_wine.sh && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
+	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/backends && ./test/signal && ./test/signal_posix && ./test/inotify && ./test/inotify_kqueue.sh && ./test/backends_adapters.sh && ./test/backends_wine.sh && ./test/signal_wine.sh && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
 
 # The stop signal, twice from one source: once on signalfd, once on the
 # generic POSIX arm. An arm nobody runs is an arm nobody has checked.
@@ -41,14 +41,18 @@ test/signal: test/signal.c src/slipstream_signal.c src/slipstream_signal.h
 test/signal_posix: test/signal.c src/slipstream_signal.c src/slipstream_signal.h
 	$(CC) $(CFLAGS) -Isrc -DSLIPSTREAM_SIGNAL_NO_SIGNALFD -o $@ test/signal.c src/slipstream_signal.c
 
-# Watching files, twice from one source: once on the kernel's inotify,
-# once on the arm that looks. inotify is the oracle, so the same
-# expectations run against both and a caller cannot tell them apart.
+# Watching files. inotify is the oracle: the same expectations run
+# against the kernel's inotify here, against EVFILT_VNODE through
+# libkqueue in test/inotify_kqueue.sh, and a caller cannot tell them
+# apart.
 test/inotify: test/inotify.c src/slipstream_inotify.c src/slipstream_inotify.h
 	$(CC) $(CFLAGS) -Isrc -o $@ test/inotify.c src/slipstream_inotify.c
 
-test/inotify_posix: test/inotify.c src/slipstream_inotify.c src/slipstream_inotify.h
-	$(CC) $(CFLAGS) -Isrc -DSLIPSTREAM_INOTIFY_NO_INOTIFY -o $@ test/inotify.c src/slipstream_inotify.c
+# The kqueue arm, run on this host through libkqueue. The script says so
+# and skips when there is no libkqueue to build against.
+.PHONY: inotify_kqueue
+inotify_kqueue:
+	./test/inotify_kqueue.sh
 
 # The question that runs before liburing exists, so it is built like any
 # other C consumer of a header here - and deliberately does not link or

@@ -133,14 +133,23 @@ macOS run, which needs a Mac.
 `slipstream_signal.h` carries signalfd: the same three calls, the same
 mask bits, the same record on the wire, and a descriptor a loop polls.
 
-Linux hands the work to the kernel. Where there is no inotify the arm
-looks at the watched directory, looks again, and reports the difference
-- create, modify, delete, the two halves of a move with one cookie
-between them, attrib, delete-self, move-self, ignored, and `IN_ISDIR`
-where it belongs. What no arm can make the same is time: a record
-arrives late by up to one look, and two changes between two looks are
-one record. Windows is next; `ReadDirectoryChangesW` names what changed,
-so it needs no looking.
+**No arm makes a thread.** Each one uses what its own system has for
+the job - inotify on Linux, `EVFILT_VNODE` on the BSDs and macOS - and
+the work of turning that into inotify's records happens where the
+caller reads, on the caller's own thread.
+
+kqueue says THAT a directory changed, never what: `NOTE_WRITE` on a
+directory means a name appeared, went, or was renamed inside it. So
+that arm looks at the directory once, when the kernel says it changed,
+and reports the difference - create, modify, delete, the two halves of
+a move with one cookie between them, attrib, delete-self, move-self,
+ignored, and `IN_ISDIR` where it belongs. It is not a poller: nothing
+looks until the kernel says to.
+
+A system with no such mechanism answers `-ENOSYS`. Polling the disk
+behind a caller's back would be a different thing wearing this name.
+Windows is next: `ReadDirectoryChangesW` names what changed, so that
+arm needs no looking at all.
 
 ## Tests
 
@@ -148,10 +157,11 @@ so it needs no looking.
 make test
 ```
 
-- `test/inotify.c` — watching files as a descriptor, run twice on Linux
-  (the kernel's inotify, and the arm that looks through
-  `SLIPSTREAM_INOTIFY_NO_INOTIFY`); inotify is the oracle and both arms
-  answer the same records for the same operations
+- `test/inotify.c` — watching files as a descriptor: the kernel's
+  inotify here, and the same file again against `EVFILT_VNODE` through
+  libkqueue (`test/inotify_kqueue.sh`), which is the API the BSDs and
+  macOS carry. inotify is the oracle, and both arms answer the same
+  records for the same operations
 - `test/signal.c` — the stop signal as a descriptor, run twice on Linux
   (signalfd, and the generic POSIX arm through
   `SLIPSTREAM_SIGNAL_NO_SIGNALFD`) and once under Wine

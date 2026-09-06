@@ -130,6 +130,18 @@ SLIPSTREAM_API int slipstream_inotify_rm_watch(int fd, int wd);
  * watched through it is forgotten. */
 SLIPSTREAM_API int slipstream_inotify_close(int fd);
 
+/* Take what is waiting. Answers the bytes written into buf, 0 when
+ * nothing waits on a NONBLOCK descriptor, or a negated errno.
+ *
+ * On Linux and every other POSIX arm this is read(2), and a caller may
+ * spell it that way. On Windows the descriptor is a SOCKET, which the
+ * C runtime's read() does not take, so a caller that wants ONE spelling
+ * everywhere writes this one.
+ *
+ * Whole records only, as inotify gives: a buffer too small to hold the
+ * first record answers -EINVAL. */
+SLIPSTREAM_API int slipstream_inotify_read(int fd, void *buf, unsigned len);
+
 #ifdef __cplusplus
 }
 #endif

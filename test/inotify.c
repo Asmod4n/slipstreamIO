@@ -46,7 +46,7 @@ static unsigned drain(int fd, struct got *out, unsigned max, unsigned want, int 
   int waited = 0;
   while (n < want && waited < ms) {
     char buf[8192];
-    ssize_t got;
+    int got;
     struct pollfd p;
     p.fd = fd;
     p.events = POLLIN;
@@ -54,26 +54,26 @@ static unsigned drain(int fd, struct got *out, unsigned max, unsigned want, int 
       waited += step;
       continue;
     }
-    got = read(fd, buf, sizeof(buf));
+    got = slipstream_inotify_read(fd, buf, (unsigned) sizeof(buf));
     if (got <= 0) {
       waited += step;
       continue;
     }
-    for (ssize_t at = 0; at + (ssize_t) sizeof(struct slipstream_inotify_event) <= got;) {
+    for (int at = 0; at + (int) sizeof(struct slipstream_inotify_event) <= got;) {
       struct slipstream_inotify_event ev;
       memcpy(&ev, buf + at, sizeof(ev));
-      at += (ssize_t) sizeof(ev);
+      at += (int) sizeof(ev);
       if (n < max) {
         out[n].wd = ev.wd;
         out[n].mask = ev.mask;
         out[n].cookie = ev.cookie;
         out[n].name[0] = '\0';
-        if (ev.len != 0 && at + (ssize_t) ev.len <= got) {
+        if (ev.len != 0 && at + (int) ev.len <= got) {
           snprintf(out[n].name, sizeof(out[n].name), "%s", buf + at);
         }
         n++;
       }
-      at += (ssize_t) ev.len;
+      at += (int) ev.len;
     }
   }
   return n;
