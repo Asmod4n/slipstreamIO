@@ -31,7 +31,7 @@ abi_header:
 	  echo "  (set LIBURING_SRC to one, or add it under deps/liburing)"; exit 1; }
 
 test: abi_header $(BINS)
-	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/backends && ./test/signal && ./test/signal_posix && ./test/inotify && ./test/inotify_kqueue.sh && ./test/backends_adapters.sh && ./test/backends_wine.sh && ./test/signal_wine.sh && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
+	./test/available && ./test/syscall && ./test/shim && ./test/blocked && ./test/backends && ./test/signal && ./test/signal_posix && ./test/inotify && ./test/inotify_kqueue.sh && ./test/inotify_wine.sh && ./test/backends_adapters.sh && ./test/backends_wine.sh && ./test/signal_wine.sh && ./test/liburing_h_shims.sh && ./test/with_liburing.sh
 
 # The stop signal, twice from one source: once on signalfd, once on the
 # generic POSIX arm. An arm nobody runs is an arm nobody has checked.
@@ -48,11 +48,16 @@ test/signal_posix: test/signal.c src/slipstream_signal.c src/slipstream_signal.h
 test/inotify: test/inotify.c src/slipstream_inotify.c src/slipstream_inotify.h
 	$(CC) $(CFLAGS) -Isrc -o $@ test/inotify.c src/slipstream_inotify.c
 
-# The kqueue arm, run on this host through libkqueue. The script says so
-# and skips when there is no libkqueue to build against.
-.PHONY: inotify_kqueue
+# The other two arms, each on the API it ships against: EVFILT_VNODE
+# through libkqueue on this host, and ReadDirectoryChangesW as a MinGW
+# binary under Wine. Both run test/inotify.c, and both scripts say so
+# and skip when what they need is missing.
+.PHONY: inotify_kqueue inotify_wine
 inotify_kqueue:
 	./test/inotify_kqueue.sh
+
+inotify_wine:
+	./test/inotify_wine.sh
 
 # The question that runs before liburing exists, so it is built like any
 # other C consumer of a header here - and deliberately does not link or

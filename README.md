@@ -146,10 +146,21 @@ a move with one cookie between them, attrib, delete-self, move-self,
 ignored, and `IN_ISDIR` where it belongs. It is not a poller: nothing
 looks until the kernel says to.
 
-A system with no such mechanism answers `-ENOSYS`. Polling the disk
-behind a caller's back would be a different thing wearing this name.
-Windows is next: `ReadDirectoryChangesW` names what changed, so that
-arm needs no looking at all.
+Windows names what changed, so that arm does no looking: the kernel
+hands over a chain of `FILE_NOTIFY_INFORMATION` and each one is a
+record, read off a completion port where the caller reads. Two things
+Windows does not have are answered there rather than passed on - it
+watches a directory and never one file, so a watch on a file becomes a
+filtered watch on the directory holding it; and it does not say whether
+what changed was a directory, so the names known to be directories are
+kept per watch and `IN_ISDIR` is right for one that goes as well as one
+that arrives. A watch also reads the directory ABOVE its own, because
+that is where its own name lives, and that is where `IN_DELETE_SELF`
+and `IN_MOVE_SELF` come from.
+
+A system with none of these mechanisms answers `-ENOSYS`. Polling the
+disk behind a caller's back would be a different thing wearing this
+name.
 
 ## Tests
 
@@ -157,11 +168,12 @@ arm needs no looking at all.
 make test
 ```
 
-- `test/inotify.c` — watching files as a descriptor: the kernel's
-  inotify here, and the same file again against `EVFILT_VNODE` through
-  libkqueue (`test/inotify_kqueue.sh`), which is the API the BSDs and
-  macOS carry. inotify is the oracle, and both arms answer the same
-  records for the same operations
+- `test/inotify.c` — watching files as a descriptor, one file run
+  against all three arms: the kernel's inotify here, `EVFILT_VNODE`
+  through libkqueue (`test/inotify_kqueue.sh`), and
+  `ReadDirectoryChangesW` as a MinGW binary under Wine
+  (`test/inotify_wine.sh`). inotify is the oracle, and every arm answers
+  the same records for the same operations
 - `test/signal.c` — the stop signal as a descriptor, run twice on Linux
   (signalfd, and the generic POSIX arm through
   `SLIPSTREAM_SIGNAL_NO_SIGNALFD`) and once under Wine

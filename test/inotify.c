@@ -14,20 +14,70 @@
 #include "slipstream_inotify.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#include <io.h>
+#define nap_ms(ms) Sleep(ms)
+#define make_dir(p) _mkdir(p)
+#define remove_dir(p) _rmdir(p)
+#else
+#include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
+static void nap_ms(int ms) {
+  struct timespec t;
+  t.tv_sec = ms / 1000;
+  t.tv_nsec = (long) (ms % 1000) * 1000000L;
+  nanosleep(&t, NULL);
+}
+#define make_dir(p) mkdir(p, 0755)
+#define remove_dir(p) rmdir(p)
+#endif
+
+/* A directory of our own to make and break things in. mkdtemp is POSIX;
+ * Windows names one from its own temp path and the process id. */
+static int temp_dir(char *out, size_t max) {
+#ifdef _WIN32
+  char base[MAX_PATH];
+  const DWORD n = GetTempPathA((DWORD) sizeof(base), base);
+  if (n == 0 || n >= sizeof(base)) return 0;
+  snprintf(out, max, "%sslipstream-inotify-%lu", base, (unsigned long) GetCurrentProcessId());
+  return _mkdir(out) == 0;
+#else
+  snprintf(out, max, "/tmp/slipstream-inotify-XXXXXX");
+  return mkdtemp(out) != NULL;
+#endif
+}
 
 static int fails;
 
 static void ok(int cond, const char *what) {
   printf("%s %s\n", cond ? "ok  " : "FAIL", what);
   if (!cond) fails++;
+}
+
+static void skipped(const char *what, const char *why) {
+  printf("skip %s - %s\n", what, why);
+}
+
+/* Wine is not Windows, and one scene here tells them apart: Windows
+ * unlinks a directory that is deleted under an open handle at once and
+ * says so in the directory above, and Wine holds the unlink back until
+ * the handle closes. Nothing can report a deletion that has not
+ * happened, so that scene is skipped there and run on Windows. */
+static int under_wine(void) {
+#ifdef _WIN32
+  const HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+  return ntdll != NULL && GetProcAddress(ntdll, "wine_get_version") != NULL;
+#else
+  return 0;
+#endif
 }
 
 /* Every record that arrived within the deadline, in order. A record
@@ -44,18 +94,14 @@ static unsigned drain(int fd, struct got *out, unsigned max, unsigned want, int 
   unsigned n = 0;
   const int step = 20;
   int waited = 0;
+  /* The descriptor is NONBLOCK, so a read that finds nothing answers 0
+   * and this waits a step. One spelling for every arm: a POSIX caller
+   * may poll the descriptor instead, and a Windows one cannot. */
   while (n < want && waited < ms) {
     char buf[8192];
-    int got;
-    struct pollfd p;
-    p.fd = fd;
-    p.events = POLLIN;
-    if (poll(&p, 1, step) <= 0) {
-      waited += step;
-      continue;
-    }
-    got = slipstream_inotify_read(fd, buf, (unsigned) sizeof(buf));
+    int got = slipstream_inotify_read(fd, buf, (unsigned) sizeof(buf));
     if (got <= 0) {
+      nap_ms(step);
       waited += step;
       continue;
     }
@@ -101,7 +147,7 @@ static void put(const char *path, const char *text) {
 }
 
 int main(void) {
-  char dir[] = "/tmp/slipstream-inotify-XXXXXX";
+  char dir[256];
   char a[512];
   char b[512];
   struct got g[64];
@@ -109,8 +155,8 @@ int main(void) {
   int fd;
   int wd;
 
-  if (mkdtemp(dir) == NULL) {
-    perror("mkdtemp");
+  if (!temp_dir(dir, sizeof(dir))) {
+    fprintf(stderr, "no temp directory to work in\n");
     return 1;
   }
   snprintf(a, sizeof(a), "%s/one.txt", dir);
@@ -156,7 +202,7 @@ int main(void) {
 
   /* A directory inside the watched one, so ISDIR is asked for. */
   snprintf(a, sizeof(a), "%s/sub", dir);
-  ok(mkdir(a, 0755) == 0, "a directory inside it");
+  ok(make_dir(a) == 0, "a directory inside it");
   n = drain(fd, g, 64, 1, 2000);
   {
     const struct got *made = find(g, n, SLIPSTREAM_IN_CREATE, "sub");
@@ -178,16 +224,22 @@ int main(void) {
   /* The watched thing itself, removed under the watch. */
   wd = slipstream_inotify_add_watch(fd, a, SLIPSTREAM_IN_ALL_EVENTS);
   ok(wd > 0, "watch the directory inside");
-  ok(rmdir(a) == 0, "rmdir it");
-  n = drain(fd, g, 64, 2, 3000);
-  ok(find(g, n, SLIPSTREAM_IN_DELETE_SELF, NULL) != NULL,
-     "the watched thing going is IN_DELETE_SELF");
-  ok(find(g, n, SLIPSTREAM_IN_IGNORED, NULL) != NULL, "and then IN_IGNORED");
+  ok(remove_dir(a) == 0, "rmdir it");
+  if (under_wine()) {
+    skipped("the watched thing going is IN_DELETE_SELF",
+            "wine holds the unlink back while a handle is open");
+    skipped("and then IN_IGNORED", "the same reason");
+  } else {
+    n = drain(fd, g, 64, 2, 3000);
+    ok(find(g, n, SLIPSTREAM_IN_DELETE_SELF, NULL) != NULL,
+       "the watched thing going is IN_DELETE_SELF");
+    ok(find(g, n, SLIPSTREAM_IN_IGNORED, NULL) != NULL, "and then IN_IGNORED");
+  }
 
   ok(slipstream_inotify_close(fd) == 0, "close answers 0");
   ok(slipstream_inotify_rm_watch(fd, 1) == -EBADF, "a descriptor that is closed answers -EBADF");
 
-  rmdir(dir);
+  remove_dir(dir);
   printf(fails == 0 ? "inotify: all ok\n" : "inotify: %d failed\n", fails);
   return fails == 0 ? 0 : 1;
 }
