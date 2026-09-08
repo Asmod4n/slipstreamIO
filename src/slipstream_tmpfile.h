@@ -1,0 +1,57 @@
+/* A temporary file, as a descriptor and nothing else.
+ *
+ * A server that takes an upload cannot hold it in memory: one request
+ * decides how much, and the client decides how many. The bytes go to a
+ * file, and the file is nobody's business but this process's - it has no
+ * name to open, no name to collide with, and no name to leave behind
+ * when the process dies.
+ *
+ *   int fd = slipstream_tmpfile(NULL);
+ *   io_uring_prep_write(sqe, fd, buf, len, off);
+ *
+ * On POSIX that is mkstemp(3) and then unlink(2), which is the oldest
+ * idiom there is: the directory entry goes, the open descriptor keeps
+ * the file, and the last close frees the blocks. mkostemp(3) would do
+ * both steps in one, and it is GNU only, so this does not use it.
+ *
+ * Not memfd_create(2), which has no name at all: a memfd is tmpfs, so
+ * the bytes are memory, and a server that spills to memory to stop
+ * running out of memory has not spilled.
+ *
+ * Windows cannot unlink an open file, so the moment differs there and a
+ * caller must know it. FILE_FLAG_DELETE_ON_CLOSE removes the entry when
+ * the last handle goes, so the name is in the directory until then. No
+ * other process can open it while it is there - the share mode is 0 -
+ * and nothing is left in the directory after the descriptor closes,
+ * which is what both arms promise.
+ */
+#ifndef SLIPSTREAM_TMPFILE_H
+#define SLIPSTREAM_TMPFILE_H
+
+#ifndef SLIPSTREAM_API
+#define SLIPSTREAM_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* A file to write, already gone from its directory. Answers the
+ * descriptor, or a NEGATED errno - liburing's convention, which the rest
+ * of this library already follows.
+ *
+ * `dir` names where it is made. NULL asks the platform: TMPDIR and then
+ * /tmp on POSIX, GetTempPathW on Windows. Name one to put the bytes on a
+ * disk that has room for them - the default is small on many machines,
+ * and on some it is tmpfs, which is memory.
+ *
+ * The mode is 0600, set on the file and not left to the umask. The
+ * descriptor is close-on-exec.
+ */
+SLIPSTREAM_API int slipstream_tmpfile(const char *dir);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SLIPSTREAM_TMPFILE_H */
