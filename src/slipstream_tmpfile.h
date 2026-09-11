@@ -9,10 +9,18 @@
  *   int fd = slipstream_tmpfile(NULL);
  *   io_uring_prep_write(sqe, fd, buf, len, off);
  *
- * On POSIX that is mkstemp(3) and then unlink(2), which is the oldest
- * idiom there is: the directory entry goes, the open descriptor keeps
- * the file, and the last close frees the blocks. mkostemp(3) would do
- * both steps in one, and it is GNU only, so this does not use it.
+ * On Linux that is O_TMPFILE: the file is made in a directory and never
+ * appears in it, so there is no entry to collide with, no entry to
+ * unlink, and no window in which another process could open it. It is
+ * also the only form that can be given a name afterwards - see
+ * slipstream_tmpfile_link.
+ *
+ * Where the filesystem does not implement O_TMPFILE, and on every other
+ * POSIX platform, it is mkstemp(3) and then unlink(2), which is the
+ * oldest idiom there is: the directory entry goes, the open descriptor
+ * keeps the file, and the last close frees the blocks. mkostemp(3)
+ * would do both steps in one, and it is GNU only, so this does not use
+ * it.
  *
  * Not memfd_create(2), which has no name at all: a memfd is tmpfs, so
  * the bytes are memory, and a server that spills to memory to stop
@@ -49,6 +57,28 @@ extern "C" {
  * descriptor is close-on-exec.
  */
 SLIPSTREAM_API int slipstream_tmpfile(const char *dir);
+
+/* A name for the file behind `fd`, in the filesystem. 0, or a NEGATED
+ * errno.
+ *
+ * This is what O_TMPFILE buys, and it is why this library prefers it:
+ * a file that never had a name can be given one, so an upload that was
+ * written to a temporary file becomes the file it was meant to be
+ * without a copy. A file that was made by the mkstemp arm was unlinked
+ * at birth and can never be linked again - the kernel answers -ENOENT,
+ * and that is the honest answer rather than a silent copy.
+ *
+ * -EEXIST when `path` is taken: this never replaces. A caller that
+ * wants to replace links to a name of its own and renames over the
+ * target, which is the only form that is atomic.
+ *
+ * -EOPNOTSUPP where the platform has no such call, which is everything
+ * that is not Linux, Windows included.
+ *
+ * The directory of `path` and the directory the file was made in have
+ * to be the same filesystem, because a link never crosses one.
+ */
+SLIPSTREAM_API int slipstream_tmpfile_link(int fd, const char *path);
 
 #ifdef __cplusplus
 }

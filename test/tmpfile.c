@@ -120,6 +120,39 @@ int main(void) {
   /* And this is what both promise: nothing left behind. */
   ok(entries_in(dir) == 0, "the directory is empty once it closes");
 
+#if !defined(_WIN32) && defined(__linux__)
+  /* The name a file with no name can be given. This is what O_TMPFILE
+   * buys: an upload becomes the file it was meant to be, with no copy.
+   * A filesystem without O_TMPFILE takes the mkstemp arm, whose file
+   * was unlinked at birth and can never be linked - the kernel answers
+   * ENOENT, and the scene says which arm it stood on rather than
+   * failing. */
+  {
+    char target[512];
+    const int lf = slipstream_tmpfile(dir);
+    ok(lf >= 0, "a second descriptor, to link into place");
+    if (lf >= 0) {
+      const char body[] = "an upload that becomes a file";
+      ok(slip_write(lf, body, sizeof(body)) == (int)sizeof(body), "it takes the bytes");
+      snprintf(target, sizeof(target), "%s/landed", dir);
+      const int rc = slipstream_tmpfile_link(lf, target);
+      if (rc == 0) {
+        ok(entries_in(dir) == 1, "the link put it in the directory");
+        struct stat st;
+        ok(stat(target, &st) == 0 && (size_t)st.st_size == sizeof(body),
+           "the file at the name holds the bytes");
+        /* Twice is EEXIST: this never replaces. */
+        ok(slipstream_tmpfile_link(lf, target) == -EEXIST, "a taken name is refused");
+        unlink(target);
+      } else {
+        ok(rc == -ENOENT, "the mkstemp arm cannot link, and says ENOENT");
+      }
+      slip_close(lf);
+    }
+    ok(entries_in(dir) == 0, "the directory is empty again");
+  }
+#endif
+
 #ifdef _WIN32
   RemoveDirectoryA(dir);
 #else
