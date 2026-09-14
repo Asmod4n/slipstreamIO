@@ -576,6 +576,8 @@ int slipstream_inotify_close(int fd) {
 
 #include <windows.h>
 
+/* offsetof, for the bound tests on the record walk. */
+#include <stddef.h>
 #include <sys/stat.h>
 
 /* One directory read in flight. The buffer is the kernel's to fill, so
@@ -763,13 +765,29 @@ static int arm_read(struct watch *w) {
   return 1;
 }
 
+/* CancelIo asks for the end of the read; it does not wait for it. Until
+ * the read really ends the kernel still owns w->buf and this OVERLAPPED,
+ * and it writes names a peer chose into them. So the wait happens here,
+ * before the caller frees the watch. One read is in flight per handle,
+ * so a wait on the handle names that read and no other one. A read that
+ * was never armed leaves Internal at zero, and the call answers at
+ * once. */
+static void wait_for_read_to_end(HANDLE h, OVERLAPPED *ov) {
+  DWORD bytes = 0;
+  CancelIo(h);
+  while (!GetOverlappedResult(h, ov, &bytes, TRUE) && GetLastError() == ERROR_IO_INCOMPLETE) {
+    /* The wait itself came back early. The read is still the kernel's,
+     * so the only answer is to wait again. */
+  }
+}
+
 static void watch_free(struct watch *w) {
   if (w->dir != INVALID_HANDLE_VALUE) {
-    CancelIo(w->dir);
+    wait_for_read_to_end(w->dir, &w->ov);
     CloseHandle(w->dir);
   }
   if (w->up != INVALID_HANDLE_VALUE) {
-    CancelIo(w->up);
+    wait_for_read_to_end(w->up, &w->uov);
     CloseHandle(w->up);
   }
   free(w->self_name);
@@ -791,11 +809,24 @@ static void forget(struct inst *in, size_t at) {
 static void translate(struct inst *in, struct watch *w, DWORD bytes) {
   DWORD at = 0;
   if (bytes == 0) return;
+  if (bytes > (DWORD) sizeof(w->buf)) bytes = (DWORD) sizeof(w->buf);
   for (;;) {
-    FILE_NOTIFY_INFORMATION *fni = (FILE_NOTIFY_INFORMATION *) (w->buf + at);
+    FILE_NOTIFY_INFORMATION *fni;
     char name[512];
     char full[4096];
     int isdir = 0;
+
+    /* The walk read every offset in this buffer and tested none of
+     * them. No record has been seen to lie, so this is hardening and
+     * not a repair: a record must start inside the bytes the kernel
+     * reported, the fixed part of it must fit, and its name must fit in
+     * what is left. */
+    if (at > bytes || bytes - at < sizeof(FILE_NOTIFY_INFORMATION)) return;
+    fni = (FILE_NOTIFY_INFORMATION *) (w->buf + at);
+    if (fni->FileNameLength >
+        bytes - at - offsetof(FILE_NOTIFY_INFORMATION, FileName)) {
+      return;
+    }
 
     if (!utf8_of(fni->FileName, fni->FileNameLength / sizeof(WCHAR), name, (int) sizeof(name))) {
       name[0] = '\0';
@@ -815,7 +846,7 @@ static void translate(struct inst *in, struct watch *w, DWORD bytes) {
       /* A watch the caller asked for on a FILE hears only about that
        * file, and hears it the way inotify does: without a name. */
       if (w->only != NULL && strcmp(w->only, name) != 0) {
-        if (fni->NextEntryOffset == 0) break;
+        if (fni->NextEntryOffset == 0 || fni->NextEntryOffset > bytes - at) break;
         at += fni->NextEntryOffset;
         continue;
       }
@@ -856,7 +887,7 @@ static void translate(struct inst *in, struct watch *w, DWORD bytes) {
         }
       }
     }
-    if (fni->NextEntryOffset == 0) break;
+    if (fni->NextEntryOffset == 0 || fni->NextEntryOffset > bytes - at) break;
     at += fni->NextEntryOffset;
   }
 }
@@ -869,9 +900,18 @@ static int translate_up(struct inst *in, struct watch *w, DWORD bytes) {
   DWORD at = 0;
   int gone = 0;
   if (bytes == 0 || w->self_name == NULL) return 0;
+  if (bytes > (DWORD) sizeof(w->up_buf)) bytes = (DWORD) sizeof(w->up_buf);
   for (;;) {
-    FILE_NOTIFY_INFORMATION *fni = (FILE_NOTIFY_INFORMATION *) (w->up_buf + at);
+    FILE_NOTIFY_INFORMATION *fni;
     char name[512];
+    /* The same three tests the walk above now makes, and for the same
+     * reason: hardening of a buffer the kernel fills. */
+    if (at > bytes || bytes - at < sizeof(FILE_NOTIFY_INFORMATION)) return gone;
+    fni = (FILE_NOTIFY_INFORMATION *) (w->up_buf + at);
+    if (fni->FileNameLength >
+        bytes - at - offsetof(FILE_NOTIFY_INFORMATION, FileName)) {
+      return gone;
+    }
     if (!utf8_of(fni->FileName, fni->FileNameLength / sizeof(WCHAR), name, (int) sizeof(name))) {
       name[0] = '\0';
     }
@@ -886,7 +926,7 @@ static int translate_up(struct inst *in, struct watch *w, DWORD bytes) {
         emit_masked(in, w, SLIPSTREAM_IN_MODIFY, 0, NULL, 0);
       }
     }
-    if (fni->NextEntryOffset == 0) break;
+    if (fni->NextEntryOffset == 0 || fni->NextEntryOffset > bytes - at) break;
     at += fni->NextEntryOffset;
   }
   return gone;

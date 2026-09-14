@@ -60,6 +60,14 @@ struct iocp_op {
   struct eng_op *op;
   struct iocp_op *next; /* the in-flight list, engine thread only */
   SOCKET sock;
+  /* The handle the IO was issued on, which is what CancelIoEx needs.
+   * For a socket op it is the socket itself. A file op is issued on the
+   * HANDLE under the CRT descriptor, and w->sock holds that descriptor
+   * index instead. A cancel on the index names another object or none,
+   * so the op stays in flight and the kernel writes its OVERLAPPED
+   * after the free. The handle is kept here, beside w->sock, because
+   * w->sock still carries the socket that the accept path reads. */
+  HANDLE cancel_handle;
   WSABUF wb;
   unsigned char kind;
   unsigned char multishot;
@@ -119,9 +127,17 @@ static int iocp_open_ring(struct slip_ring *r) {
 
 /* The fixed file table's close: a descriptor here came from socket() or
  * from the CRT, and closesocket refuses the latter - the same two-step
- * IORING_OP_CLOSE takes. */
+ * IORING_OP_CLOSE takes.
+ *
+ * WSAENOTSOCK is the only error that means "this is a CRT descriptor".
+ * Any other failure - Winsock not started, the call in progress - says
+ * nothing about the value, and _close would then read a SOCKET as a
+ * descriptor index. That index is a small number that can name another
+ * open file, which _close would close. So the fallback runs on
+ * WSAENOTSOCK alone, as IORING_OP_CLOSE already does. */
 void slip_native_fd_close(int fd) {
-  if (closesocket((SOCKET) fd) != 0) (void) _close(fd);
+  if (closesocket((SOCKET) fd) == 0) return;
+  if (WSAGetLastError() == WSAENOTSOCK) (void) _close(fd);
 }
 
 static void iocp_close_ring(struct slip_ring *r) {
@@ -131,12 +147,20 @@ static void iocp_close_ring(struct slip_ring *r) {
    * the kernel writes into it. Cancel them all, then drain the port
    * until the list is empty. */
   for (struct iocp_op *w = st->in_flight; w != NULL; w = w->next)
-    CancelIoEx((HANDLE) w->sock, &w->ov);
+    CancelIoEx(w->cancel_handle, &w->ov);
+  /* The loop ends when the list is empty, and on no other condition. A
+   * wait that times out proves nothing about the op: the kernel still
+   * owns the OVERLAPPED, so leaving here frees memory it writes later.
+   * A timeout asks for the cancel again and waits again. */
   while (st->in_flight != NULL) {
     DWORD bytes = 0;
     ULONG_PTR key = 0;
     OVERLAPPED *ov = NULL;
-    if (!GetQueuedCompletionStatus(st->port, &bytes, &key, &ov, 1000) && ov == NULL) break;
+    if (!GetQueuedCompletionStatus(st->port, &bytes, &key, &ov, 1000) && ov == NULL) {
+      for (struct iocp_op *w = st->in_flight; w != NULL; w = w->next)
+        CancelIoEx(w->cancel_handle, &w->ov);
+      continue;
+    }
     if (key == IOCP_KEY_IO && ov != NULL) {
       struct iocp_op *w = CONTAINING_RECORD(ov, struct iocp_op, ov);
       struct iocp_op **p = &st->in_flight;
@@ -279,6 +303,7 @@ static int iocp_arm_accept(struct slip_ring *r, struct iocp_state *st, struct en
   }
   w->op = op;
   w->sock = (SOCKET) s->fd;
+  w->cancel_handle = (HANDLE) w->sock;
   w->accepted = child;
   w->kind = IOCP_KIND_ACCEPT;
   w->multishot = (s->ioprio & IORING_ACCEPT_MULTISHOT) != 0;
@@ -412,6 +437,7 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       }
       w->op = op;
       w->sock = (SOCKET) s->fd;
+      w->cancel_handle = h;
       w->kind = IOCP_KIND_IO;
       w->ov.Offset = (DWORD) (s->off & 0xffffffffu);
       w->ov.OffsetHigh = (DWORD) (s->off >> 32);
@@ -508,6 +534,7 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       }
       w->op = op;
       w->sock = (SOCKET) s->fd;
+      w->cancel_handle = (HANDLE) w->sock;
       w->kind = IOCP_KIND_POLL;
       w->wb.buf = NULL;
       w->wb.len = 0;
@@ -555,6 +582,7 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       }
       w->op = op;
       w->sock = (SOCKET) s->fd;
+      w->cancel_handle = (HANDLE) w->sock;
       w->kind = IOCP_KIND_CONNECT;
       op->be_source = w;
       if (!connectex((SOCKET) s->fd, sa, (int) s->off, NULL, 0, NULL, &w->ov) &&
@@ -598,6 +626,7 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       }
       w->op = op;
       w->sock = (SOCKET) s->fd;
+      w->cancel_handle = (HANDLE) w->sock;
       w->kind = IOCP_KIND_IO;
       w->back = m;
       op->be_source = w;
@@ -643,6 +672,7 @@ static int iocp_execute(struct slip_ring *r, struct eng_op *op, int *res) {
       }
       w->op = op;
       w->sock = (SOCKET) s->fd;
+      w->cancel_handle = (HANDLE) w->sock;
       w->wb.buf = (char *) (uintptr_t) s->addr;
       w->wb.len = s->len;
       op->be_source = w;

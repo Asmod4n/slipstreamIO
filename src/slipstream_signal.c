@@ -132,6 +132,27 @@ static int loopback_pair(SOCKET sp[2]) {
     closesocket(c);
     return -1;
   }
+  /* accept takes whoever arrived, and on a loopback port any local
+   * process may be the one that arrived. Without this test the accepted
+   * socket can be a stranger's, and the stranger then owns the write
+   * end of this process's signal wire: slipstream_signal_read turns a
+   * byte it sends into a signal number. The pair is ours only if the
+   * two ends name each other. */
+  {
+    struct sockaddr_in pa, ca;
+    int palen = (int) sizeof(pa);
+    int calen = (int) sizeof(ca);
+    memset(&pa, 0, sizeof(pa));
+    memset(&ca, 0, sizeof(ca));
+    if (getpeername(s, (struct sockaddr *) &pa, &palen) != 0 ||
+        getsockname(c, (struct sockaddr *) &ca, &calen) != 0 ||
+        pa.sin_family != ca.sin_family || pa.sin_port != ca.sin_port ||
+        pa.sin_addr.s_addr != ca.sin_addr.s_addr) {
+      closesocket(s);
+      closesocket(c);
+      return -1;
+    }
+  }
   sp[0] = s;
   sp[1] = c;
   return 0;
@@ -163,8 +184,18 @@ int slipstream_signal_read(int fd, int *signum) {
   char one;
   const int got = recv((SOCKET) fd, &one, 1, 0);
   if (got == 1) {
-    if (signum != NULL) *signum = (int) (unsigned char) one;
-    return 1;
+    /* Only a number this process asked for. The wire carries one byte
+     * per signal and nothing authenticates it, so the list the caller
+     * gave to slipstream_signal_open is what bounds the answer. A byte
+     * outside it is dropped rather than reported as a signal. */
+    const int n = (int) (unsigned char) one;
+    for (unsigned i = 0; i < g_nwant; i++) {
+      if (g_want[i] == n) {
+        if (signum != NULL) *signum = n;
+        return 1;
+      }
+    }
+    return 0;
   }
   if (got < 0 && WSAGetLastError() == WSAEWOULDBLOCK) return 0;
   return got == 0 ? -EIO : -EIO;
@@ -197,6 +228,12 @@ int slipstream_signal_close(int fd) {
 static dispatch_source_t g_src[32];
 static unsigned g_nsrc;
 static int g_write = -1;
+/* What the disposition was before this took it. SIG_IGN survives execve
+ * where a handler does not, so a process that closes and then forks a
+ * helper would hand that helper an unstoppable TERM. The old value goes
+ * back at close for the same reason. */
+static int g_sig[32];
+static void (*g_was[32])(int);
 
 int slipstream_signal_open(const int *signums, unsigned n) {
   int fds[2];
@@ -210,10 +247,28 @@ int slipstream_signal_open(const int *signums, unsigned n) {
   for (unsigned i = 0; i < n; i++) {
     const int sig = signums[i];
     dispatch_source_t s;
-    signal(sig, SIG_IGN);
+    void (*was)(int) = signal(sig, SIG_IGN);
+    if (was == SIG_ERR) {
+      close(fds[0]);
+      close(fds[1]);
+      g_write = -1;
+      return -errno;
+    }
     s = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t) sig, 0,
                                dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
     if (s == NULL) {
+      /* Undo the whole open, not the part after this one. Every source
+       * already made is cancelled, every disposition already taken is
+       * given back, and g_nsrc returns to zero - it used to keep the
+       * count it had reached, so a later open appended from there and
+       * walked off the end of g_src after enough failures. */
+      signal(sig, was);
+      for (unsigned k = 0; k < g_nsrc; k++) {
+        dispatch_source_cancel(g_src[k]);
+        dispatch_release(g_src[k]);
+        signal(g_sig[k], g_was[k]);
+      }
+      g_nsrc = 0;
       close(fds[0]);
       close(fds[1]);
       g_write = -1;
@@ -225,7 +280,10 @@ int slipstream_signal_open(const int *signums, unsigned n) {
       (void) ignored;
     });
     dispatch_resume(s);
-    g_src[g_nsrc++] = s;
+    g_sig[g_nsrc] = sig;
+    g_was[g_nsrc] = was;
+    g_src[g_nsrc] = s;
+    g_nsrc++;
   }
   return fds[0];
 }
@@ -245,6 +303,7 @@ int slipstream_signal_close(int fd) {
   for (unsigned i = 0; i < g_nsrc; i++) {
     dispatch_source_cancel(g_src[i]);
     dispatch_release(g_src[i]);
+    signal(g_sig[i], g_was[i]);
   }
   g_nsrc = 0;
   if (g_write >= 0) close(g_write);

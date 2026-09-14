@@ -1,6 +1,20 @@
 /* See slipstream_tmpfile.h for what this is and why it is not
  * memfd_create(2). */
 
+/* The Makefile builds with -std=c11 and no feature macro, which is a
+ * rule about the exported headers: they have to stand up for a C
+ * consumer on their own terms. A translation unit of ours is not a
+ * header, and under a strict -std= glibc declares neither mkstemp nor
+ * fchmod. Both were called here with no declaration in scope, which the
+ * compiler accepted with a warning and C23 refuses outright. The macro
+ * is asked for here, where it changes nothing anybody else sees.
+ *
+ * _GNU_SOURCE rather than _POSIX_C_SOURCE, because it also declares
+ * mkostemp, which is what closes the descriptor-flag window below. */
+#ifndef _WIN32
+#define _GNU_SOURCE
+#endif
+
 #include "slipstream_tmpfile.h"
 
 #include <errno.h>
@@ -58,6 +72,11 @@ SLIPSTREAM_API int slipstream_tmpfile(const char *dir) {
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* glibc, musl and the BSDs carry mkostemp; macOS does not. */
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#define SLIP_HAVE_MKOSTEMP 1
+#endif
+
 #define SLIP_TMPFILE_LEAF "/slipstream-XXXXXX"
 
 SLIPSTREAM_API int slipstream_tmpfile(const char *dir) {
@@ -74,7 +93,20 @@ SLIPSTREAM_API int slipstream_tmpfile(const char *dir) {
   memcpy(path, dir, dlen);
   memcpy(path + dlen, SLIP_TMPFILE_LEAF, sizeof(SLIP_TMPFILE_LEAF));
 
+  /* mkostemp carries O_CLOEXEC into the open itself. That matters for a
+   * caller with more than one thread: between a plain mkstemp and a
+   * later F_SETFD, any other thread may fork and exec, and the child
+   * then inherits a descriptor to this file. The comment that used to
+   * stand here said the window was "this thread's own", which is a
+   * claim about the caller and not true of a threaded one.
+   *
+   * Where mkostemp is absent - macOS is the one that matters - the old
+   * two-step stands, with the window named rather than denied. */
+#ifdef SLIP_HAVE_MKOSTEMP
+  const int fd = mkostemp(path, O_CLOEXEC);
+#else
   const int fd = mkstemp(path);
+#endif
   if (fd < 0) return -errno;
 
   /* The mode is said here rather than left to the umask. POSIX.1-2008
@@ -83,13 +115,15 @@ SLIPSTREAM_API int slipstream_tmpfile(const char *dir) {
    * set a process-wide umask to find out. */
   if (fchmod(fd, S_IRUSR | S_IWUSR) < 0) goto fail;
 
-  /* mkostemp(3) would carry O_CLOEXEC into the open. It is GNU, so this
-   * is the portable half of the same thing: the window between the two
-   * calls is this thread's own, and no exec happens inside it. */
+#ifndef SLIP_HAVE_MKOSTEMP
+  /* The fallback, and the window is real: another thread that execs
+   * between the open above and this line hands the child a descriptor
+   * to this file. Nothing portable closes it without mkostemp. */
   {
     const int flags = fcntl(fd, F_GETFD);
     if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) goto fail;
   }
+#endif
 
   /* The name goes, the file stays: the descriptor holds the last
    * reference, so the blocks go back when it closes, and no other
