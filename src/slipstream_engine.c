@@ -122,9 +122,15 @@ static struct io_uring_cqe *cq_cqes(struct slip_ring *r) {
 /* Every slice of the ring's one block starts on a cache line. */
 static size_t block_align(size_t n) { return (n + 63u) & ~(size_t) 63u; }
 
+/* The caller's depth, rounded up. The stop at 1u << 31 is not a
+ * refinement: without it a v above 0x80000000 shifts n to zero and the
+ * loop never ends, because zero is below every v. The caller is refused
+ * long before that by setup's cap, and this stops anyway - a helper
+ * that hangs on an argument it was not given is a trap for the next
+ * caller. */
 static unsigned round_up_pow2(unsigned v) {
   unsigned n = 1;
-  while (n < v) n <<= 1;
+  while (n < v && n < (1u << 31)) n <<= 1;
   return n;
 }
 
@@ -223,7 +229,13 @@ void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res) {
 /* A multishot emission: the CQE without the op. When the CQ is full the
  * emission rides the backlog on a carrier op of its own; when even that
  * cannot be had, the overflow counter is the honest remainder. */
-void slip_engine_emit(struct slip_ring *r, __u64 user_data, int res, unsigned flags) {
+/* True when the completion was placed, false when it was counted as an
+ * overflow and dropped. A caller that holds a resource named in that
+ * completion has to know: a multishot accept whose CQE is dropped has
+ * already taken the connection, and the descriptor is then held by this
+ * process and named to nobody. */
+bool slip_engine_emit(struct slip_ring *r, __u64 user_data, int res, unsigned flags) {
+  bool placed = true;
   mtx_lock(&r->mtx);
   drain_backlog_locked(r);
   if (cq_room(r)) {
@@ -236,9 +248,11 @@ void slip_engine_emit(struct slip_ring *r, __u64 user_data, int res, unsigned fl
       backlog_locked(r, carrier, res);
     } else {
       cq_of(r)->overflow++;
+      placed = false;
     }
   }
   mtx_unlock(&r->mtx);
+  return placed;
 }
 
 /* ---- the fixed file table ---------------------------------------------
@@ -379,7 +393,7 @@ static int msg_ring(struct slip_ring *from, const struct io_uring_sqe *s) {
   if (s->addr != IORING_MSG_DATA) return -EOPNOTSUPP;
   to = ring_of(s->fd);
   if (to == NULL) return -EBADF;
-  slip_engine_emit(to, s->off, (int) s->len, 0);
+  (void) slip_engine_emit(to, s->off, (int) s->len, 0);
   /* A ring may message itself, and then there is nobody to wake: the
    * caller is the thread that will read it. Another ring may have a
    * thread asleep in its backend's wait, and poke is the door. */
@@ -404,10 +418,26 @@ static void settle_worker_ticket(struct slip_ring *r) {
   mtx_unlock(&r->mtx);
 }
 
+/* What the kernel takes, and therefore what this takes: the two are one
+ * number so a caller cannot tell the engine from the kernel by the
+ * error it gets for an absurd depth. */
+#define SLIP_MAX_ENTRIES 32768u
+#define SLIP_MAX_CQ_ENTRIES 65536u
+
 /* ---- the exported five, and the backend switch ------------------------ */
 
 int slipstream_engine_setup(unsigned int entries, struct io_uring_params *p) {
   if (entries == 0 || p == NULL) return -EINVAL;
+  /* The same ceilings the kernel keeps: IORING_MAX_ENTRIES for the
+   * submission side and IORING_MAX_CQ_ENTRIES for the completion side.
+   * A caller that asks for more gets -EINVAL here, as it would there.
+   *
+   * Without them entries is an allocation multiplier with nothing above
+   * it: one call asking for 1 << 20 reserves about 420 MB of sqes, cqes
+   * and op records. The provided-buffer ring already refuses its own
+   * count this way (see IORING_REGISTER_PBUF_RING below); the ring
+   * itself did not. */
+  if (entries > SLIP_MAX_ENTRIES || p->cq_entries > SLIP_MAX_CQ_ENTRIES) return -EINVAL;
   /* Shapes that change what liburing's inlines expect of this memory.
    * Refused by name rather than half-served.
    *

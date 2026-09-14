@@ -23,7 +23,22 @@
 #include <poll.h>
 #include <sys/select.h>
 
-static int select_open_ring(struct slip_ring *r) { return slip_posix_ctl_open(r); }
+/* The ceiling this file's header states, applied to the one descriptor
+ * that does not park: the ring's own control pipe. pipe(2) hands out
+ * the lowest free numbers, so ctl_r is at or above FD_SETSIZE exactly
+ * when the process already holds that many descriptors - a count a peer
+ * decides by opening connections. Refused at open, because a ring whose
+ * poke cannot be watched can never wake, and a named refusal at setup
+ * is the only honest answer. */
+static int select_open_ring(struct slip_ring *r) {
+  const int rc = slip_posix_ctl_open(r);
+  if (rc != 0) return rc;
+  if (r->ctl_r >= FD_SETSIZE || r->ctl_w >= FD_SETSIZE) {
+    slip_posix_ctl_close(r);
+    return -EMFILE;
+  }
+  return 0;
+}
 static void select_close_ring(struct slip_ring *r) { slip_posix_ctl_close(r); }
 
 /* The one thing this backend must check: an fd_set holds descriptors
@@ -44,8 +59,11 @@ static int select_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
   FD_ZERO(&rd);
   FD_ZERO(&wr);
   FD_ZERO(&ex);
+  /* Guarded like every other descriptor in this function, even though
+   * select_open_ring refused a high one already. Two tests cost nothing
+   * against a bit written outside the set. */
   int top = r->ctl_r;
-  FD_SET(r->ctl_r, &rd);
+  if (r->ctl_r >= 0 && r->ctl_r < FD_SETSIZE) FD_SET(r->ctl_r, &rd);
   for (unsigned i = 0; i < r->waiting_n; i++) {
     const short want = r->waiting[i]->wait_events;
     const int fd = r->waiting[i]->sqe.fd;
@@ -65,7 +83,8 @@ static int select_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
   }
   if (select(top + 1, &rd, &wr, &ex, timeout_ms >= 0 ? &tv : NULL) < 0)
     return 0; /* EINTR: a harmless drain */
-  if (FD_ISSET(r->ctl_r, &rd)) slip_posix_ctl_drain(r);
+  if (r->ctl_r >= 0 && r->ctl_r < FD_SETSIZE && FD_ISSET(r->ctl_r, &rd))
+    slip_posix_ctl_drain(r);
 
   /* select answers in the sets it was given, so the parked ops are
    * walked once to read the answer off. There is nowhere else to put

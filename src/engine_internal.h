@@ -27,6 +27,7 @@
 #include "thrd_compat.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 /* FreeBSD's errno.h withholds the NAME under a bare -std=c11 - the
@@ -204,7 +205,7 @@ void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res);
 
 /* A CQE that is NOT an op's completion - a multishot emission. The op
  * stays alive and parked; only the CQE goes out. Engine thread only. */
-void slip_engine_emit(struct slip_ring *r, __u64 user_data, int res, unsigned flags);
+bool slip_engine_emit(struct slip_ring *r, __u64 user_data, int res, unsigned flags);
 
 /* The fixed file table, owned by the core beside the register path.
  * lookup: slot -> real descriptor, -EBADF outside the table or empty.

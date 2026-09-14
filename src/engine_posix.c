@@ -265,7 +265,19 @@ static enum eng_verdict run_accept_multishot(struct slip_ring *r, struct eng_op 
       *res_out = answer;
       return RAN;
     }
-    slip_engine_emit(r, s->user_data, answer, IORING_CQE_F_MORE);
+    /* The connection is taken before the completion is written, so a
+     * completion that cannot be placed leaves this process holding a
+     * descriptor whose number reached nobody. The kernel ends a
+     * multishot when the queue cannot take another; this does the same,
+     * and gives the descriptor back first. */
+    if (!slip_engine_emit(r, s->user_data, answer, IORING_CQE_F_MORE)) {
+      if (s->file_index != 0)
+        slip_fixed_clear(r, (unsigned) answer);
+      else
+        close(answer);
+      *res_out = -ENOBUFS;
+      return RAN;
+    }
   }
 }
 
@@ -290,7 +302,7 @@ static enum eng_verdict run_recv_multishot(struct slip_ring *r, struct eng_op *o
     }
     const ssize_t n = recv(s->fd, rbuf, rlen, (int) s->msg_flags | MSG_DONTWAIT);
     if (n > 0) {
-      slip_engine_emit(r, s->user_data, (int) n, cflags | IORING_CQE_F_MORE);
+      (void) slip_engine_emit(r, s->user_data, (int) n, cflags | IORING_CQE_F_MORE);
       continue;
     }
     /* Nothing came: the buffer was never filled, so it is not consumed. */
@@ -380,7 +392,7 @@ static enum eng_verdict run_recvmsg_multishot(struct slip_ring *r, struct eng_op
       out->controllen = (__u32) mh.msg_controllen;
       out->payloadlen = (__u32) n;
       out->flags = (__u32) mh.msg_flags;
-      slip_engine_emit(r, s->user_data, (int) (header + (size_t) n),
+      (void) slip_engine_emit(r, s->user_data, (int) (header + (size_t) n),
                        cflags | IORING_CQE_F_MORE);
       continue;
     }
@@ -694,7 +706,7 @@ enum eng_verdict slip_posix_try(struct slip_ring *r, struct eng_op *op, int *res
         const short want = (short) s->poll32_events;
         const short have = revents_now(s->fd, want);
         if (have != 0) {
-          slip_engine_emit(r, s->user_data, (int) (unsigned short) have, IORING_CQE_F_MORE);
+          (void) slip_engine_emit(r, s->user_data, (int) (unsigned short) have, IORING_CQE_F_MORE);
         }
         op->wait_events = want;
         return PARK;
