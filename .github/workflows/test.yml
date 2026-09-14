@@ -1,0 +1,51 @@
+# One entry point on two systems, because an arm nobody runs is an arm
+# nobody has checked - the Makefile says so about the two signal arms and
+# it is true of the platforms as well.
+#
+# What each system proves, and nothing is claimed beyond it:
+#
+#   ubuntu  the io_uring forwarder and the engine behind it. On a host
+#           with io_uring the engine is never entered - the syscall
+#           layer goes straight to __NR_io_uring_* - so this also runs
+#           the engine arms through test/backends, which asks for each
+#           backend by name.
+#   macos   the kqueue engine and the dispatch signal arm. Neither can
+#           be built anywhere else: dispatch/dispatch.h is on this
+#           system and no other, and a fix for that arm written on Linux
+#           has never been compiled until this job runs.
+#
+# The Windows arms ride on Wine from the ubuntu job. They are the same
+# MinGW binaries the Makefile builds, and their scripts skip themselves
+# where Wine is absent, so a runner without it says skip rather than
+# passing something it did not run.
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: what the Wine and libkqueue arms need
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 wine wine64 libkqueue-dev
+      - run: make test
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # No install step: clang and libdispatch are the system's. The
+      # Wine and libkqueue arms are absent here and skip themselves -
+      # kqueue is the platform's own, so the engine uses it directly
+      # rather than through libkqueue.
+      - run: make test
