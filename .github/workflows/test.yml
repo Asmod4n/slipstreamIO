@@ -9,10 +9,15 @@
 #           layer goes straight to __NR_io_uring_* - so this also runs
 #           the engine arms through test/backends, which asks for each
 #           backend by name.
-#   macos   the kqueue engine and the dispatch signal arm. Neither can
-#           be built anywhere else: dispatch/dispatch.h is on this
-#           system and no other, and a fix for that arm written on Linux
-#           has never been compiled until this job runs.
+#   macos   the dispatch signal arm, and nothing else that no other
+#           runner covers. dispatch/dispatch.h is on this system and no
+#           other, so this job is the only compiler that arm ever sees.
+#           It does NOT certify kqueue. That implementation is not
+#           steady enough to stand as a reference, which is why the
+#           EVFILT_VNODE arm runs on Linux through libkqueue with
+#           inotify as the oracle - see test/inotify_kqueue.sh. A green
+#           run here says the tree builds and behaves on Apple clang;
+#           it does not say kqueue is right.
 #   windows the Windows arms on the real thing, with MSVC. Wine gives
 #           the ubuntu job a good imitation of IOCP and of
 #           ReadDirectoryChangesW, and an imitation is where a lifetime
@@ -52,9 +57,10 @@ jobs:
         with:
           submodules: recursive
       # No install step: clang and libdispatch are the system's. The
-      # Wine and libkqueue arms are absent here and skip themselves -
-      # kqueue is the platform's own, so the engine uses it directly
-      # rather than through libkqueue.
+      # Wine and libkqueue arms are absent here and skip themselves.
+      # The engine uses this system's own kqueue, which is what ships
+      # here - and which is not the arm any claim about kqueue rests
+      # on. The libkqueue run on the ubuntu job is that arm.
       - run: make test
 
   windows:
