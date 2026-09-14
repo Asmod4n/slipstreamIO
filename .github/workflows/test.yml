@@ -13,11 +13,18 @@
 #           be built anywhere else: dispatch/dispatch.h is on this
 #           system and no other, and a fix for that arm written on Linux
 #           has never been compiled until this job runs.
+#   windows the Windows arms on the real thing, with MSVC. Wine gives
+#           the ubuntu job a good imitation of IOCP and of
+#           ReadDirectoryChangesW, and an imitation is where a lifetime
+#           bug hides: a CancelIo that Wine completes at once says
+#           nothing about a kernel that does not. This job runs those
+#           four programs against the real API.
 #
-# The Windows arms ride on Wine from the ubuntu job. They are the same
-# MinGW binaries the Makefile builds, and their scripts skip themselves
-# where Wine is absent, so a runner without it says skip rather than
-# passing something it did not run.
+# The windows job is also the tree's first MSVC. Nothing here had an
+# _MSC_VER guard before it, so the compiler is expected to find things
+# the other two do not - which is what it is for. It builds the test
+# programs directly rather than through the Makefile, because that file
+# is POSIX make and this runner has none.
 name: test
 
 on:
@@ -49,3 +56,43 @@ jobs:
       # kqueue is the platform's own, so the engine uses it directly
       # rather than through libkqueue.
       - run: make test
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ilammy/msvc-dev-cmd@v1
+      # The four programs whose arms only exist on this system: the
+      # temp file, the signal wire, the directory watch and the IOCP
+      # engine. Each is built from the sources the Makefile names for
+      # it, and run at once - a program that builds and does not run
+      # has proven the compiler and nothing else.
+      - name: the temp file
+        shell: cmd
+        run: |
+          cl /nologo /std:c11 /W3 /Isrc /Ishim\windows /Ishim\common ^
+             /Fe:tmpfile.exe test\tmpfile.c src\slipstream_tmpfile.c || exit /b 1
+          tmpfile.exe || exit /b 1
+      - name: the signal wire
+        shell: cmd
+        run: |
+          cl /nologo /std:c11 /W3 /Isrc /Ishim\windows /Ishim\common ^
+             /Fe:signal.exe test\signal.c src\slipstream_signal.c ws2_32.lib || exit /b 1
+          signal.exe || exit /b 1
+      - name: the directory watch
+        shell: cmd
+        run: |
+          cl /nologo /std:c11 /W3 /Isrc /Ishim\windows /Ishim\common ^
+             /Fe:inotify.exe test\inotify.c src\slipstream_inotify.c || exit /b 1
+          inotify.exe || exit /b 1
+      - name: the IOCP engine
+        shell: cmd
+        run: |
+          cl /nologo /std:c11 /W3 /Isrc /Ishim\windows /Ishim\common ^
+             /Ideps\liburing\src\include /Fe:backends.exe test\backends.c ^
+             src\slipstream_engine.c src\engine_dispatch.c src\engine_epoll.c ^
+             src\engine_iocp.c src\engine_kqueue.c src\engine_posix.c ^
+             src\engine_select.c ws2_32.lib || exit /b 1
+          backends.exe || exit /b 1
