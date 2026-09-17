@@ -162,6 +162,22 @@ struct eng_done {
  * ops itself and re-parks the spurious ones; a completion backend just
  * translates its packets. Zero from wait is a bare poke. poke may be
  * called from any thread; everything else is the engine thread's. */
+/* How many entries a fixed file table may hold on this platform.
+ *
+ * A kernel measures the registration against RLIMIT_NOFILE and answers
+ * EMFILE for a larger table: measured on Linux 6.18.44, where a table of
+ * exactly the limit registered and one entry more did not. A direct
+ * descriptor is not charged against that limit once the table holds it -
+ * that is what makes the shape worth having - but the registration is,
+ * and a caller that learns its ceiling from this engine has to learn the
+ * one it will meet on a kernel.
+ *
+ * Defined by the platform half that is compiled: engine_posix.c off
+ * Windows, engine_iocp.c on it. Windows has no such limit to read, so it
+ * answers UINT_MAX and the table's own allocation becomes the ceiling -
+ * the platform's answer rather than a number of ours. */
+unsigned slip_max_fixed_files(void);
+
 struct eng_backend {
   const char *name;
   int (*open_ring)(struct slip_ring *r);

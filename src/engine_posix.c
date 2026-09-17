@@ -14,10 +14,12 @@
 #include "engine_internal.h"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -174,6 +176,15 @@ static ssize_t file_try_nowait(const struct io_uring_sqe *s, void *buf, int writ
 }
 
 /* Whether the miss is worth a thread, or is the real answer. */
+/* See engine_internal.h. RLIMIT_NOFILE is the kernel's own ceiling for
+ * a fixed file table, so it is this platform's answer too. */
+unsigned slip_max_fixed_files(void) {
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return UINT_MAX;
+  if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur > UINT_MAX) return UINT_MAX;
+  return (unsigned) rl.rlim_cur;
+}
+
 static int nowait_missed(void) {
   return errno == EAGAIN || errno == EWOULDBLOCK || errno == EOPNOTSUPP ||
          errno == ENOSYS || errno == EINVAL;

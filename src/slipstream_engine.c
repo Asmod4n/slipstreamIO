@@ -604,7 +604,11 @@ int slipstream_engine_register(int fd, unsigned int opcode, void *arg,
       const struct io_uring_rsrc_register *rr = arg;
       if (!(rr->flags & IORING_RSRC_REGISTER_SPARSE) || rr->data != 0 || rr->tags != 0)
         return -EINVAL;
-      if (rr->nr == 0 || rr->nr > (1u << 20)) return -EINVAL;
+      if (rr->nr == 0) return -EINVAL;
+      /* The kernel's ceiling, asked of the backend - this file holds no
+       * OS call. A table larger than it answers EMFILE on a kernel, so
+       * it answers EMFILE here. */
+      if (rr->nr > slip_max_fixed_files()) return -EMFILE;
       if (r->fixed != NULL) return -EBUSY; /* one table per ring, like the kernel */
       int *table = malloc((size_t) rr->nr * sizeof(int));
       if (table == NULL) return -ENOMEM;

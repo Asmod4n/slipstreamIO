@@ -35,6 +35,7 @@
 #include <mswsock.h>
 #include <windows.h>
 #include <fcntl.h>
+#include <limits.h>
 /* Windows has no openat, so it has no AT_FDCWD either. The value is
  * Linux's, and it is the only dfd this backend accepts - see OPENAT. */
 #ifndef AT_FDCWD
@@ -87,6 +88,11 @@ struct iocp_state {
   HANDLE port;
   struct iocp_op *in_flight;
 };
+
+/* See engine_internal.h. Windows has no RLIMIT_NOFILE to read, so the
+ * table is not bounded from here and its own allocation is the
+ * ceiling. */
+unsigned slip_max_fixed_files(void) { return UINT_MAX; }
 
 static const ULONG_PTR IOCP_KEY_POKE = 1;
 static const ULONG_PTR IOCP_KEY_IO = 2;

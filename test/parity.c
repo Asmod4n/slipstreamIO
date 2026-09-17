@@ -21,11 +21,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -520,6 +522,35 @@ static int sc_direct_listener(struct io_uring *ring, struct rec *out) {
   return 4;
 }
 
+/* A fixed file table may not be larger than RLIMIT_NOFILE. The kernel
+ * answers EMFILE for one that is, and so does the engine - a consumer
+ * that learns its ceiling from the engine has to meet the same one on a
+ * kernel. The limit is read here rather than assumed, because the
+ * harness does not own it.
+ *
+ * Nothing reaches the ring, so there is no completion to compare. The
+ * answer is recorded as a rec of its own: user_data names the case and
+ * res carries what the registration said. */
+static int sc_fixed_table_over_nofile(struct io_uring *ring, struct rec *out) {
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
+  if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= UINT_MAX) return -1;
+
+  const unsigned over = (unsigned) rl.rlim_cur + 1u;
+  out[0].user_data = 220;
+  out[0].res = io_uring_register_files_sparse(ring, over);
+  out[0].flags = 0;
+  if (out[0].res == 0) io_uring_unregister_files(ring);
+
+  /* And the limit itself registers, which is what makes the row above a
+   * boundary rather than a refusal of everything large. */
+  out[1].user_data = 221;
+  out[1].res = io_uring_register_files_sparse(ring, (unsigned) rl.rlim_cur);
+  out[1].flags = 0;
+  if (out[1].res == 0) io_uring_unregister_files(ring);
+  return 2;
+}
+
 /* A slot that was never filled is -EBADF, exactly as the kernel answers
  * a fixed-file op on an empty one. */
 static int sc_empty_slot_is_ebadf(struct io_uring *ring, struct rec *out) {
@@ -965,6 +996,7 @@ static const struct scenario scenarios[] = {
   { "a wait with nothing coming times out", sc_wait_times_out, 1 },
   { "socket_direct/bind/listen/close_direct on a slot", sc_direct_listener, 1 },
   { "a fixed-file op on an empty slot is -EBADF", sc_empty_slot_is_ebadf, 0 },
+  { "a fixed table over RLIMIT_NOFILE is -EMFILE", sc_fixed_table_over_nofile, 0 },
   { "a recv picks a provided buffer, and fills THAT one", sc_recv_buffer_select, 0 },
   { "multishot recv: F_MORE per arrival, EOF ends it", sc_recv_multishot, 1 },
   { "setsockopt and getsockopt as ring commands", sc_cmd_sockopt, 1 },
