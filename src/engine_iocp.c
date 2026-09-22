@@ -124,6 +124,19 @@ void slip_native_fd_close(int fd) {
   if (closesocket((SOCKET) fd) != 0) (void) _close(fd);
 }
 
+/* And its twin, the same two-step: a socket duplicates through Winsock
+ * into this same process, anything else through the CRT. */
+int slip_native_fd_dup(int fd) {
+  WSAPROTOCOL_INFOW info;
+  if (WSADuplicateSocketW((SOCKET) fd, GetCurrentProcessId(), &info) == 0) {
+    const SOCKET made = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
+                                   &info, 0, WSA_FLAG_OVERLAPPED);
+    if (made != INVALID_SOCKET) return (int) made;
+  }
+  const int made = _dup(fd);
+  return made >= 0 ? made : -EBADF;
+}
+
 static void iocp_close_ring(struct slip_ring *r) {
   struct iocp_state *st = r->be_state;
   if (st == NULL) return;

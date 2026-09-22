@@ -113,6 +113,11 @@ void slip_posix_ctl_drain(struct slip_ring *r) {
  * holds the table but no OS call. */
 void slip_native_fd_close(int fd) { close(fd); }
 
+int slip_native_fd_dup(int fd) {
+  const int made = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+  return made >= 0 ? made : -errno;
+}
+
 void slip_posix_poke(struct slip_ring *r) {
   const char b = 1;
   /* A full pipe already holds a wakeup; a failed write is not an error. */

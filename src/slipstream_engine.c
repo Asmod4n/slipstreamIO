@@ -586,6 +586,35 @@ int slipstream_engine_register(int fd, unsigned int opcode, void *arg,
       r->alloc_hint = 0;
       return 0;
     }
+    case IORING_REGISTER_FILES_UPDATE: {
+      /* The one road a socketpair has into the table: socketpair(2) is
+       * the only thing that makes one, so its descriptors exist before
+       * any ring does and nothing can install them directly. What the
+       * kernel answers here is measured in test/parity.c, scenario
+       * "files_update lifts a socketpair into the table": no table is
+       * -ENXIO, past the end is -EINVAL, an occupied slot is replaced,
+       * a -1 empties one, the answer is how many slots were written,
+       * and the table's reference is its own - the caller may close its
+       * descriptor and the slot keeps working. */
+      if (r->fixed == NULL) return -ENXIO;
+      if (arg == NULL) return -EFAULT;
+      const struct io_uring_files_update *up = arg;
+      if (nr_args == 0) return -EINVAL;
+      if (up->offset > r->fixed_n || nr_args > r->fixed_n - up->offset) return -EINVAL;
+      const int *fds = (const int *) (uintptr_t) up->fds;
+      if (fds == NULL) return -EFAULT;
+      for (unsigned i = 0; i < nr_args; i++) {
+        const unsigned slot = up->offset + i;
+        int mine = -1;
+        if (fds[i] >= 0) {
+          mine = slip_native_fd_dup(fds[i]);
+          if (mine < 0) return i > 0 ? (int) i : mine;
+        }
+        if (r->fixed[slot] >= 0) slip_native_fd_close(r->fixed[slot]);
+        r->fixed[slot] = mine;
+      }
+      return (int) nr_args;
+    }
     case IORING_UNREGISTER_FILES: {
       if (r->fixed == NULL) return -ENXIO;
       for (unsigned i = 0; i < r->fixed_n; i++) {

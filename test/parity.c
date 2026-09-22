@@ -944,6 +944,89 @@ struct scenario {
   int ordered; /* order is part of the contract (a link chain) */
 };
 
+/* A socketpair can only come from socketpair(2) - there is no
+ * prep_socketpair and no register that makes one - so a consumer that
+ * wants its pair as direct descriptors has exactly one road: hand the
+ * descriptors it already holds to the table. This asks the kernel what
+ * that road does, including who owns the descriptor afterwards. */
+static int sc_files_update_takes_a_socketpair(struct io_uring *ring, struct rec *out) {
+  static const char hello[] = "through the slot";
+  int sp[2];
+  int n = 0;
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) != 0) return -1;
+  int fds[1];
+  fds[0] = sp[0];
+
+  /* no table yet - there is nothing to write into */
+  out[n].user_data = 300;
+  out[n].res = io_uring_register_files_update(ring, 0, fds, 1);
+  out[n].flags = 0;
+  n++;
+
+  out[n].user_data = 301;
+  out[n].res = io_uring_register_files_sparse(ring, 4);
+  out[n].flags = 0;
+  n++;
+
+  out[n].user_data = 302;
+  out[n].res = io_uring_register_files_update(ring, 0, fds, 1);
+  out[n].flags = 0;
+  n++;
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_send(sqe, 0, hello, sizeof(hello), 0);
+  sqe->flags |= IOSQE_FIXED_FILE;
+  io_uring_sqe_set_data64(sqe, 303);
+  if (submit_one(ring, out + n) != 1) { close(sp[0]); close(sp[1]); return n; }
+  n++;
+
+  /* the caller's descriptor stays the caller's: closing it must not
+   * take the slot with it */
+  close(sp[0]);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_send(sqe, 0, hello, sizeof(hello), 0);
+  sqe->flags |= IOSQE_FIXED_FILE;
+  io_uring_sqe_set_data64(sqe, 304);
+  if (submit_one(ring, out + n) != 1) { close(sp[1]); return n; }
+  n++;
+
+  char room[64];
+  out[n].user_data = 305;
+  out[n].res = (int) recv(sp[1], room, sizeof(room), 0);
+  out[n].flags = 0;
+  n++;
+
+  /* past the end of the table */
+  fds[0] = sp[1];
+  out[n].user_data = 306;
+  out[n].res = io_uring_register_files_update(ring, 9, fds, 1);
+  out[n].flags = 0;
+  n++;
+
+  /* a slot that already holds one */
+  out[n].user_data = 307;
+  out[n].res = io_uring_register_files_update(ring, 0, fds, 1);
+  out[n].flags = 0;
+  n++;
+
+  /* and -1, which is how a table entry is emptied */
+  fds[0] = -1;
+  out[n].user_data = 308;
+  out[n].res = io_uring_register_files_update(ring, 0, fds, 1);
+  out[n].flags = 0;
+  n++;
+
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_send(sqe, 0, hello, sizeof(hello), 0);
+  sqe->flags |= IOSQE_FIXED_FILE;
+  io_uring_sqe_set_data64(sqe, 309);
+  if (submit_one(ring, out + n) != 1) { close(sp[1]); return n; }
+  n++;
+
+  close(sp[1]);
+  return n;
+}
+
 static const struct scenario scenarios[] = {
   { "a NOP", sc_single_nop, 0 },
   { "a recv that must wait for the peer", sc_recv_waits_for_peer, 0 },
@@ -964,6 +1047,7 @@ static const struct scenario scenarios[] = {
   { "shutdown SHUT_WR reads as EOF at the peer", sc_shutdown_means_eof, 1 },
   { "a wait with nothing coming times out", sc_wait_times_out, 1 },
   { "socket_direct/bind/listen/close_direct on a slot", sc_direct_listener, 1 },
+  { "files_update lifts a socketpair into the table", sc_files_update_takes_a_socketpair, 1 },
   { "a fixed-file op on an empty slot is -EBADF", sc_empty_slot_is_ebadf, 0 },
   { "a recv picks a provided buffer, and fills THAT one", sc_recv_buffer_select, 0 },
   { "multishot recv: F_MORE per arrival, EOF ends it", sc_recv_multishot, 1 },

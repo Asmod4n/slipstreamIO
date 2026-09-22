@@ -226,6 +226,11 @@ struct slip_bufring *slip_bufring_of(struct slip_ring *r, unsigned short bgid);
  * (close on POSIX, closesocket/CloseHandle territory on Windows). */
 void slip_native_fd_close(int fd);
 
+/* The fixed file table holds its OWN reference to a descriptor handed
+ * to it, so closing the caller's copy leaves the slot standing. Answers
+ * a negative errno. */
+int slip_native_fd_dup(int fd);
+
 /* ---- the two families -------------------------------------------------
  * READINESS (select, epoll, kqueue): the OS says "that descriptor came
  * ready" and the shared machinery in engine_posix.c does everything
