@@ -374,6 +374,67 @@ static void scenes(const char *name) {
     sock_close(mp[1]);
   }
 
+  /* 2f: files_update lifts a socketpair the CALLER made into the fixed
+   * table. What the answers have to be was measured against a running
+   * kernel in test/parity.c; this holds the backend to the same ones on
+   * a platform where no kernel can be asked. The line that matters is
+   * the last: the table's reference is its own, so the caller closing
+   * its descriptor leaves the slot working. */
+  {
+    int up[2] = { -1, -1 };
+    static char hello[] = "slot";
+    static char back[8];
+    int fds[1];
+    check(pair_of_streams(up) == 0, "a socketpair for the table");
+    fds[0] = up[1];
+    check(slipstream_engine_register(d.fd, IORING_REGISTER_FILES_UPDATE, NULL, 1) == -ENXIO,
+          "files_update before any table is -ENXIO");
+
+    struct io_uring_rsrc_register rr;
+    memset(&rr, 0, sizeof(rr));
+    rr.nr = 4;
+    rr.flags = IORING_RSRC_REGISTER_SPARSE;
+    check(slipstream_engine_register(d.fd, IORING_REGISTER_FILES2, &rr, sizeof(rr)) == 0,
+          "a sparse table of four");
+
+    struct io_uring_files_update fu;
+    memset(&fu, 0, sizeof(fu));
+    fu.offset = 0;
+    fu.fds = (__u64) (uintptr_t) fds;
+    check(slipstream_engine_register(d.fd, IORING_REGISTER_FILES_UPDATE, &fu, 1) == 1,
+          "and the update writes one slot");
+    fu.offset = 9;
+    check(slipstream_engine_register(d.fd, IORING_REGISTER_FILES_UPDATE, &fu, 1) == -EINVAL,
+          "past the end of the table is -EINVAL");
+
+    struct io_uring_sqe *fs = push(&d, IORING_OP_SEND, 0, hello, 4, 0, 0x801);
+    fs->flags |= IOSQE_FIXED_FILE;
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    struct io_uring_cqe *fq = cq_pop(&d);
+    check(fq != NULL && fq->res == 4, "a send through the slot goes");
+
+    sock_close(up[1]);
+    fs = push(&d, IORING_OP_SEND, 0, hello, 4, 0, 0x802);
+    fs->flags |= IOSQE_FIXED_FILE;
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    fq = cq_pop(&d);
+    check(fq != NULL && fq->res == 4,
+          "and still goes once the caller has closed its own descriptor");
+
+    memset(back, 0, sizeof(back));
+    push(&d, IORING_OP_RECV, up[0], back, sizeof(back), 0, 0x803);
+    e = slipstream_engine_enter(d.fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+    fq = cq_pop(&d);
+    /* A stream carries the two sends as bytes, not as messages, so the
+     * peer may see them in one read or in two - what is asked is that
+     * the bytes are there and are the ones that were sent. */
+    check(fq != NULL && fq->res >= 4 && memcmp(back, hello, 4) == 0,
+          "and the peer has the bytes");
+    check(slipstream_engine_register(d.fd, IORING_UNREGISTER_FILES, NULL, 0) == 0,
+          "and the table gives the slot back");
+    sock_close(up[0]);
+  }
+
   /* 3: an idle wait with a deadline says -ETIME, after the deadline. */
   struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000000LL };
   struct io_uring_getevents_arg arg = { .ts = (__u64) (uintptr_t) &ts };
