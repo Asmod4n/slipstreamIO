@@ -42,6 +42,10 @@ MRuby::Gem::Specification.new('mruby-slipstreamio') do |spec|
     # trusted.
     FileUtils.touch(seam_marker)
   end
+  ENV['PKG_CONFIG_PATH'] = ["#{liburing_out}/lib/pkgconfig", ENV['PKG_CONFIG_PATH']].compact.join(':')
+  unless spec.search_package('liburing')
+    abort 'mruby-slipstreamio: pkg-config does not find the carried liburing.'
+  end
   spec.linker.flags_after_libraries << liburing_lib
 
   # The installed headers, not deps/liburing's source tree: compat.h and
