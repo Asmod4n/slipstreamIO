@@ -97,7 +97,7 @@ struct slip_ring {
   struct eng_op *backlog_head, *backlog_tail; /* completions the CQ had no room for */
   struct eng_op *wq_head, *wq_tail; /* engine -> worker (regular files, POSIX) */
   struct eng_op *blocked_done; /* the op the queue stalled on, finished off-thread */
-  int blocked_failed; /* that op's result was negative - the chain must know */
+  int blocked_failed; /* how that op ended its chain: a SLIP_CHAIN_ value */
 
   /* ---- what WHOEVER IS INSIDE ENTER owns ---------------------------
    * The submitter runs the ops, parks them and drains the backend on its
@@ -114,7 +114,7 @@ struct slip_ring {
   unsigned waiting_n;
   struct eng_op **ready;
   struct eng_done *done;
-  int chain_failed; /* a linked op failed: cancel the rest of its chain */
+  int chain_failed; /* a SLIP_CHAIN_ value: whether the rest of the chain is cancelled, and seen */
   struct eng_op *blocking; /* a linked op is pending somewhere; the queue waits */
 
   /* ---- registered resources ----------------------------------------
@@ -201,6 +201,19 @@ struct eng_backend {
  * thread's own loop - the worker, and iocp's drain. Takes the CQ lock,
  * frees the op (or backlogs it when the CQ is full). */
 void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res);
+
+/* How a failed op leaves the rest of its chain. Measured against a
+ * running kernel (test/parity.c, the skip_success scenarios): when the
+ * op that fails carries IOSQE_CQE_SKIP_SUCCESS, the members it cancels
+ * post no CQE at all, whatever flags they carry; without it each posts
+ * -ECANCELED, its own flag or not. */
+#define SLIP_CHAIN_HOLDS 0
+#define SLIP_CHAIN_CANCELS 1
+#define SLIP_CHAIN_CANCELS_QUIETLY 2
+
+static inline int slip_chain_failure_of(const struct eng_op *op) {
+  return (op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) ? SLIP_CHAIN_CANCELS_QUIETLY : SLIP_CHAIN_CANCELS;
+}
 
 /* A CQE that is NOT an op's completion - a multishot emission. The op
  * stays alive and parked; only the CQE goes out. Engine thread only. */

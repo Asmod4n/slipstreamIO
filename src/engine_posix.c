@@ -816,7 +816,7 @@ static int worker_main(void *arg) {
        * it. */
       mtx_lock(&r->mtx);
       r->blocked_done = op;
-      r->blocked_failed = res < 0;
+      r->blocked_failed = res < 0 ? slip_chain_failure_of(op) : SLIP_CHAIN_HOLDS;
       mtx_unlock(&r->mtx);
     }
     slip_engine_post(r, op, res); /* frees op */
@@ -898,9 +898,9 @@ static int cancel_names(const struct eng_op *cancel, const struct eng_op *target
 static void cancel_target(struct slip_ring *r, struct eng_op *t) {
   if (t == r->blocking) {
     r->blocking = NULL;
-    r->chain_failed = 1;
+    r->chain_failed = slip_chain_failure_of(t);
   } else if (t->sqe.flags & IOSQE_IO_LINK) {
-    r->chain_failed = 1;
+    r->chain_failed = slip_chain_failure_of(t);
   }
   slip_engine_post(r, t, -ECANCELED);
 }

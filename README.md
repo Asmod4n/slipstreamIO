@@ -39,7 +39,9 @@ operation that would block is parked with the events it waits for, an
 engine thread polls the parked set and posts the completion when the
 descriptor comes ready. Regular files have no readiness, so file work
 goes to a worker thread. `IOSQE_IO_LINK` failure cancels the rest of the
-chain with `-ECANCELED`, and rings advertise `IORING_FEAT_EXT_ARG` so
+chain with `-ECANCELED`. `IOSQE_CQE_SKIP_SUCCESS` drops the CQE of an
+operation that succeeds; when the failing link carries it, the
+cancelled rest of the chain posts nothing. Rings advertise `IORING_FEAT_EXT_ARG` so
 timed waits ride beside `enter` instead of needing a timeout opcode.
 
 Carried today, each held to kernel parity: nop, read, write, recv,

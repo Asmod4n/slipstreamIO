@@ -211,7 +211,12 @@ static void backlog_locked(struct slip_ring *r, struct eng_op *op, int res) {
 void slip_engine_post(struct slip_ring *r, struct eng_op *op, int res) {
   mtx_lock(&r->mtx);
   drain_backlog_locked(r);
-  if (cq_room(r)) {
+  /* IOSQE_CQE_SKIP_SUCCESS: an op that succeeds posts nothing, and one
+   * that fails posts as always - the kernel answered both
+   * (test/parity.c, the skip_success scenarios). */
+  if (res >= 0 && (op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS)) {
+    op_release(r, op);
+  } else if (cq_room(r)) {
     post_locked(r, op->sqe.user_data, res, op->cqe_flags);
     op_release(r, op);
   } else {
@@ -298,9 +303,9 @@ struct slip_bufring *slip_bufring_of(struct slip_ring *r, unsigned short bgid) {
 static void complete(struct slip_ring *r, struct eng_op *op, int res) {
   if (op == r->blocking) {
     r->blocking = NULL;
-    if (res < 0) r->chain_failed = 1;
+    if (res < 0) r->chain_failed = slip_chain_failure_of(op);
   } else if (res < 0 && (op->sqe.flags & IOSQE_IO_LINK)) {
-    r->chain_failed = 1;
+    r->chain_failed = slip_chain_failure_of(op);
   }
   slip_engine_post(r, op, res);
 }
@@ -317,8 +322,14 @@ static void process_queue(struct slip_ring *r) {
     if (r->chain_failed) {
       /* A failing IOSQE_IO_LINK member cancels the rest of its chain -
        * io_uring_enter(2), IOSQE_IO_LINK. */
-      slip_engine_post(r, op, -ECANCELED);
-      if (!linked) r->chain_failed = 0;
+      if (r->chain_failed == SLIP_CHAIN_CANCELS_QUIETLY) {
+        mtx_lock(&r->mtx);
+        op_release(r, op);
+        mtx_unlock(&r->mtx);
+      } else {
+        slip_engine_post(r, op, -ECANCELED);
+      }
+      if (!linked) r->chain_failed = SLIP_CHAIN_HOLDS;
       continue;
     }
 
@@ -333,7 +344,7 @@ static void process_queue(struct slip_ring *r) {
         op->sqe.opcode != IORING_OP_NOP) {
       const int realfd = slip_fixed_lookup(r, op->sqe.fd);
       if (realfd < 0) {
-        if (linked) r->chain_failed = 1;
+        if (linked) r->chain_failed = slip_chain_failure_of(op);
         slip_engine_post(r, op, -EBADF);
         continue;
       }
@@ -351,7 +362,7 @@ static void process_queue(struct slip_ring *r) {
 
     int res = 0;
     if (r->be->execute(r, op, &res) == EXEC_DONE) {
-      if (res < 0 && linked) r->chain_failed = 1;
+      if (res < 0 && linked) r->chain_failed = slip_chain_failure_of(op);
       slip_engine_post(r, op, res);
     } else if (linked) {
       r->blocking = op; /* the chain waits wherever the op is */
@@ -395,9 +406,9 @@ static void settle_worker_ticket(struct slip_ring *r) {
   if (r->blocked_done != NULL && r->blocked_done == r->blocking) {
     r->blocking = NULL;
     r->blocked_done = NULL;
-    if (r->blocked_failed) {
-      r->chain_failed = 1;
-      r->blocked_failed = 0;
+    if (r->blocked_failed != SLIP_CHAIN_HOLDS) {
+      r->chain_failed = r->blocked_failed;
+      r->blocked_failed = SLIP_CHAIN_HOLDS;
     }
   }
   drain_backlog_locked(r);

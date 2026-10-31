@@ -938,6 +938,118 @@ static int sc_msg_ring_bad_fd(struct io_uring *ring, struct rec *out) {
   return collect_within(ring, out, 1, 500);
 }
 
+/* IOSQE_CQE_SKIP_SUCCESS: what a worker pool puts on every job it
+ * sends, so the sender's ring holds only answers. A NOP with the flag
+ * and a NOP without it; how many CQEs come back, and whose, is the
+ * kernel's answer. */
+static int sc_skip_success_nop(struct io_uring *ring, struct rec *out) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+  io_uring_sqe_set_data64(sqe, 50);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_data64(sqe, 51);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 2, 300);
+}
+
+/* The pool's own shape: a message to a ring, the flag on the send. */
+static int sc_skip_success_msg_ring(struct io_uring *ring, struct rec *out) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_msg_ring(sqe, ring->ring_fd, 9, 0x517, 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+  io_uring_sqe_set_data64(sqe, 52);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 2, 300);
+}
+
+/* The flag on a send that fails. */
+static int sc_skip_success_failure(struct io_uring *ring, struct rec *out) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_msg_ring(sqe, -1, 1, 0x518, 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+  io_uring_sqe_set_data64(sqe, 53);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 1, 300);
+}
+
+/* The flag on the head of a link chain that succeeds. */
+static int sc_skip_success_link_head(struct io_uring *ring, struct rec *out) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS | IOSQE_IO_LINK);
+  io_uring_sqe_set_data64(sqe, 54);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_data64(sqe, 55);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 2, 300);
+}
+
+/* The flag on the head of a link chain that fails: what the head and
+ * the cancelled member each say. */
+static int sc_skip_success_failing_link_head(struct io_uring *ring, struct rec *out) {
+  static char buf[8];
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_read(sqe, -1, buf, sizeof(buf), 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS | IOSQE_IO_LINK);
+  io_uring_sqe_set_data64(sqe, 56);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+  io_uring_sqe_set_data64(sqe, 57);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 2, 300);
+}
+
+/* The two halves of the case above apart: the flag on the cancelled
+ * member only, and on the failing head only. */
+static int sc_skip_success_cancelled_member(struct io_uring *ring, struct rec *out) {
+  static char buf[8];
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_read(sqe, -1, buf, sizeof(buf), 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK);
+  io_uring_sqe_set_data64(sqe, 58);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+  io_uring_sqe_set_data64(sqe, 59);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 2, 300);
+}
+
+static int sc_skip_success_on_the_failing_head_only(struct io_uring *ring, struct rec *out) {
+  static char buf[8];
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_read(sqe, -1, buf, sizeof(buf), 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS | IOSQE_IO_LINK);
+  io_uring_sqe_set_data64(sqe, 60);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_data64(sqe, 61);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 2, 300);
+}
+
+/* A chain of three whose middle carries the flag and fails. */
+static int sc_skip_success_failing_middle(struct io_uring *ring, struct rec *out) {
+  static char buf[8];
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK);
+  io_uring_sqe_set_data64(sqe, 62);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_read(sqe, -1, buf, sizeof(buf), 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS | IOSQE_IO_LINK);
+  io_uring_sqe_set_data64(sqe, 63);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_nop(sqe);
+  io_uring_sqe_set_data64(sqe, 64);
+  io_uring_submit(ring);
+  return collect_within(ring, out, 3, 300);
+}
+
 struct scenario {
   const char *what;
   scenario_fn run;
@@ -976,6 +1088,14 @@ static const struct scenario scenarios[] = {
   { "one enter with min_complete 2 answers with two", sc_two_in_one_enter, 0 },
   { "msg_ring at its own ring: the message and the send", sc_msg_ring_self, 0 },
   { "msg_ring at a target that is not a ring", sc_msg_ring_bad_fd, 0 },
+  { "skip_success: a NOP with the flag, a NOP without", sc_skip_success_nop, 0 },
+  { "skip_success on a msg_ring to its own ring", sc_skip_success_msg_ring, 0 },
+  { "skip_success on a msg_ring that fails", sc_skip_success_failure, 0 },
+  { "skip_success on the head of a chain", sc_skip_success_link_head, 1 },
+  { "skip_success on a failing chain head", sc_skip_success_failing_link_head, 1 },
+  { "skip_success on a cancelled chain member", sc_skip_success_cancelled_member, 1 },
+  { "skip_success on the failing head only", sc_skip_success_on_the_failing_head_only, 1 },
+  { "skip_success on a failing middle of three", sc_skip_success_failing_middle, 1 },
 };
 
 static int run_side(const struct scenario *sc, int engine, struct rec *out) {
