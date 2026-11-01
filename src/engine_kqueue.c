@@ -192,8 +192,11 @@ static int kqueue_wait(struct slip_ring *r, struct eng_done *out, unsigned max,
     const int writing = evs[e].filter == EVFILT_WRITE;
     struct eng_op **side = writing ? &slot->out : &slot->in;
     const unsigned before = n;
-    for (struct eng_op *op = *side; op != NULL && n < r->op_pool_n; op = op->next)
+    const int socket_error = (evs[e].flags & EV_EOF) ? (int) evs[e].fflags : 0;
+    for (struct eng_op *op = *side; op != NULL && n < r->op_pool_n; op = op->next) {
+      if (writing && socket_error != 0) op->socket_error = socket_error;
       ready[n++] = op;
+    }
     /* Woken with nobody behind it: a knote that outlived its ops. */
     if (n == before) {
       struct kevent del;

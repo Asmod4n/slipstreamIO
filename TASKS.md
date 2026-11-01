@@ -129,8 +129,8 @@ What has no readiness to wait for still goes to GCD, never to a thread
 of ours: a positioned read or write on a regular file becomes a
 dispatch_io channel - completing when the request is DONE, the way
 read(2) on a regular file does, not on a low water mark of 1 - and
-everything else (connect, openat, a read at the descriptor's own
-offset) runs the plain blocking call on the global concurrent queue,
+everything else (openat, a read at the descriptor's own offset, and
+a Unix connect into a full backlog) runs the plain blocking call on the global concurrent queue,
 which is where io_uring puts the same ops too. Both come back through
 done[] and are handed out by wait on the submitter's thread, so the
 core settles chains the ordinary way.
@@ -172,7 +172,9 @@ that check fails and this section goes.
 
 Delivered, each with its kernel-parity scenario: socket, bind, listen,
 shutdown, accept (single-shot; SOCK_* flags via accept4, spelled out on
-macOS), connect (worker - blocking belongs there), sendmsg, recvmsg,
+macOS), connect (parked on the socket, so a cancel takes it and the close of
+the ring does not wait; a Unix peer with a full backlog blocks in the
+worker), sendmsg, recvmsg,
 poll_add (the readiness is the answer), poll_remove, async_cancel (by
 user_data, by fd, CANCEL_ALL; 0 / -ENOENT / -EALREADY like the kernel),
 statx (raw syscall on Linux, an fstatat fallback filling the shim's

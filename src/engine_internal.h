@@ -48,6 +48,13 @@ struct eng_op {
   struct io_uring_sqe sqe;
   struct eng_op *next;
   short wait_events; /* POLLIN/POLLOUT while parked (readiness backends) */
+  /* A connect that answered EINPROGRESS: the next try reads the answer
+   * from the socket instead of calling connect again. */
+  int connect_in_progress;
+  /* The socket error a backend read together with the readiness. Some
+   * kqueue implementations read SO_ERROR into the event and clear it on
+   * the socket, so the op keeps the copy. */
+  int socket_error;
   /* Where this op sits in waiting[], so leaving the set is a swap and
    * not a search. Meaningful only while parked; waiting[slot] == op is
    * what says so, since a fresh op starts at zero. */

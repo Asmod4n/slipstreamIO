@@ -495,6 +495,43 @@ static short revents_now(int fd, short events) {
 }
 #endif
 
+/* A connect waits on the socket and not in the worker, so a cancel takes
+ * it and the close of the ring frees it at once - what test/parity.c
+ * measured the kernel doing, also on a socket that carries O_NONBLOCK.
+ * The socket keeps the flags it had. A Unix peer with a full backlog
+ * answers EAGAIN and polls writable at once, so that case blocks in the
+ * worker instead of parking in a loop. */
+static enum eng_verdict try_connect(struct eng_op *op, int *res_out) {
+  const struct io_uring_sqe *s = &op->sqe;
+  if (op->connect_in_progress) {
+    if (op->socket_error != 0) return (*res_out = -op->socket_error), RAN;
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) return (*res_out = -errno), RAN;
+    if (err != 0) return (*res_out = -err), RAN;
+    struct sockaddr_storage peer;
+    socklen_t plen = sizeof(peer);
+    if (getpeername(s->fd, (struct sockaddr *) &peer, &plen) == 0) return (*res_out = 0), RAN;
+    if (errno != ENOTCONN) return (*res_out = -errno), RAN;
+    op->wait_events = POLLOUT;
+    return PARK;
+  }
+  const int fl = fcntl(s->fd, F_GETFL, 0);
+  if (fl < 0) return (*res_out = -errno), RAN;
+  if (!(fl & O_NONBLOCK)) fcntl(s->fd, F_SETFL, fl | O_NONBLOCK);
+  const int n = connect(s->fd, (const struct sockaddr *) (uintptr_t) s->addr, (socklen_t) s->off);
+  const int e = errno;
+  if (!(fl & O_NONBLOCK)) fcntl(s->fd, F_SETFL, fl);
+  if (n == 0) return (*res_out = 0), RAN;
+  if (e == EINPROGRESS) {
+    op->connect_in_progress = 1;
+    op->wait_events = POLLOUT;
+    return PARK;
+  }
+  if (e == EAGAIN) return FILE_OP;
+  return (*res_out = -e), RAN;
+}
+
 enum eng_verdict slip_posix_try(struct slip_ring *r, struct eng_op *op, int *res_out) {
   const struct io_uring_sqe *s = &op->sqe;
   void *buf = (void *) (uintptr_t) s->addr;
@@ -732,10 +769,11 @@ enum eng_verdict slip_posix_try(struct slip_ring *r, struct eng_op *op, int *res
       *res_out = slip_posix_cmd_sock(s);
       return RAN;
     case IORING_OP_CONNECT:
+      return try_connect(op, res_out);
     case IORING_OP_OPENAT:
     case IORING_OP_OPENAT2:
-      /* connect blocks until the peer answers, open blocks on a FIFO -
-       * the kernel runs both async and so does the worker. */
+      /* open blocks on a FIFO - the kernel runs it async and so does the
+       * worker. */
       return FILE_OP;
     default:
       /* Known op, not carried here. -EOPNOTSUPP and not -EINVAL: the
