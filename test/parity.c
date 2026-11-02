@@ -22,12 +22,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "slipstream_engine.h" /* the backend switch: every one of them is measured */
@@ -1050,6 +1053,262 @@ static int sc_skip_success_failing_middle(struct io_uring *ring, struct rec *out
   return collect_within(ring, out, 3, 300);
 }
 
+/* A scenario that closes the ring itself says so here, and run_side
+ * does not close it a second time. */
+static int ring_exited;
+
+static long long ms_now(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (long long) t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* A loopback listener with listen(fd, 0) and one client in its accept
+ * queue, not accepted: the queue is full, and the SYN of the next
+ * client goes unanswered. */
+struct full_listener {
+  int lfd;
+  int first;
+  struct sockaddr_in a;
+};
+
+static int open_full_listener(struct full_listener *f) {
+  socklen_t alen = sizeof(f->a);
+  memset(&f->a, 0, sizeof(f->a));
+  f->a.sin_family = AF_INET;
+  f->a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  f->lfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (f->lfd < 0 || bind(f->lfd, (struct sockaddr *) &f->a, sizeof(f->a)) != 0 ||
+      listen(f->lfd, 0) != 0 || getsockname(f->lfd, (struct sockaddr *) &f->a, &alen) != 0)
+    return -1;
+  f->first = socket(AF_INET, SOCK_STREAM, 0);
+  if (f->first < 0 || connect(f->first, (struct sockaddr *) &f->a, sizeof(f->a)) != 0) return -1;
+  return 0;
+}
+
+/* The client of a waiting connect. One SYN retry bounds the wait of an
+ * engine that blocks in connect, so a divergence ends in seconds. */
+static int client_with_one_syn_retry(void) {
+  const int c = socket(AF_INET, SOCK_STREAM, 0);
+  const int one = 1;
+  if (c >= 0) setsockopt(c, IPPROTO_TCP, TCP_SYNCNT, &one, sizeof(one));
+  return c;
+}
+
+/* The ring closes while a connect waits for a SYN that nobody answers.
+ * Records: the CQEs within 200 ms (none expected), then whether the
+ * close of the ring took under 100 ms. */
+static int sc_exit_with_a_waiting_connect(struct io_uring *ring, struct rec *out) {
+  struct full_listener f;
+  if (open_full_listener(&f) != 0) return -1;
+  const int c = client_with_one_syn_retry();
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c, (struct sockaddr *) &f.a, sizeof(f.a));
+  io_uring_sqe_set_data64(sqe, 80);
+  io_uring_submit(ring);
+  int n = collect_within(ring, out, 1, 200);
+  const long long t0 = ms_now();
+  io_uring_queue_exit(ring);
+  ring_exited = 1;
+  out[n].user_data = 81;
+  out[n].res = ms_now() - t0 < 100;
+  out[n].flags = 0;
+  n++;
+  close(c);
+  close(f.first);
+  close(f.lfd);
+  return n;
+}
+
+/* A connect that waits is cancelled by its user_data. */
+static int sc_cancel_a_waiting_connect(struct io_uring *ring, struct rec *out) {
+  struct full_listener f;
+  if (open_full_listener(&f) != 0) return -1;
+  const int c = client_with_one_syn_retry();
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c, (struct sockaddr *) &f.a, sizeof(f.a));
+  io_uring_sqe_set_data64(sqe, 90);
+  io_uring_submit(ring);
+  int n = collect_within(ring, out, 1, 200);
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_cancel64(sqe, 90, 0);
+  io_uring_sqe_set_data64(sqe, 91);
+  io_uring_submit(ring);
+  n += collect_within(ring, out + n, 2 - n, 5000);
+  close(c);
+  close(f.first);
+  close(f.lfd);
+  return n;
+}
+
+/* A connect that waits, and the accept queue frees after 200 ms. */
+static int sc_connect_after_the_queue_frees(struct io_uring *ring, struct rec *out) {
+  struct full_listener f;
+  if (open_full_listener(&f) != 0) return -1;
+  const int c = socket(AF_INET, SOCK_STREAM, 0);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c, (struct sockaddr *) &f.a, sizeof(f.a));
+  io_uring_sqe_set_data64(sqe, 100);
+  io_uring_submit(ring);
+  int n = collect_within(ring, out, 1, 200);
+  const int accepted = accept(f.lfd, NULL, NULL);
+  n += collect_within(ring, out + n, 1 - n, 5000);
+  close(accepted);
+  close(c);
+  close(f.first);
+  close(f.lfd);
+  return n;
+}
+
+/* The caller writes over the address right after the submit. The record
+ * says whether the connect still reached the listener. */
+static int sc_connect_address_written_over(struct io_uring *ring, struct rec *out) {
+  const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t alen = sizeof(a);
+  if (lfd < 0 || bind(lfd, (struct sockaddr *) &a, sizeof(a)) != 0 || listen(lfd, 4) != 0 ||
+      getsockname(lfd, (struct sockaddr *) &a, &alen) != 0)
+    return -1;
+  struct sockaddr_in asked = a;
+  const int c = socket(AF_INET, SOCK_STREAM, 0);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c, (struct sockaddr *) &asked, sizeof(asked));
+  io_uring_sqe_set_data64(sqe, 110);
+  io_uring_submit(ring);
+  memset(&asked, 0, sizeof(asked));
+  const int n = collect_within(ring, out, 1, 5000);
+  close(c);
+  close(lfd);
+  return n;
+}
+
+/* Whether a connect through the ring leaves O_NONBLOCK as it found it. */
+static int sc_connect_keeps_the_flags(struct io_uring *ring, struct rec *out) {
+  const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t alen = sizeof(a);
+  if (lfd < 0 || bind(lfd, (struct sockaddr *) &a, sizeof(a)) != 0 || listen(lfd, 4) != 0 ||
+      getsockname(lfd, (struct sockaddr *) &a, &alen) != 0)
+    return -1;
+  const int c = socket(AF_INET, SOCK_STREAM, 0);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c, (struct sockaddr *) &a, sizeof(a));
+  io_uring_sqe_set_data64(sqe, 120);
+  io_uring_submit(ring);
+  int n = collect_within(ring, out, 1, 5000);
+  out[n].user_data = 121;
+  out[n].res = (fcntl(c, F_GETFL, 0) & O_NONBLOCK) != 0;
+  out[n].flags = 0;
+  n++;
+  close(c);
+  close(lfd);
+  return n;
+}
+
+/* A connect linked to a send on the same socket; the peer reads it. */
+static int sc_connect_linked_to_a_send(struct io_uring *ring, struct rec *out) {
+  const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t alen = sizeof(a);
+  if (lfd < 0 || bind(lfd, (struct sockaddr *) &a, sizeof(a)) != 0 || listen(lfd, 4) != 0 ||
+      getsockname(lfd, (struct sockaddr *) &a, &alen) != 0)
+    return -1;
+  const int c = socket(AF_INET, SOCK_STREAM, 0);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c, (struct sockaddr *) &a, sizeof(a));
+  io_uring_sqe_set_data64(sqe, 130);
+  sqe->flags |= IOSQE_IO_LINK;
+  sqe = io_uring_get_sqe(ring);
+  io_uring_prep_send(sqe, c, "linked", 6, 0);
+  io_uring_sqe_set_data64(sqe, 131);
+  io_uring_submit(ring);
+  int n = collect_within(ring, out, 2, 5000);
+  const int accepted = accept(lfd, NULL, NULL);
+  char got[8] = { 0 };
+  out[n].user_data = 132;
+  out[n].res = accepted >= 0 ? (int) recv(accepted, got, sizeof(got), 0) : -1;
+  out[n].flags = 0;
+  n++;
+  close(accepted);
+  close(c);
+  close(lfd);
+  return n;
+}
+
+/* A connect on a socket that already carries O_NONBLOCK, into a full
+ * accept queue: what the CQE says within 200 ms. */
+static int sc_connect_on_a_nonblocking_socket(struct io_uring *ring, struct rec *out) {
+  struct full_listener f;
+  if (open_full_listener(&f) != 0) return -1;
+  const int c = client_with_one_syn_retry();
+  fcntl(c, F_SETFL, fcntl(c, F_GETFL, 0) | O_NONBLOCK);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c, (struct sockaddr *) &f.a, sizeof(f.a));
+  io_uring_sqe_set_data64(sqe, 150);
+  io_uring_submit(ring);
+  int n = collect_within(ring, out, 1, 200);
+  out[n].user_data = 151;
+  out[n].res = n;
+  out[n].flags = 0;
+  n++;
+  if (n == 1) {
+    sqe = io_uring_get_sqe(ring);
+    io_uring_prep_cancel64(sqe, 150, 0);
+    io_uring_sqe_set_data64(sqe, 152);
+    io_uring_submit(ring);
+    n += collect_within(ring, out + n, 2, 5000);
+  }
+  close(c);
+  close(f.first);
+  close(f.lfd);
+  return n;
+}
+
+/* A Unix stream socket whose peer has a full backlog: what the connect
+ * answers within 200 ms, and after the listener closes. */
+static int sc_unix_connect_full_backlog(struct io_uring *ring, struct rec *out) {
+  struct sockaddr_un a;
+  memset(&a, 0, sizeof(a));
+  a.sun_family = AF_UNIX;
+  snprintf(a.sun_path, sizeof(a.sun_path), "/tmp/slip-parity-%d.sock", (int) getpid());
+  unlink(a.sun_path);
+  const int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (lfd < 0 || bind(lfd, (struct sockaddr *) &a, sizeof(a)) != 0 || listen(lfd, 0) != 0)
+    return -1;
+  int first[2] = { socket(AF_UNIX, SOCK_STREAM, 0), socket(AF_UNIX, SOCK_STREAM, 0) };
+  const int nb = O_NONBLOCK;
+  for (int i = 0; i < 2; i++) {
+    fcntl(first[i], F_SETFL, fcntl(first[i], F_GETFL, 0) | nb);
+    connect(first[i], (struct sockaddr *) &a, sizeof(a));
+  }
+  const int c = socket(AF_UNIX, SOCK_STREAM, 0);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_connect(sqe, c, (struct sockaddr *) &a, sizeof(a));
+  io_uring_sqe_set_data64(sqe, 140);
+  io_uring_submit(ring);
+  int n = collect_within(ring, out, 1, 200);
+  out[n].user_data = 141;
+  out[n].res = n;
+  out[n].flags = 0;
+  n++;
+  close(lfd);
+  if (n == 1) n += collect_within(ring, out + n, 1, 2000);
+  unlink(a.sun_path);
+  close(c);
+  close(first[0]);
+  close(first[1]);
+  return n;
+}
+
 struct scenario {
   const char *what;
   scenario_fn run;
@@ -1096,6 +1355,14 @@ static const struct scenario scenarios[] = {
   { "skip_success on a cancelled chain member", sc_skip_success_cancelled_member, 1 },
   { "skip_success on the failing head only", sc_skip_success_on_the_failing_head_only, 1 },
   { "skip_success on a failing middle of three", sc_skip_success_failing_middle, 1 },
+  { "the ring closes while a connect waits", sc_exit_with_a_waiting_connect, 1 },
+  { "a cancel takes a waiting connect", sc_cancel_a_waiting_connect, 0 },
+  { "a waiting connect, then the queue frees", sc_connect_after_the_queue_frees, 1 },
+  { "the address written over after the submit", sc_connect_address_written_over, 1 },
+  { "a connect leaves O_NONBLOCK as it was", sc_connect_keeps_the_flags, 1 },
+  { "a connect linked to a send", sc_connect_linked_to_a_send, 1 },
+  { "a Unix connect into a full backlog", sc_unix_connect_full_backlog, 1 },
+  { "a connect on a socket with O_NONBLOCK", sc_connect_on_a_nonblocking_socket, 0 },
 };
 
 static int run_side(const struct scenario *sc, int engine, struct rec *out) {
@@ -1103,8 +1370,9 @@ static int run_side(const struct scenario *sc, int engine, struct rec *out) {
   side_is_engine = engine;
   struct io_uring ring;
   if (io_uring_queue_init(8, &ring, 0) != 0) return -1;
+  ring_exited = 0;
   const int n = sc->run(&ring, out);
-  io_uring_queue_exit(&ring);
+  if (!ring_exited) io_uring_queue_exit(&ring);
   return n;
 }
 
