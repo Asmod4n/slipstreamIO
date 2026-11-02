@@ -572,6 +572,42 @@ static int sc_recv_buffer_select(struct io_uring *ring, struct rec *out) {
   return n;
 }
 
+/* A send that selects its buffer: the SQE names a group and no bytes,
+ * the kernel sends the buffer at the head of the ring and names it in
+ * the CQE. The peer must read exactly that buffer. */
+static int sc_send_buffer_select(struct io_uring *ring, struct rec *out) {
+  enum { NBUF = 4, BUFSZ = 8 };
+  static char pool[NBUF * BUFSZ] = "first..\0second.\0third..\0fourth.";
+  int err = 0;
+  struct io_uring_buf_ring *br = io_uring_setup_buf_ring(ring, NBUF, 13, 0, &err);
+  if (br == NULL) return NOT_IN_THIS_KERNEL;
+  const int mask = io_uring_buf_ring_mask(NBUF);
+  for (int i = 0; i < NBUF; i++)
+    io_uring_buf_ring_add(br, pool + i * BUFSZ, BUFSZ - 1, (unsigned short) i, mask, i);
+  io_uring_buf_ring_advance(br, NBUF);
+
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
+
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  io_uring_prep_send(sqe, sp[0], NULL, 0, MSG_NOSIGNAL | MSG_WAITALL);
+  sqe->flags |= IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 13;
+  io_uring_sqe_set_data64(sqe, 225);
+  const int n = submit_one(ring, out);
+
+  char got[BUFSZ] = {0};
+  const ssize_t r = recv(sp[1], got, sizeof(got), MSG_DONTWAIT);
+  const int arrived = n == 1 && out[0].res == BUFSZ - 1 && r == BUFSZ - 1 &&
+                      memcmp(got, pool + (out[0].flags >> IORING_CQE_BUFFER_SHIFT) * BUFSZ, BUFSZ - 1) == 0;
+  close(sp[0]);
+  close(sp[1]);
+  io_uring_free_buf_ring(ring, br, NBUF, 13);
+  if (n == 1 && out[0].res == -EINVAL && !side_is_engine) return NOT_IN_THIS_KERNEL;
+  if (!arrived) return -1;
+  return n;
+}
+
 /* Multishot recv: one CQE per arrival carrying F_MORE, and EOF ends it
  * with a res of 0 and no F_MORE - the kernel's own way of saying the
  * multishot is over. */
@@ -1337,6 +1373,7 @@ static const struct scenario scenarios[] = {
   { "socket_direct/bind/listen/close_direct on a slot", sc_direct_listener, 1 },
   { "a fixed-file op on an empty slot is -EBADF", sc_empty_slot_is_ebadf, 0 },
   { "a recv picks a provided buffer, and fills THAT one", sc_recv_buffer_select, 0 },
+  { "a send picks a provided buffer, and sends THAT one", sc_send_buffer_select, 0 },
   { "multishot recv: F_MORE per arrival, EOF ends it", sc_recv_multishot, 1 },
   { "setsockopt and getsockopt as ring commands", sc_cmd_sockopt, 1 },
   { "multishot accept fills slots, one F_MORE CQE each", sc_accept_multishot, 1 },

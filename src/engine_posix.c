@@ -593,15 +593,41 @@ enum eng_verdict slip_posix_try(struct slip_ring *r, struct eng_op *op, int *res
       *res_out = n < 0 ? -errno : (int) n;
       return RAN;
     }
-    case IORING_OP_SEND:
-      n = send(s->fd, buf, s->len, (int) s->msg_flags | MSG_DONTWAIT);
+    case IORING_OP_SEND: {
+      /* The same answer to a bundle as the recv gives. */
+      if (s->ioprio & IORING_RECVSEND_BUNDLE) {
+        *res_out = -EOPNOTSUPP;
+        return RAN;
+      }
+      /* A selected buffer is the bytes to send: the SQE names the group,
+       * the ring names the buffer. A send that did not go out leaves the
+       * buffer in the ring, as the recv does. */
+      const void *sbuf = buf;
+      unsigned slen = s->len;
+      unsigned short bid = 0;
+      unsigned cflags = 0;
+      const int select = (s->flags & IOSQE_BUFFER_SELECT) != 0;
+      if (select) {
+        void *taken = NULL;
+        const int rc = bufring_take(r, s->buf_group, &taken, &slen, &bid);
+        if (rc != 0) {
+          *res_out = rc;
+          return RAN;
+        }
+        sbuf = taken;
+        cflags = IORING_CQE_F_BUFFER | ((unsigned) bid << IORING_CQE_BUFFER_SHIFT);
+      }
+      n = send(s->fd, sbuf, slen, (int) s->msg_flags | MSG_DONTWAIT);
+      if (n < 0 && select) bufring_unget(r, s->buf_group);
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
           !(s->msg_flags & MSG_DONTWAIT)) {
         op->wait_events = POLLOUT;
         return PARK;
       }
+      if (n >= 0) op->cqe_flags = cflags;
       *res_out = n < 0 ? -errno : (int) n;
       return RAN;
+    }
     case IORING_OP_READ: {
       const int pollable = fd_is_pollable(s->fd);
       if (pollable == 0) {
